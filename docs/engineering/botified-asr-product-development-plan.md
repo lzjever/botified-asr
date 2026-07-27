@@ -124,15 +124,16 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - CPU release 的 `torch` 和 `torchaudio` 均固定为 `2.11.0+cpu`，只从 PyTorch 官方 CPU index `https://download.pytorch.org/whl/cpu` 解析和安装；不得让通用 PyPI 或其他额外 index 覆盖这两个 artifact。
 - CUDA runtime、对应的 PyTorch artifact 和模型必须在各自 release 构建前精确固定；CPU pin 不自动成为 CUDA pin。
 - 发布镜像不得在启动时执行 `pip install -U`。
-- SenseVoice、FSMN-VAD、CAM++ 固定如下；禁止解析 alias/master 后再记录“实际 revision”：
+- SenseVoice、FSMN-VAD、CAM++ 固定到下列 Hugging Face immutable commit；禁止解析 alias/master 后再记录“实际 revision”：
 
-| 模型 | immutable revision | artifact | 预期 SHA-256 | 校验状态 |
+| 模型 | Hugging Face immutable revision | primary weight artifact | primary weight 预期 SHA-256 | 校验状态 |
 |---|---|---|---|---|
-| SenseVoiceSmall | `FunAudioLLM/SenseVoiceSmall@3847d57b6bdf2dd8875cb1508d2af43d80a16bf7` | `model.pt` | `833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea` | 当前来自 Hub 元数据；release 前必须本地隔离下载复算 |
+| SenseVoiceSmall | `FunAudioLLM/SenseVoiceSmall@3847d57b6bdf2dd8875cb1508d2af43d80a16bf7` | `model.pt` | `833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea` | 当前来自 Hugging Face LFS 元数据；release 前必须本地隔离下载复算 |
 | FSMN-VAD | `funasr/fsmn-vad@df20e6b30c653645fa4ff125cacfcabd1020a669` | `model.pt` | `b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5` | 已本地复算 |
 | CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` | 已本地复算 |
 
-- 模型首次下载只进入按 revision 隔离的 cache，ready 前校验 hash、加载并 warmup。
+- 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 在 Phase 3 接入 loader 前必须建立同等完整的 runtime manifest。
+- 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
 - SenseVoice、FSMN-VAD、CAM++ 各加载一个单例 adapter；所有 model call 共用唯一串行 inference lane。
 - 仓库代码采用 MIT license；每个 release 提供 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
