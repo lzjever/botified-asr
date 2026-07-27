@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-
 _JOB_ID = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+_CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
 class JobStatus(str, Enum):
@@ -30,6 +31,42 @@ def validate_job_id(value: object) -> str:
     if _JOB_ID.fullmatch(value) is None:
         raise ValueError("job ID is invalid")
     return value
+
+
+def generate_job_id() -> str:
+    return "".join(secrets.choice(_CROCKFORD_ALPHABET) for _ in range(8))
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedJobSpec:
+    canonical_options_json: str
+    selected_speaker_snapshot: bytes
+    snapshot_sha256: str
+    total_samples: int
+    request_fingerprint: str
+    processor_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.canonical_options_json) is not str:
+            raise TypeError("canonical job options must be a string")
+        if not self.canonical_options_json:
+            raise ValueError("canonical job options must not be empty")
+        if type(self.selected_speaker_snapshot) is not bytes:
+            raise TypeError("selected speaker snapshot must be bytes")
+        if type(self.total_samples) is not int:
+            raise TypeError("job total samples must be an integer")
+        if self.total_samples < 0:
+            raise ValueError("job total samples must be nonnegative")
+        for name in (
+            "snapshot_sha256",
+            "request_fingerprint",
+            "processor_fingerprint",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise TypeError(f"job {name} must be a string")
+            if _LOWERCASE_SHA256.fullmatch(value) is None:
+                raise ValueError(f"job {name} is invalid")
 
 
 @dataclass(frozen=True, slots=True)

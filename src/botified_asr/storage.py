@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -12,7 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable
 
-from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
+from botified_asr.jobs import (
+    DurableJob,
+    JobPhase,
+    JobStatus,
+    QueuedJobSpec,
+    generate_job_id,
+    validate_job_id,
+)
 from botified_asr.speaker_profiles import (
     KEEP_EXISTING,
     SpeakerEmbedding,
@@ -20,7 +29,6 @@ from botified_asr.speaker_profiles import (
     SpeakerProfile,
     SpeakerProfileUpdate,
 )
-
 
 SCHEMA_VERSION = 4
 MAX_SPEAKER_PROFILES = 256
@@ -40,6 +48,14 @@ _SPEAKER_PROFILE_COLUMNS = """
     embedding_model_id, embedding_model_revision,
     embedding_dimension, embedding_policy_fingerprint,
     sample_count, created_at, updated_at
+"""
+_TRANSCRIPTION_JOB_COLUMNS = """
+    id, phase, status, input_lease_id, canonical_options_json,
+    selected_speaker_snapshot, snapshot_sha256, input_size_bytes,
+    total_samples, processed_samples, request_fingerprint,
+    processor_fingerprint, attempt_no, attempt_token, owner_generation,
+    crash_recoveries, cancel_requested, result_lease_id, error_code,
+    input_cleanup_pending, created_at, started_at, finished_at
 """
 _V4_TRANSCRIPTION_JOBS_DDL = """CREATE TABLE transcription_jobs (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -167,6 +183,32 @@ class UploadLease:
 
 @dataclass(frozen=True)
 class InputRef:
+    id: str
+    resource_kind: str
+    owner_kind: str
+    owner_id: str
+    path: Path
+    actual_bytes: int
+    content_sha256: str
+
+
+@dataclass
+class JobUploadLease:
+    id: str
+    resource_kind: str
+    owner_kind: str
+    owner_id: str
+    path: Path
+    reserved_bytes: int
+    actual_bytes: int = 0
+    content_sha256: str | None = None
+    _hasher: object = field(default_factory=hashlib.sha256, repr=False)
+    _checkpointed_bytes: int = field(default=0, repr=False)
+    _state: str = field(default="writing", repr=False)
+
+
+@dataclass(frozen=True)
+class JobInputRef:
     id: str
     resource_kind: str
     owner_kind: str
@@ -993,6 +1035,685 @@ class Storage:
             ).fetchall()
         return tuple(_decode_speaker_profile(row) for row in rows)
 
+    def begin_job_upload(self, created_at: datetime) -> JobUploadLease:
+        encoded_created_at = _encode_job_timestamp(created_at)
+        reservation = RESERVATION_QUANTUM
+        while True:
+            job_id = validate_job_id(generate_job_id())
+            partial_path = self.staging_dir / f"{job_id}.partial"
+            ready_path = self.staging_dir / f"{job_id}.ready"
+            with self._transaction():
+                collision = (
+                    self._connection.execute(
+                        "SELECT 1 FROM transcription_jobs WHERE id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    is not None
+                    or self._connection.execute(
+                        "SELECT 1 FROM storage_leases WHERE id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    is not None
+                )
+                if collision:
+                    continue
+
+                active = self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM storage_leases
+                    WHERE lease_type = 'upload' AND phase = 'writing'
+                    """
+                ).fetchone()[0]
+                if active >= self.limits.max_active_uploads:
+                    raise StorageAdmissionError(
+                        "too_many_active_uploads",
+                        "too many active uploads",
+                    )
+                self._admit_delta(reservation)
+                self._connection.execute(
+                    """
+                    INSERT INTO transcription_jobs(
+                        id, phase, status, input_lease_id,
+                        processed_samples, attempt_no, crash_recoveries,
+                        cancel_requested, input_cleanup_pending, created_at
+                    ) VALUES (
+                        ?, 'receiving', NULL, ?, 0, 0, 0, 0, 0, ?
+                    )
+                    """,
+                    (job_id, job_id, encoded_created_at),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO storage_leases(
+                        id, lease_type, resource_kind, owner_kind, owner_id,
+                        phase, controlled_path, reserved_bytes, actual_bytes
+                    ) VALUES (
+                        ?, 'upload', 'transcription', 'job', ?,
+                        'writing', ?, ?, 0
+                    )
+                    """,
+                    (
+                        job_id,
+                        job_id,
+                        str(partial_path),
+                        reservation,
+                    ),
+                )
+
+            try:
+                handle = partial_path.open("xb")
+            except OSError as error:
+                self._compensate_failed_job_open(job_id, partial_path)
+                if isinstance(error, FileExistsError):
+                    continue
+                raise
+            if ready_path.exists() or ready_path.is_symlink():
+                handle.close()
+                try:
+                    partial_path.unlink()
+                except FileNotFoundError:
+                    pass
+                _fsync_directory(self.staging_dir)
+                self._compensate_failed_job_open(job_id, partial_path)
+                continue
+
+            self._files[job_id] = handle
+            return JobUploadLease(
+                job_id,
+                "transcription",
+                "job",
+                job_id,
+                partial_path,
+                reservation,
+            )
+
+    def append_job_upload(
+        self,
+        lease: JobUploadLease,
+        data: bytes,
+    ) -> None:
+        if type(lease) is not JobUploadLease:
+            raise TypeError(
+                "append_job_upload requires a JobUploadLease"
+            )
+        with self._lock:
+            self._require_job_upload_lease(lease, phase="writing")
+            self._append_writing(
+                lease=lease,
+                lease_type="upload",
+                data=data,
+            )
+
+    def seal_job_upload(self, lease: JobUploadLease) -> JobInputRef:
+        if type(lease) is not JobUploadLease:
+            raise TypeError(
+                "seal_job_upload requires a JobUploadLease"
+            )
+        with self._lock:
+            self._require_job_upload_lease(lease, phase="writing")
+            open_handle = self._files.get(lease.id)
+            if open_handle is None:
+                raise RuntimeError("job upload lease is closed")
+            partial_path = lease.path
+            sealed_path = self.staging_dir / f"{lease.id}.ready"
+            try:
+                open_handle.flush()
+                os.fsync(open_handle.fileno())
+                open_handle.close()
+                self._files.pop(lease.id, None)
+                os.replace(partial_path, sealed_path)
+                _fsync_directory(self.staging_dir)
+                digest = lease._hasher.hexdigest()
+                with self._transaction():
+                    job_row = self._connection.execute(
+                        """
+                        SELECT phase, status, input_lease_id
+                        FROM transcription_jobs WHERE id = ?
+                        """,
+                        (lease.id,),
+                    ).fetchone()
+                    if (
+                        job_row is None
+                        or tuple(job_row)
+                        != ("receiving", None, lease.id)
+                    ):
+                        raise RuntimeError(
+                            "job is no longer receiving"
+                        )
+                    changed = self._connection.execute(
+                        """
+                        UPDATE storage_leases SET
+                            phase = 'sealed',
+                            controlled_path = ?,
+                            reserved_bytes = ?,
+                            actual_bytes = ?,
+                            content_sha256 = ?
+                        WHERE id = ? AND lease_type = 'upload'
+                          AND resource_kind = 'transcription'
+                          AND owner_kind = 'job' AND owner_id = ?
+                          AND phase = 'writing' AND controlled_path = ?
+                          AND reserved_bytes = ?
+                          AND actual_bytes BETWEEN 0 AND ?
+                          AND content_sha256 IS NULL
+                        """,
+                        (
+                            str(sealed_path),
+                            lease.actual_bytes,
+                            lease.actual_bytes,
+                            digest,
+                            lease.id,
+                            lease.id,
+                            str(partial_path),
+                            lease.reserved_bytes,
+                            lease.actual_bytes,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise RuntimeError(
+                            "job upload lease is no longer writing"
+                        )
+            except BaseException:
+                self._compensate_failed_job_seal(
+                    lease,
+                    partial_path=partial_path,
+                    sealed_path=sealed_path,
+                )
+                raise
+            lease.path = sealed_path
+            lease.reserved_bytes = lease.actual_bytes
+            lease.content_sha256 = digest
+            lease._state = "sealed"
+        return JobInputRef(
+            lease.id,
+            lease.resource_kind,
+            lease.owner_kind,
+            lease.owner_id,
+            sealed_path,
+            lease.actual_bytes,
+            digest,
+        )
+
+    def abort_job_upload(
+        self,
+        handle: JobUploadLease | JobInputRef,
+    ) -> None:
+        if type(handle) not in {JobUploadLease, JobInputRef}:
+            raise TypeError(
+                "abort_job_upload requires a job upload handle"
+            )
+        writing = type(handle) is JobUploadLease
+        if writing and handle._state == "sealed":
+            raise RuntimeError("job upload lease is stale")
+        if writing and handle._state not in {"writing", "aborted"}:
+            raise RuntimeError("job upload lease has invalid state")
+        self._validate_job_handle_identity(handle, writing=writing)
+
+        partial_path = self.staging_dir / f"{handle.id}.partial"
+        ready_path = self.staging_dir / f"{handle.id}.ready"
+        with self._transaction():
+            job_row = self._connection.execute(
+                """
+                SELECT phase, status, input_lease_id
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (handle.id,),
+            ).fetchone()
+            lease_row = self._connection.execute(
+                """
+                SELECT lease_type, resource_kind, owner_kind, owner_id,
+                       phase, controlled_path, reserved_bytes, actual_bytes,
+                       content_sha256
+                FROM storage_leases WHERE id = ?
+                """,
+                (handle.id,),
+            ).fetchone()
+            if job_row is None and lease_row is None:
+                if partial_path.exists() or ready_path.exists():
+                    raise RuntimeError(
+                        "job upload cleanup state is inconsistent"
+                    )
+                if writing:
+                    handle._state = "aborted"
+                return
+            expected_phase = "writing" if writing else "sealed"
+            expected_path = partial_path if writing else ready_path
+            if (
+                job_row is None
+                or job_row["phase"] not in {"receiving", "deleting"}
+                or job_row["status"] is not None
+                or job_row["input_lease_id"] != handle.id
+                or not self._job_lease_row_matches(
+                    lease_row,
+                    handle,
+                    phase=expected_phase,
+                    path=expected_path,
+                )
+            ):
+                raise RuntimeError("job upload handle is stale")
+            if job_row["phase"] == "receiving":
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET phase = 'deleting'
+                    WHERE id = ? AND phase = 'receiving'
+                      AND status IS NULL AND input_lease_id = ?
+                    """,
+                    (handle.id, handle.id),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "job changed during upload abort"
+                    )
+
+        if writing:
+            open_handle = self._files.pop(handle.id, None)
+            if open_handle is not None:
+                open_handle.close()
+        for path in (partial_path, ready_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        _fsync_directory(self.staging_dir)
+
+        with self._transaction():
+            lease_deleted = self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE id = ? AND lease_type = 'upload'
+                  AND resource_kind = 'transcription'
+                  AND owner_kind = 'job' AND owner_id = ?
+                  AND phase = ? AND controlled_path = ?
+                  AND reserved_bytes = ? AND actual_bytes = ?
+                  AND content_sha256 IS ?
+                """,
+                (
+                    handle.id,
+                    handle.id,
+                    "writing" if writing else "sealed",
+                    str(partial_path if writing else ready_path),
+                    lease_row["reserved_bytes"],
+                    lease_row["actual_bytes"],
+                    lease_row["content_sha256"],
+                ),
+            ).rowcount
+            job_deleted = self._connection.execute(
+                """
+                DELETE FROM transcription_jobs
+                WHERE id = ? AND phase = 'deleting'
+                  AND status IS NULL AND input_lease_id = ?
+                """,
+                (handle.id, handle.id),
+            ).rowcount
+            if lease_deleted != 1 or job_deleted != 1:
+                raise RuntimeError(
+                    "job changed during upload cleanup"
+                )
+        if writing:
+            handle._state = "aborted"
+
+    def publish_job(
+        self,
+        input_ref: JobInputRef,
+        spec: QueuedJobSpec,
+    ) -> DurableJob:
+        if type(input_ref) is not JobInputRef:
+            raise TypeError("publish_job requires a JobInputRef")
+        if type(spec) is not QueuedJobSpec:
+            raise TypeError("publish_job requires a QueuedJobSpec")
+        self._validate_job_handle_identity(input_ref, writing=False)
+        if not self._sealed_job_file_matches(input_ref):
+            raise RuntimeError("sealed job input file does not match reference")
+
+        with self._transaction():
+            lease_row = self._connection.execute(
+                """
+                SELECT lease_type, resource_kind, owner_kind, owner_id,
+                       phase, controlled_path, reserved_bytes, actual_bytes,
+                       content_sha256
+                FROM storage_leases WHERE id = ?
+                """,
+                (input_ref.id,),
+            ).fetchone()
+            if not self._job_lease_row_matches(
+                lease_row,
+                input_ref,
+                phase="sealed",
+                path=input_ref.path,
+            ):
+                raise RuntimeError("sealed job input reference is stale")
+            job_row = self._connection.execute(
+                """
+                SELECT phase, status, input_lease_id
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (input_ref.id,),
+            ).fetchone()
+            if (
+                job_row is None
+                or tuple(job_row)
+                != ("receiving", None, input_ref.id)
+            ):
+                raise RuntimeError("job is no longer receiving")
+            queued = self._connection.execute(
+                """
+                SELECT COUNT(*) FROM transcription_jobs
+                WHERE phase = 'visible' AND status = 'queued'
+                """
+            ).fetchone()[0]
+            if queued >= self.limits.max_queued_jobs:
+                raise StorageAdmissionError(
+                    "too_many_queued_jobs",
+                    "too many queued jobs",
+                )
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET
+                    phase = 'visible',
+                    status = 'queued',
+                    canonical_options_json = ?,
+                    selected_speaker_snapshot = ?,
+                    snapshot_sha256 = ?,
+                    input_size_bytes = ?,
+                    total_samples = ?,
+                    request_fingerprint = ?,
+                    processor_fingerprint = ?
+                WHERE id = ? AND phase = 'receiving'
+                  AND status IS NULL AND input_lease_id = ?
+                """,
+                (
+                    spec.canonical_options_json,
+                    sqlite3.Binary(spec.selected_speaker_snapshot),
+                    spec.snapshot_sha256,
+                    input_ref.actual_bytes,
+                    spec.total_samples,
+                    spec.request_fingerprint,
+                    spec.processor_fingerprint,
+                    input_ref.id,
+                    input_ref.id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("job is no longer receiving")
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (input_ref.id,),
+            ).fetchone()
+        if row is None:
+            raise StorageSchemaError("published job row is missing")
+        return _decode_transcription_job(row)
+
+    def get_visible_job(self, job_id: str) -> DurableJob | None:
+        validate_job_id(job_id)
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs
+                WHERE id = ? AND phase = 'visible' AND status = 'queued'
+                """,
+                (job_id,),
+            ).fetchone()
+        return None if row is None else _decode_transcription_job(row)
+
+    def _compensate_failed_job_open(
+        self,
+        job_id: str,
+        partial_path: Path,
+    ) -> None:
+        with self._transaction():
+            lease_deleted = self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE id = ? AND lease_type = 'upload'
+                  AND resource_kind = 'transcription'
+                  AND owner_kind = 'job' AND owner_id = ?
+                  AND phase = 'writing' AND controlled_path = ?
+                """,
+                (job_id, job_id, str(partial_path)),
+            ).rowcount
+            job_deleted = self._connection.execute(
+                """
+                DELETE FROM transcription_jobs
+                WHERE id = ? AND phase = 'receiving'
+                  AND status IS NULL AND input_lease_id = ?
+                """,
+                (job_id, job_id),
+            ).rowcount
+            if lease_deleted != 1 or job_deleted != 1:
+                raise RuntimeError(
+                    "job changed during failed open cleanup"
+                )
+
+    def _compensate_failed_job_seal(
+        self,
+        lease: JobUploadLease,
+        *,
+        partial_path: Path,
+        sealed_path: Path,
+    ) -> None:
+        open_handle = self._files.pop(lease.id, None)
+        if open_handle is not None:
+            try:
+                open_handle.close()
+            except OSError:
+                pass
+        with self._transaction():
+            job_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (lease.id,),
+            ).fetchone()
+            lease_row = self._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (lease.id,),
+            ).fetchone()
+            if (
+                job_row is None
+                or job_row["phase"] not in {"receiving", "deleting"}
+                or job_row["status"] is not None
+                or job_row["input_lease_id"] != lease.id
+                or lease_row is None
+                or lease_row["lease_type"] != "upload"
+                or lease_row["resource_kind"] != "transcription"
+                or lease_row["owner_kind"] != "job"
+                or lease_row["owner_id"] != lease.id
+                or lease_row["phase"] not in {"writing", "sealed"}
+                or lease_row["controlled_path"]
+                not in {str(partial_path), str(sealed_path)}
+            ):
+                raise RuntimeError(
+                    "job changed during failed seal cleanup"
+                )
+            if job_row["phase"] == "receiving":
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET phase = 'deleting'
+                    WHERE id = ? AND phase = 'receiving'
+                      AND status IS NULL AND input_lease_id = ?
+                    """,
+                    (lease.id, lease.id),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "job changed during failed seal cleanup"
+                    )
+        expected_job_row = job_row
+        expected_lease_row = lease_row
+
+        for path in (partial_path, sealed_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        _fsync_directory(self.staging_dir)
+
+        with self._transaction():
+            current_job = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (lease.id,),
+            ).fetchone()
+            current_lease = self._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (lease.id,),
+            ).fetchone()
+            job_keys = expected_job_row.keys()
+            expected_job = tuple(
+                "deleting" if key == "phase" else expected_job_row[key]
+                for key in job_keys
+            )
+            if (
+                current_job is None
+                or tuple(current_job) != expected_job
+                or current_lease is None
+                or tuple(current_lease) != tuple(expected_lease_row)
+            ):
+                raise RuntimeError(
+                    "job changed during failed seal cleanup"
+                )
+            lease_deleted = self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE id = ? AND lease_type = 'upload'
+                  AND resource_kind = 'transcription'
+                  AND owner_kind = 'job' AND owner_id = ?
+                  AND phase = ? AND controlled_path = ?
+                """,
+                (
+                    lease.id,
+                    lease.id,
+                    expected_lease_row["phase"],
+                    expected_lease_row["controlled_path"],
+                ),
+            ).rowcount
+            job_deleted = self._connection.execute(
+                """
+                DELETE FROM transcription_jobs
+                WHERE id = ? AND phase = 'deleting' AND status IS NULL
+                  AND input_lease_id = ?
+                """,
+                (lease.id, lease.id),
+            ).rowcount
+            if lease_deleted != 1 or job_deleted != 1:
+                raise RuntimeError(
+                    "job changed during failed seal cleanup"
+                )
+        lease._state = "aborted"
+
+    def _validate_job_handle_identity(
+        self,
+        handle: JobUploadLease | JobInputRef,
+        *,
+        writing: bool,
+    ) -> None:
+        validate_job_id(handle.id)
+        expected_path = self.staging_dir / (
+            f"{handle.id}.partial" if writing else f"{handle.id}.ready"
+        )
+        if (
+            handle.resource_kind != "transcription"
+            or handle.owner_kind != "job"
+            or handle.owner_id != handle.id
+            or handle.path != expected_path
+            or not self._is_controlled_path(
+                handle.id,
+                "upload",
+                "writing" if writing else "sealed",
+                handle.path,
+            )
+        ):
+            raise RuntimeError("job upload handle is invalid")
+
+    def _require_job_upload_lease(
+        self,
+        lease: JobUploadLease,
+        *,
+        phase: str,
+    ) -> None:
+        self._validate_job_handle_identity(lease, writing=True)
+        self._require_writing(lease, "upload")
+        row = self._connection.execute(
+            """
+            SELECT lease_type, resource_kind, owner_kind, owner_id,
+                   phase, controlled_path, reserved_bytes, actual_bytes,
+                   content_sha256
+            FROM storage_leases WHERE id = ?
+            """,
+            (lease.id,),
+        ).fetchone()
+        job_row = self._connection.execute(
+            """
+            SELECT phase, status, input_lease_id
+            FROM transcription_jobs WHERE id = ?
+            """,
+            (lease.id,),
+        ).fetchone()
+        if (
+            not self._job_lease_row_matches(
+                row,
+                lease,
+                phase=phase,
+                path=lease.path,
+            )
+            or job_row is None
+            or tuple(job_row)
+            != ("receiving", None, lease.id)
+        ):
+            raise RuntimeError("job upload lease does not match ledger")
+
+    def _job_lease_row_matches(
+        self,
+        row: sqlite3.Row | None,
+        handle: JobUploadLease | JobInputRef,
+        *,
+        phase: str,
+        path: Path,
+    ) -> bool:
+        if row is None:
+            return False
+        expected_reserved = (
+            handle.reserved_bytes
+            if type(handle) is JobUploadLease
+            else handle.actual_bytes
+        )
+        return bool(
+            row["lease_type"] == "upload"
+            and row["resource_kind"] == handle.resource_kind
+            and row["owner_kind"] == handle.owner_kind
+            and row["owner_id"] == handle.owner_id
+            and row["phase"] == phase
+            and row["controlled_path"] == str(path)
+            and row["reserved_bytes"] == expected_reserved
+            and (
+                type(handle) is JobUploadLease
+                or row["actual_bytes"] == handle.actual_bytes
+            )
+            and (
+                type(handle) is JobUploadLease
+                or row["content_sha256"] == handle.content_sha256
+            )
+        )
+
+    def _sealed_job_file_matches(self, ref: JobInputRef) -> bool:
+        try:
+            stat_result = ref.path.stat(follow_symlinks=False)
+            return (
+                not ref.path.is_symlink()
+                and ref.path.is_file()
+                and stat_result.st_size == ref.actual_bytes
+                and re.fullmatch(r"[0-9a-f]{64}", ref.content_sha256)
+                is not None
+            )
+        except OSError:
+            return False
+
     def begin_upload(
         self,
         resource_kind: str,
@@ -1221,7 +1942,7 @@ class Storage:
     def _append_writing(
         self,
         *,
-        lease: UploadLease | ReservedByteWriter,
+        lease: UploadLease | JobUploadLease | ReservedByteWriter,
         lease_type: str,
         data: bytes,
     ) -> None:
@@ -1278,7 +1999,7 @@ class Storage:
     def _seal_writing(
         self,
         *,
-        lease: UploadLease | ReservedByteWriter,
+        lease: UploadLease | JobUploadLease | ReservedByteWriter,
         lease_type: str,
         sealed_suffix: str,
         directory: Path,
@@ -1334,7 +2055,7 @@ class Storage:
 
     def _compensate_failed_seal(
         self,
-        lease: UploadLease | ReservedByteWriter,
+        lease: UploadLease | JobUploadLease | ReservedByteWriter,
         *,
         lease_type: str,
         directory: Path,
@@ -1532,7 +2253,7 @@ class Storage:
 
     def _require_writing(
         self,
-        lease: UploadLease | ReservedByteWriter,
+        lease: UploadLease | JobUploadLease | ReservedByteWriter,
         lease_type: str,
     ) -> None:
         if lease._state == "sealed":
@@ -1616,15 +2337,108 @@ class Storage:
 
     def _reconcile_startup(self) -> None:
         with self._lock:
-            rows = self._connection.execute(
+            marker_rows = self._connection.execute(
+                "SELECT * FROM shutdown_marker"
+            ).fetchall()
+            job_rows = self._connection.execute(
+                f"SELECT {_TRANSCRIPTION_JOB_COLUMNS} FROM transcription_jobs"
+            ).fetchall()
+            lease_rows = self._connection.execute(
                 "SELECT * FROM storage_leases"
             ).fetchall()
-        for row in rows:
+        if marker_rows:
+            raise StorageSchemaError(
+                "shutdown marker is unsupported during startup"
+            )
+
+        jobs_by_id: dict[str, tuple[sqlite3.Row, DurableJob]] = {}
+        for row in job_rows:
+            job = _decode_transcription_job(row)
+            if job.id in jobs_by_id:
+                raise StorageSchemaError("duplicate transcription job")
+            if not (
+                (
+                    job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}
+                    and job.status is None
+                )
+                or (
+                    job.phase is JobPhase.VISIBLE
+                    and job.status is JobStatus.QUEUED
+                )
+            ):
+                raise StorageSchemaError(
+                    "unsupported transcription job during startup"
+                )
+            jobs_by_id[job.id] = (row, job)
+
+        leases_by_id: dict[str, sqlite3.Row] = {}
+        generic_cleanup: list[sqlite3.Row] = []
+        for row in lease_rows:
             if not self._valid_reconciliation_row(row):
                 raise StorageSchemaError("corrupt storage lease")
+            lease_id = row["id"]
+            if lease_id in leases_by_id:
+                raise StorageSchemaError("duplicate storage lease")
+            leases_by_id[lease_id] = row
+            if row["owner_kind"] in {"sync", "legacy"}:
+                generic_cleanup.append(row)
 
-        touched_dirs: set[Path] = set()
-        for row in rows:
+        job_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        protected_paths: set[Path] = set()
+        for job_id, (job_row, job) in jobs_by_id.items():
+            lease_row = leases_by_id.get(job.input_lease_id)
+            if (
+                lease_row is None
+                or lease_row["id"] != job_id
+                or lease_row["lease_type"] != "upload"
+                or lease_row["resource_kind"] != "transcription"
+                or lease_row["owner_kind"] != "job"
+                or lease_row["owner_id"] != job_id
+            ):
+                raise StorageSchemaError(
+                    "transcription job input reference is corrupt"
+                )
+            controlled_path = Path(lease_row["controlled_path"])
+            if job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}:
+                job_cleanup.append((job_row, lease_row))
+                continue
+            if (
+                lease_row["phase"] != "sealed"
+                or controlled_path
+                != self.staging_dir / f"{job_id}.ready"
+                or lease_row["reserved_bytes"]
+                != lease_row["actual_bytes"]
+                or job.input_size_bytes != lease_row["actual_bytes"]
+                or not _is_regular_file_with_size(
+                    controlled_path,
+                    lease_row["actual_bytes"],
+                )
+            ):
+                raise StorageSchemaError(
+                    "queued transcription job input is corrupt"
+                )
+            protected_paths.add(controlled_path)
+
+        for lease_id, row in leases_by_id.items():
+            if row["owner_kind"] == "job":
+                if row["lease_type"] == "artifact":
+                    raise StorageSchemaError(
+                        "job artifact is unsupported during startup"
+                    )
+                if lease_id not in jobs_by_id:
+                    raise StorageSchemaError(
+                        "job storage lease has no transcription job"
+                    )
+
+        cleanup_paths: set[Path] = set()
+        for _, lease_row in job_cleanup:
+            cleanup_paths.update(
+                {
+                    self.staging_dir / f"{lease_row['id']}.partial",
+                    self.staging_dir / f"{lease_row['id']}.ready",
+                }
+            )
+        for row in generic_cleanup:
             lease_type = row["lease_type"]
             directory = (
                 self.staging_dir
@@ -1636,71 +2450,182 @@ class Storage:
                 if lease_type == "upload"
                 else ("partial", "complete")
             )
-            for suffix in suffixes:
-                candidate = directory / f"{row['id']}.{suffix}"
-                try:
-                    candidate.unlink()
-                except FileNotFoundError:
-                    pass
-            touched_dirs.add(directory)
+            cleanup_paths.update(
+                directory / f"{row['id']}.{suffix}"
+                for suffix in suffixes
+            )
+        for directory, pattern in (
+            (self.staging_dir, STAGING_NAME_PATTERN),
+            (self.artifact_dir, ARTIFACT_NAME_PATTERN),
+        ):
+            cleanup_paths.update(
+                entry
+                for entry in directory.iterdir()
+                if pattern.fullmatch(entry.name)
+                and entry not in protected_paths
+            )
+        for path in cleanup_paths:
+            self._preflight_cleanup_path(path)
+
+        if job_cleanup:
+            with self._transaction():
+                for job_row, _ in job_cleanup:
+                    if job_row["phase"] == "receiving":
+                        changed = self._connection.execute(
+                            """
+                            UPDATE transcription_jobs SET phase = 'deleting'
+                            WHERE id = ? AND phase = 'receiving'
+                              AND status IS NULL AND input_lease_id = ?
+                            """,
+                            (job_row["id"], job_row["input_lease_id"]),
+                        ).rowcount
+                        if changed != 1:
+                            raise StorageSchemaError(
+                                "transcription job changed during startup"
+                            )
+
+        touched_dirs = {path.parent for path in cleanup_paths}
+        for path in cleanup_paths:
+            self._unlink_if_present(path)
         for directory in touched_dirs:
             _fsync_directory(directory)
-        if rows:
-            with self._transaction():
-                self._connection.execute("DELETE FROM storage_leases")
 
-        self._remove_strict_orphans(
-            self.staging_dir, STAGING_NAME_PATTERN
-        )
-        self._remove_strict_orphans(
-            self.artifact_dir, ARTIFACT_NAME_PATTERN
-        )
+        if job_cleanup or generic_cleanup:
+            with self._transaction():
+                for job_row, lease_row in job_cleanup:
+                    current_job = self._connection.execute(
+                        f"""
+                        SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                        FROM transcription_jobs WHERE id = ?
+                        """,
+                        (job_row["id"],),
+                    ).fetchone()
+                    current_lease = self._connection.execute(
+                        "SELECT * FROM storage_leases WHERE id = ?",
+                        (lease_row["id"],),
+                    ).fetchone()
+                    job_keys = job_row.keys()
+                    expected_job = tuple(
+                        "deleting" if key == "phase" else job_row[key]
+                        for key in job_keys
+                    )
+                    if (
+                        current_job is None
+                        or tuple(current_job) != expected_job
+                        or current_lease is None
+                        or tuple(current_lease) != tuple(lease_row)
+                    ):
+                        raise StorageSchemaError(
+                            "job cleanup state changed during startup"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM storage_leases WHERE id = ?",
+                        (lease_row["id"],),
+                    )
+                    self._connection.execute(
+                        """
+                        DELETE FROM transcription_jobs
+                        WHERE id = ? AND phase = 'deleting'
+                        """,
+                        (job_row["id"],),
+                    )
+                for row in generic_cleanup:
+                    current = self._connection.execute(
+                        "SELECT * FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    if current is None or tuple(current) != tuple(row):
+                        raise StorageSchemaError(
+                            "storage lease changed during startup"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    )
 
     def _valid_reconciliation_row(self, row: sqlite3.Row) -> bool:
         lease_id = row["id"]
         lease_type = row["lease_type"]
         phase = row["phase"]
         resource_kind = row["resource_kind"]
+        owner_kind = row["owner_kind"]
+        owner_id = row["owner_id"]
+        reserved_bytes = row["reserved_bytes"]
+        actual_bytes = row["actual_bytes"]
+        content_sha256 = row["content_sha256"]
         return bool(
-            isinstance(lease_id, str)
+            type(lease_id) is str
             and LEASE_ID_PATTERN.fullmatch(lease_id)
             and lease_type in LEASE_TYPES
             and phase in {"writing", "sealed"}
-            and row["owner_kind"] in {"sync", "legacy"}
-            and isinstance(row["owner_id"], str)
-            and row["owner_id"]
-            and isinstance(resource_kind, str)
+            and owner_kind in {"sync", "job", "legacy"}
+            and type(owner_id) is str
+            and owner_id
+            and type(resource_kind) is str
             and resource_kind
             and (
                 lease_type == "upload"
                 or resource_kind in ARTIFACT_KINDS
             )
+            and type(reserved_bytes) is int
+            and type(actual_bytes) is int
+            and 0 <= actual_bytes <= reserved_bytes
+            and (
+                content_sha256 is None
+                or (
+                    type(content_sha256) is str
+                    and re.fullmatch(r"[0-9a-f]{64}", content_sha256)
+                    is not None
+                )
+            )
+            and type(row["created_at"]) is str
+            and bool(row["created_at"])
             and self._is_controlled_path(
                 lease_id,
                 lease_type,
                 phase,
                 Path(row["controlled_path"]),
             )
+            and (
+                owner_kind != "job"
+                or (
+                    owner_id == lease_id
+                    and lease_type == "upload"
+                    and resource_kind == "transcription"
+                    and (
+                        (
+                            phase == "writing"
+                            and content_sha256 is None
+                        )
+                        or (
+                            phase == "sealed"
+                            and reserved_bytes == actual_bytes
+                            and content_sha256 is not None
+                        )
+                    )
+                )
+            )
         )
 
-    def _remove_strict_orphans(
-        self,
-        directory: Path,
-        pattern: re.Pattern[str],
-    ) -> None:
-        removed = False
-        for entry in directory.iterdir():
-            if (
-                pattern.fullmatch(entry.name)
-                and (entry.is_file() or entry.is_symlink())
-            ):
-                try:
-                    entry.unlink()
-                    removed = True
-                except FileNotFoundError:
-                    pass
-        if removed:
-            _fsync_directory(directory)
+    def _unlink_if_present(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _preflight_cleanup_path(self, path: Path) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise StorageSchemaError(
+                "storage cleanup path cannot be inspected"
+            ) from error
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise StorageSchemaError(
+                "storage cleanup path is not safely unlinkable"
+            )
 
     def total_reserved_bytes(self) -> int:
         with self._lock:
@@ -1855,6 +2780,91 @@ def _decode_speaker_profile(row: sqlite3.Row) -> SpeakerProfile:
     return profile
 
 
+def _decode_transcription_job(row: sqlite3.Row) -> DurableJob:
+    try:
+        job = DurableJob(
+            id=row["id"],
+            phase=JobPhase(row["phase"]),
+            status=(
+                None
+                if row["status"] is None
+                else JobStatus(row["status"])
+            ),
+            input_lease_id=row["input_lease_id"],
+            canonical_options_json=row["canonical_options_json"],
+            selected_speaker_snapshot=row["selected_speaker_snapshot"],
+            snapshot_sha256=row["snapshot_sha256"],
+            input_size_bytes=row["input_size_bytes"],
+            total_samples=row["total_samples"],
+            processed_samples=row["processed_samples"],
+            request_fingerprint=row["request_fingerprint"],
+            processor_fingerprint=row["processor_fingerprint"],
+            attempt_no=row["attempt_no"],
+            attempt_token=row["attempt_token"],
+            owner_generation=row["owner_generation"],
+            crash_recoveries=row["crash_recoveries"],
+            cancel_requested=_decode_sqlite_boolean(
+                row["cancel_requested"],
+                name="cancel_requested",
+            ),
+            result_lease_id=row["result_lease_id"],
+            error_code=row["error_code"],
+            input_cleanup_pending=_decode_sqlite_boolean(
+                row["input_cleanup_pending"],
+                name="input_cleanup_pending",
+            ),
+            created_at=_decode_job_timestamp(row["created_at"]),
+            started_at=(
+                None
+                if row["started_at"] is None
+                else _decode_job_timestamp(row["started_at"])
+            ),
+            finished_at=(
+                None
+                if row["finished_at"] is None
+                else _decode_job_timestamp(row["finished_at"])
+            ),
+        )
+    except (IndexError, TypeError, ValueError) as error:
+        raise StorageSchemaError("transcription job row is corrupt") from error
+    return job
+
+
+def _decode_sqlite_boolean(value: object, *, name: str) -> bool:
+    if type(value) is not int or value not in {0, 1}:
+        raise ValueError(f"job {name} is not a canonical boolean")
+    return bool(value)
+
+
+def _encode_job_timestamp(value: datetime) -> str:
+    if type(value) is not datetime:
+        raise TypeError("job timestamp must be a datetime")
+    if value.tzinfo is not timezone.utc:
+        raise ValueError("job timestamp is not canonical UTC")
+    fraction = f".{value.microsecond:06d}" if value.microsecond else ""
+    return (
+        f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+        f"T{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+        f"{fraction}Z"
+    )
+
+
+def _decode_job_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError("job timestamp must be text")
+    parsed = datetime.strptime(
+        value,
+        (
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+            if "." in value
+            else "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    ).replace(tzinfo=timezone.utc)
+    if _encode_job_timestamp(parsed) != value:
+        raise ValueError("job timestamp is not canonical")
+    return parsed
+
+
 def _encode_profile_timestamp(value: datetime) -> str:
     if value.tzinfo is not timezone.utc:
         raise ValueError("speaker profile timestamp is not canonical UTC")
@@ -1914,6 +2924,17 @@ def _round_reservation(byte_count: int) -> int:
         // RESERVATION_QUANTUM)
         * RESERVATION_QUANTUM,
     )
+
+
+def _is_regular_file_with_size(path: Path, size: int) -> bool:
+    try:
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size == size
+        )
+    except OSError:
+        return False
 
 
 def _fsync_directory(path: Path) -> None:
