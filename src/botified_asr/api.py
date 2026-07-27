@@ -5,6 +5,7 @@ import hmac
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -29,6 +30,7 @@ from botified_asr.composition import (
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
+from botified_asr.speaker_profiles import SpeakerProfile
 from botified_asr.speaker_snapshot import (
     SelectedSpeakerIncompatibleError,
     SelectedSpeakerNotFoundError,
@@ -56,6 +58,7 @@ ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
 INCLUDE_ORDER = ("funasr.emotion", "funasr.audio_events")
 SPEAKER_ID_PATTERN = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
+SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
 
 
 class ApiError(Exception):
@@ -290,6 +293,33 @@ def create_app(
             param="model_id",
         )
 
+    async def list_speakers(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        profiles = storage.list_speaker_profiles()
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": [_speaker_profile_object(profile) for profile in profiles],
+            }
+        )
+
+    async def get_speaker(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        profile = storage.get_speaker_profile(request.path_params["speaker_id"])
+        if profile is None:
+            raise _speaker_not_found()
+        return JSONResponse(_speaker_profile_object(profile))
+
+    async def delete_speaker(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        deleted = storage.delete_speaker_profile(request.path_params["speaker_id"])
+        if not deleted:
+            raise _speaker_not_found()
+        return Response(status_code=204)
+
     async def transcriptions(request: Request) -> Response:
         authenticate(request)
         require_ready()
@@ -391,6 +421,17 @@ def create_app(
             Route("/health/ready", ready, methods=["GET"]),
             Route("/v1/models", list_models, methods=["GET"]),
             Route("/v1/models/{model_id}", get_model, methods=["GET"]),
+            Route("/v1/speakers", list_speakers, methods=["GET"]),
+            Route(
+                "/v1/speakers/{speaker_id}",
+                get_speaker,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/speakers/{speaker_id}",
+                delete_speaker,
+                methods=["DELETE"],
+            ),
             Route(
                 "/v1/audio/transcriptions",
                 transcriptions,
@@ -405,6 +446,44 @@ def create_app(
         lifespan=lifespan,
     )
     return app
+
+
+def _speaker_profile_object(profile: SpeakerProfile) -> dict[str, object]:
+    return {
+        "id": profile.id,
+        "object": "speaker",
+        "name": profile.name,
+        "description": profile.description,
+        "sample_count": profile.sample_count,
+        "embedding_model": {
+            "id": SPEAKER_EMBEDDING_MODEL_ALIAS,
+            "revision": profile.embedding_model_revision,
+            "dimension": profile.embedding_dimension,
+            "policy_fingerprint": profile.embedding_policy_fingerprint,
+        },
+        "created_at": _public_utc_timestamp(profile.created_at),
+        "updated_at": _public_utc_timestamp(profile.updated_at),
+    }
+
+
+def _public_utc_timestamp(value: datetime) -> str:
+    if value.tzinfo is not timezone.utc:
+        raise ValueError("speaker profile timestamp is not canonical UTC")
+    fractional = f".{value.microsecond:06d}" if value.microsecond else ""
+    return (
+        f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+        f"T{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+        f"{fractional}Z"
+    )
+
+
+def _speaker_not_found() -> ApiError:
+    return ApiError(
+        404,
+        "speaker_not_found",
+        "Speaker not found",
+        param="speaker_id",
+    )
 
 
 class _PreparedStreamingResponse(StreamingResponse):
