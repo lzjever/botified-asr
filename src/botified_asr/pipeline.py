@@ -22,6 +22,7 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError, PipelineNotReady
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.speakers import (
     AnonymousSpeakerPolicy,
     AnonymousSpeakerState,
@@ -104,6 +105,12 @@ class AsrResult:
     text: str
     language: str | None
     annotations: RichAnnotations
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessorResult:
+    artifact_ref: object
+    speaker_mapping: SpeakerLabelMapping
 
 
 @dataclass(frozen=True)
@@ -782,7 +789,7 @@ class Processor:
         cancellation: Cancellation,
         progress_sink: ProgressSink,
         segment_sink: SegmentSink,
-    ) -> object:
+    ) -> ProcessorResult:
         failed = True
         blocks: DecodedBlocks | None = None
         decoder_close_attempted = False
@@ -856,7 +863,10 @@ class Processor:
             close_decoder()
             artifact_ref = segment_sink.finalize()
             failed = False
-            return artifact_ref
+            return ProcessorResult(
+                artifact_ref,
+                SpeakerLabelMapping(()),
+            )
         finally:
             try:
                 close_decoder()

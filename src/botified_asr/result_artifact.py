@@ -18,6 +18,7 @@ from botified_asr.pipeline import (
     iter_canonical_join,
     serialize_canonical_record,
 )
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.speakers import is_anonymous_speaker_label
 
 _TOP_LEVEL_KEYS = {
@@ -235,7 +236,15 @@ class ResultProjector:
         reader: CanonicalJsonlReader,
         options: CanonicalOptions,
         total_samples: int,
+        *,
+        speaker_mapping: SpeakerLabelMapping,
     ) -> Projection:
+        if (
+            type(speaker_mapping) is not SpeakerLabelMapping
+            or type(speaker_mapping.resolutions) is not tuple
+            or speaker_mapping.resolutions != ()
+        ):
+            raise CanonicalArtifactError("result artifact speaker mapping is invalid")
         summary = reader.scan()
         if (
             type(total_samples) is not int

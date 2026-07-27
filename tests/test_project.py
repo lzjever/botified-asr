@@ -8,9 +8,11 @@ import httpx
 from openai import OpenAI
 from starlette.testclient import TestClient
 
+from botified_asr import pipeline as pipeline_module
 from botified_asr.api import Readiness, create_app
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.storage import Storage
 
 
@@ -34,7 +36,11 @@ class SdkProcessor:
             )
         )
         progress.update(processed_samples=1, total_samples=None)
-        return sink.finalize()
+        ref = sink.finalize()
+        return pipeline_module.ProcessorResult(
+            ref,
+            SpeakerLabelMapping(()),
+        )
 
 
 def test_uv_lock_uses_only_official_pypi() -> None:

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import wave
+from inspect import Parameter, signature
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import numpy as np
 import pytest
 
+from botified_asr import pipeline as pipeline_module
 from botified_asr.audio import Cancellation, FfmpegAudioFrontend
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import MAX_AUDIO_SAMPLES, CanonicalOptions
@@ -18,6 +20,11 @@ from botified_asr.pipeline import (
     Processor,
     RichAnnotations,
     SegmentRecord,
+)
+from botified_asr.result_artifact import Projection
+from botified_asr.speaker_matching import (
+    SpeakerLabelMapping,
+    SpeakerLabelResolution,
 )
 from botified_asr.storage import Storage
 
@@ -69,8 +76,10 @@ class EmittingProcessor:
         self,
         *,
         behavior: str = "success",
+        speaker_mapping: SpeakerLabelMapping | None = None,
     ) -> None:
         self.behavior = behavior
+        self.speaker_mapping = speaker_mapping or SpeakerLabelMapping(())
         self.calls = 0
 
     def process(
@@ -111,11 +120,30 @@ class EmittingProcessor:
         elif self.behavior == "zero":
             progress.update(processed_samples=0, total_samples=None)
         ref = sink.finalize()
-        if self.behavior == "returned_ref":
-            return object()
-        if self.behavior == "missing_progress":
+        if self.behavior == "bare_ref":
             return ref
-        return ref
+        if self.behavior == "invalid_result":
+            return object()
+        if self.behavior == "nonexact_result":
+            result_type = type(
+                "NonExactProcessorResult",
+                (pipeline_module.ProcessorResult,),
+                {"__slots__": ()},
+            )
+            return result_type(ref, self.speaker_mapping)
+        if self.behavior == "wrong_ref":
+            return pipeline_module.ProcessorResult(
+                object(),
+                self.speaker_mapping,
+            )
+        if self.behavior == "invalid_mapping":
+            return pipeline_module.ProcessorResult(
+                ref,
+                object(),
+            )
+        if self.behavior == "missing_progress":
+            return pipeline_module.ProcessorResult(ref, self.speaker_mapping)
+        return pipeline_module.ProcessorResult(ref, self.speaker_mapping)
 
 
 class RuntimeModel:
@@ -133,8 +161,63 @@ class RuntimeModel:
 
 
 class RaisingProjector:
-    def prepare(self, *_args: object, **_kwargs: object) -> object:
+    def prepare(
+        self,
+        *_args: object,
+        speaker_mapping: SpeakerLabelMapping,
+        **_kwargs: object,
+    ) -> object:
+        del speaker_mapping
         raise RuntimeError("projection failed")
+
+
+class SpyProjector:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.speaker_mapping: SpeakerLabelMapping | None = None
+
+    def prepare(
+        self,
+        *_args: object,
+        speaker_mapping: SpeakerLabelMapping,
+        **_kwargs: object,
+    ) -> Projection:
+        self.calls += 1
+        self.speaker_mapping = speaker_mapping
+        return Projection(
+            content_type="application/json",
+            body_factory=lambda: iter((b'{"text":"hello"}',)),
+        )
+
+
+class PermissiveProjector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def prepare(
+        self,
+        *_args: object,
+        speaker_mapping: object,
+        **_kwargs: object,
+    ) -> Projection:
+        del speaker_mapping
+        self.calls += 1
+        return Projection(
+            content_type="application/json",
+            body_factory=lambda: iter((b'{"text":"hello"}',)),
+        )
+
+
+def test_composition_protocols_use_the_exact_transport_contract() -> None:
+    from botified_asr.composition import ProjectionBuilder, TranscriptionProcessor
+
+    return_type = get_type_hints(TranscriptionProcessor.process)["return"]
+    assert return_type is pipeline_module.ProcessorResult
+
+    parameter = signature(ProjectionBuilder.prepare).parameters["speaker_mapping"]
+
+    assert parameter.kind is Parameter.KEYWORD_ONLY
+    assert parameter.default is Parameter.empty
 
 
 def test_progress_accumulator_is_exact_monotonic_and_requires_update() -> None:
@@ -224,7 +307,11 @@ def test_real_wav_processor_storage_and_three_projections(
         "write",
         "seal",
         "projection",
-        "returned_ref",
+        "bare_ref",
+        "invalid_result",
+        "nonexact_result",
+        "wrong_ref",
+        "invalid_mapping",
         "invalid_progress",
         "missing_progress",
     ],
@@ -268,6 +355,73 @@ def test_composition_faults_discard_every_artifact(
             )
 
         assert processor.calls == 1
+        _assert_no_artifact(storage)
+    finally:
+        storage.close()
+
+
+def test_composition_passes_the_identical_speaker_mapping_to_projector(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.composition import prepare_sync_transcription
+
+    mapping = SpeakerLabelMapping((SpeakerLabelResolution("A", None),))
+    processor = EmittingProcessor(speaker_mapping=mapping)
+    projector = SpyProjector()
+    storage = _storage(tmp_path)
+    try:
+        prepared = prepare_sync_transcription(
+            storage,
+            processor,
+            tmp_path / "input.ready",
+            owner_id="request-1",
+            options=_options(),
+            cancellation=Cancellation(),
+            projector=projector,
+        )
+
+        assert projector.speaker_mapping is mapping
+        assert b"".join(prepared.iter_body()) == b'{"text":"hello"}'
+        _assert_no_artifact(storage)
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("invalid_kind", ("object", "subclass"))
+def test_composition_rejects_invalid_mapping_before_projector_and_cleans(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    from botified_asr.composition import prepare_sync_transcription
+
+    if invalid_kind == "object":
+        mapping: object = object()
+        projector: Any = PermissiveProjector()
+    else:
+        mapping_type = type(
+            "NonExactSpeakerLabelMapping",
+            (SpeakerLabelMapping,),
+            {"__slots__": ()},
+        )
+        mapping = mapping_type(())
+        projector = SpyProjector()
+    processor = EmittingProcessor(
+        speaker_mapping=mapping,  # type: ignore[arg-type]
+    )
+    storage = _storage(tmp_path)
+    try:
+        with pytest.raises(RuntimeError):
+            prepare_sync_transcription(
+                storage,
+                processor,
+                tmp_path / "input.ready",
+                owner_id="request-1",
+                options=_options(),
+                cancellation=Cancellation(),
+                projector=projector,
+            )
+
+        assert projector.calls == 0
         _assert_no_artifact(storage)
     finally:
         storage.close()

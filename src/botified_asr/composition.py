@@ -9,6 +9,7 @@ from botified_asr.audio import Cancellation
 from botified_asr.contracts import MAX_AUDIO_SAMPLES, CanonicalOptions
 from botified_asr.pipeline import (
     CanonicalJsonlSegmentSink,
+    ProcessorResult,
     ProgressSink,
     SegmentSink,
 )
@@ -17,6 +18,7 @@ from botified_asr.result_artifact import (
     Projection,
     ResultProjector,
 )
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.storage import ArtifactRef, ReservedByteWriter, Storage
 
 
@@ -28,7 +30,7 @@ class TranscriptionProcessor(Protocol):
         cancellation: Cancellation,
         progress_sink: ProgressSink,
         segment_sink: SegmentSink,
-    ) -> object: ...
+    ) -> ProcessorResult: ...
 
 
 class ProjectionBuilder(Protocol):
@@ -37,6 +39,8 @@ class ProjectionBuilder(Protocol):
         reader: CanonicalJsonlReader,
         options: CanonicalOptions,
         total_samples: int,
+        *,
+        speaker_mapping: SpeakerLabelMapping,
     ) -> Projection: ...
 
 
@@ -201,14 +205,22 @@ def prepare_sync_transcription(
     try:
         sink = CanonicalJsonlSegmentSink(writer)
         progress = ProgressAccumulator()
-        returned_ref = processor.process(
+        result = processor.process(
             input_path,
             options,
             cancellation,
             progress,
             sink,
         )
-        if writer.sealed_ref is None or returned_ref is not writer.sealed_ref:
+        if type(result) is not ProcessorResult:
+            raise RuntimeError("processor returned an invalid result")
+        speaker_mapping = result.speaker_mapping
+        if (
+            type(speaker_mapping) is not SpeakerLabelMapping
+            or type(speaker_mapping.resolutions) is not tuple
+        ):
+            raise RuntimeError("processor returned an invalid speaker mapping")
+        if writer.sealed_ref is None or result.artifact_ref is not writer.sealed_ref:
             raise RuntimeError("processor returned an unexpected artifact reference")
         total_samples = progress.finish()
         artifact_path = storage.resolve_artifact(writer.sealed_ref)
@@ -218,6 +230,7 @@ def prepare_sync_transcription(
             reader,
             options,
             total_samples,
+            speaker_mapping=speaker_mapping,
         )
         response = PreparedSyncResponse(projection, writer)
         transferred = True

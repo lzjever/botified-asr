@@ -10,6 +10,7 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
+from botified_asr import pipeline as pipeline_module
 import botified_asr.api as api_module
 from botified_asr.api import (
     ApiError,
@@ -20,6 +21,7 @@ from botified_asr.api import (
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.storage import Storage
 
 
@@ -58,7 +60,11 @@ class FakeProcessor:
             processed_samples=processed_samples,
             total_samples=None,
         )
-        return sink.finalize()
+        ref = sink.finalize()
+        return pipeline_module.ProcessorResult(
+            ref,
+            SpeakerLabelMapping(()),
+        )
 
 
 @pytest.fixture

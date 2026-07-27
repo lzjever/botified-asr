@@ -9,6 +9,7 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
+from botified_asr import pipeline as pipeline_module
 from botified_asr.api import Readiness, create_app
 from botified_asr.audio import AudioError
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
@@ -18,6 +19,7 @@ from botified_asr.pipeline import (
     RichAnnotations,
     SegmentRecord,
 )
+from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.storage import ArtifactRef, Storage
 
 
@@ -97,7 +99,11 @@ class SpyProcessor:
             if self.behavior == "invalid_artifact":
                 progress.update(processed_samples=1, total_samples=None)
                 sink._writer.write(b"not canonical jsonl\n")
-                return sink._writer.seal()
+                ref = sink._writer.seal()
+                return pipeline_module.ProcessorResult(
+                    ref,
+                    SpeakerLabelMapping(()),
+                )
 
             sink.append(
                 SegmentRecord(
@@ -113,7 +119,10 @@ class SpyProcessor:
             ref = sink.finalize()
             assert isinstance(ref, ArtifactRef)
             self.finalized_ref = ref
-            return ref
+            return pipeline_module.ProcessorResult(
+                ref,
+                SpeakerLabelMapping(()),
+            )
         finally:
             self.finished.set()
 

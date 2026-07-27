@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,13 @@ from botified_asr.pipeline import (
     RichAnnotations,
     SegmentRecord,
 )
+from botified_asr.speaker_matching import (
+    SpeakerLabelMapping,
+    SpeakerLabelResolution,
+)
+
+
+EMPTY_SPEAKER_MAPPING = SpeakerLabelMapping(())
 
 
 class SpyStream(io.BytesIO):
@@ -377,6 +385,7 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
         reader,
         _options("text"),
         total_samples=48_000,
+        speaker_mapping=EMPTY_SPEAKER_MAPPING,
     )
     text_chunks, text_body = _body(text_projection)
     assert text_projection.content_type == "text/plain; charset=utf-8"
@@ -390,6 +399,7 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
             include=("funasr.emotion", "funasr.audio_events"),
         ),
         total_samples=48_000,
+        speaker_mapping=EMPTY_SPEAKER_MAPPING,
     )
     json_chunks, json_body = _body(json_projection)
     assert json_projection.content_type == "application/json"
@@ -430,6 +440,7 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
             include=("funasr.emotion", "funasr.audio_events"),
         ),
         total_samples=48_000,
+        speaker_mapping=EMPTY_SPEAKER_MAPPING,
     )
     _, verbose_body = _body(verbose_projection)
     assert json.loads(verbose_body) == {
@@ -484,6 +495,64 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
     )
 
 
+def test_result_projector_requires_keyword_only_speaker_mapping(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import CanonicalJsonlReader, ResultProjector
+
+    parameter = signature(ResultProjector.prepare).parameters["speaker_mapping"]
+    assert parameter.kind is Parameter.KEYWORD_ONLY
+    assert parameter.default is Parameter.empty
+
+    reader = CanonicalJsonlReader(
+        tmp_path / "empty.jsonl",
+        opener=FreshOpener(b""),
+    )
+    with pytest.raises(TypeError):
+        ResultProjector().prepare(
+            reader,
+            _options("json"),
+            total_samples=0,
+        )
+
+
+def test_transport_projector_only_accepts_exact_empty_mapping_before_scan(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalArtifactError,
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    mapping_type = type(
+        "NonExactSpeakerLabelMapping",
+        (SpeakerLabelMapping,),
+        {"__slots__": ()},
+    )
+    invalid_mappings = (
+        SpeakerLabelMapping((SpeakerLabelResolution("A", None),)),
+        mapping_type(()),
+        SpeakerLabelMapping([]),  # type: ignore[arg-type]
+        object(),
+    )
+
+    for mapping in invalid_mappings:
+        opener = FreshOpener(b"")
+        reader = CanonicalJsonlReader(tmp_path / "empty.jsonl", opener=opener)
+
+        with pytest.raises(CanonicalArtifactError) as caught:
+            ResultProjector().prepare(
+                reader,
+                _options("json"),
+                total_samples=0,
+                speaker_mapping=mapping,  # type: ignore[arg-type]
+            )
+
+        assert caught.value.code == "invalid_result_artifact"
+        assert opener.streams == []
+
+
 def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(
     tmp_path: Path,
 ) -> None:
@@ -525,6 +594,7 @@ def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(
             include=("funasr.emotion", "funasr.audio_events"),
         ),
         total_samples=48_000,
+        speaker_mapping=EMPTY_SPEAKER_MAPPING,
     )
     _, body = _body(projection)
 
@@ -556,13 +626,21 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
     reader = CanonicalJsonlReader(tmp_path / "empty.jsonl", opener=opener)
     projector = ResultProjector()
 
-    _, text_body = _body(projector.prepare(reader, _options("text"), total_samples=0))
+    _, text_body = _body(
+        projector.prepare(
+            reader,
+            _options("text"),
+            total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
+        )
+    )
     assert text_body == b""
     _, json_body = _body(
         projector.prepare(
             reader,
             _options("json", include=("funasr.emotion",)),
             total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     )
     assert json_body == b'{"text":"","funasr":{"emotion":[]}}'
@@ -574,6 +652,7 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
                 include=("funasr.audio_events",),
             ),
             total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     )
     assert verbose_auto == (
@@ -585,6 +664,7 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
             reader,
             _options("diarized_json"),
             total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     )
     assert (
@@ -595,6 +675,7 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
             reader,
             _options("verbose_json", language="fr"),
             total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     )
     assert json.loads(verbose_explicit)["language"] == "fr"
@@ -619,6 +700,7 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
             language_reader,
             _options("verbose_json"),
             total_samples=2,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     )
     assert json.loads(verbose_unknown)["language"] == "unknown"
@@ -653,6 +735,7 @@ def test_normal_projection_rejects_any_labeled_artifact_before_return(
             reader,
             _options(response_format),
             total_samples=20,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
 
     assert caught.value.code == "invalid_result_artifact"
@@ -682,6 +765,7 @@ def test_diarized_projection_rejects_any_unlabeled_record_before_return(
             reader,
             _options("diarized_json"),
             total_samples=20,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
 
     assert caught.value.code == "invalid_result_artifact"
@@ -707,6 +791,7 @@ def test_prepare_fully_scans_before_return_and_rejects_corrupt_or_bad_total(
             reader,
             _options("json", include=("funasr.emotion",)),
             total_samples=20,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
         )
     assert len(opener.streams) == 1
     assert len(opener.streams[0].readline_sizes) >= 2
@@ -721,5 +806,6 @@ def test_prepare_fully_scans_before_return_and_rejects_corrupt_or_bad_total(
                 valid_reader,
                 _options("json"),
                 total_samples=total_samples,  # type: ignore[arg-type]
+                speaker_mapping=EMPTY_SPEAKER_MAPPING,
             )
         assert caught.value.code == "invalid_result_artifact"

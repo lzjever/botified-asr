@@ -9,6 +9,7 @@ import pytest
 from botified_asr import pipeline, speakers
 from botified_asr.audio import BLOCK_SAMPLES, Cancellation, DecodedBlock, MediaProbe
 from botified_asr.contracts import CanonicalOptions
+from botified_asr.speaker_matching import SpeakerLabelMapping
 
 
 class FakeDecoder:
@@ -248,6 +249,12 @@ def _process(
     )
 
 
+def _assert_empty_processor_result(result: object, ref: object) -> None:
+    assert type(result) is pipeline.ProcessorResult
+    assert result.artifact_ref is ref
+    assert result.speaker_mapping == SpeakerLabelMapping(())
+
+
 def test_auto_without_vad_fails_before_probe() -> None:
     decoder = FakeDecoder(())
     frontend = FakeFrontend(decoder)
@@ -272,7 +279,7 @@ def test_empty_auto_succeeds_without_vad_or_asr_calls(
     progress = RecordingProgress()
     sink = RecordingSink()
 
-    artifact = _process(
+    result = _process(
         pipeline.Processor(
             FakeFrontend(decoder),
             asr,
@@ -282,7 +289,7 @@ def test_empty_auto_succeeds_without_vad_or_asr_calls(
         progress=progress,
     )
 
-    assert artifact is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert sum(len(instance.calls) for instance in instances) == 0
     assert asr.calls == []
     assert progress.updates == [(0, None)]
@@ -453,7 +460,7 @@ def test_auto_skips_empty_results_positionally_with_dense_record_indices(
     asr = FakeAsrAdapter(lambda _pcms: results)
     sink = RecordingSink()
 
-    artifact = _process(
+    result = _process(
         pipeline.Processor(
             FakeFrontend(decoder),
             asr,
@@ -463,7 +470,7 @@ def test_auto_skips_empty_results_positionally_with_dense_record_indices(
         language="zh",
     )
 
-    assert artifact is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert asr.calls[0][1] == "zh"
     assert [
         (record.index, record.start_sample, record.end_sample, record.text)
@@ -653,7 +660,7 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
     ]
     sink = RecordingSink(events)
 
-    _process(
+    result = _process(
         pipeline.Processor(
             FakeFrontend(FakeDecoder(_blocks(1))),
             FakeAsrAdapter(lambda _pcms: results),
@@ -665,6 +672,7 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
         canonical_options=_options(model="sensevoice-diarize"),
     )
 
+    _assert_empty_processor_result(result, sink.ref)
     assert len(cam.calls) == 3
     for call, segment in zip(cam.calls, segments, strict=True):
         canonical_start = segment.span.start_sample - segment.pcm_start_sample
@@ -746,7 +754,7 @@ def test_empty_diarize_never_calls_asr_or_cam(
     decoder = FakeDecoder(_blocks(block_count))
     sink = RecordingSink()
 
-    artifact = _process(
+    result = _process(
         pipeline.Processor(
             FakeFrontend(decoder),
             asr,
@@ -758,7 +766,7 @@ def test_empty_diarize_never_calls_asr_or_cam(
         canonical_options=_options(model="sensevoice-diarize"),
     )
 
-    assert artifact is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert asr.calls == []
     assert cam.calls == []
     assert sink.records == []

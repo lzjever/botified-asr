@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import wave
 from dataclasses import FrozenInstanceError
+from inspect import Parameter, signature
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from botified_asr import pipeline as pipeline_module
 from botified_asr.audio import (
     Cancellation,
     DecodedBlock,
@@ -25,6 +27,7 @@ from botified_asr.pipeline import (
     SegmentRecord,
     canonical_join,
 )
+from botified_asr.speaker_matching import SpeakerLabelMapping
 
 
 class FakeDecoder:
@@ -209,6 +212,37 @@ def run_processor(
     )
 
 
+def _assert_empty_processor_result(result: object, ref: object) -> None:
+    assert type(result) is pipeline_module.ProcessorResult
+    assert result.artifact_ref is ref
+    assert result.speaker_mapping == SpeakerLabelMapping(())
+
+
+def test_processor_result_is_exact_frozen_slotted_and_requires_both_fields() -> None:
+    result_type = pipeline_module.ProcessorResult
+    parameters = signature(result_type).parameters
+
+    assert tuple(parameters) == ("artifact_ref", "speaker_mapping")
+    assert all(
+        parameter.default is Parameter.empty for parameter in parameters.values()
+    )
+    assert result_type.__slots__ == ("artifact_ref", "speaker_mapping")
+
+    artifact_ref = object()
+    mapping = SpeakerLabelMapping(())
+    result = result_type(artifact_ref, mapping)
+
+    assert type(result) is result_type
+    assert result.artifact_ref is artifact_ref
+    assert result.speaker_mapping is mapping
+    with pytest.raises(FrozenInstanceError):
+        result.artifact_ref = object()
+    with pytest.raises(TypeError):
+        result_type()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        result_type(artifact_ref)  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize("sample_count", [0, 1, 480_000])
 def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
     sample_count: int,
@@ -223,14 +257,14 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
     decoder = FakeDecoder(blocks)
     progress = RecordingProgress()
 
-    artifact_ref = run_processor(
+    result = run_processor(
         decoder,
         adapter,
         sink,
         progress=progress,
     )
 
-    assert artifact_ref is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert sink.finalized == 1
     assert sink.aborted == 0
     assert decoder.closed == 1
@@ -280,7 +314,7 @@ def test_direct_processor_passes_explicit_language_to_one_item_batch(
     adapter = FakeAdapter()
     sink = RecordingSink()
 
-    artifact_ref = run_processor(
+    result = run_processor(
         FakeDecoder(
             [
                 DecodedBlock(start, samples[start : start + 9_600])
@@ -292,7 +326,7 @@ def test_direct_processor_passes_explicit_language_to_one_item_batch(
         canonical_options=options(language=language),
     )
 
-    assert artifact_ref is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert len(adapter.calls) == 1
     pcms, requested_language = adapter.calls[0]
     assert requested_language == language
@@ -345,7 +379,7 @@ def test_direct_processor_skips_empty_model_text_and_finalizes_successfully() ->
     progress = RecordingProgress()
     samples = np.arange(12_345, dtype=np.int32).astype(np.int16)
 
-    artifact_ref = run_processor(
+    result = run_processor(
         FakeDecoder(
             [
                 DecodedBlock(start, samples[start : start + 9_600])
@@ -358,7 +392,7 @@ def test_direct_processor_skips_empty_model_text_and_finalizes_successfully() ->
         progress=progress,
     )
 
-    assert artifact_ref is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert len(adapter.calls) == 1
     assert adapter.calls[0][1] == "zh"
     assert progress.updates[-1] == (len(samples), None)
@@ -645,7 +679,7 @@ def test_runtime_generated_wav_runs_through_public_processor(
     sink = RecordingSink()
     progress = RecordingProgress()
 
-    artifact_ref = Processor(
+    result = Processor(
         FfmpegAudioFrontend(),
         NormalizingAsrAdapter(model),
     ).process(
@@ -656,7 +690,7 @@ def test_runtime_generated_wav_runs_through_public_processor(
         sink,
     )
 
-    assert artifact_ref is sink.ref
+    _assert_empty_processor_result(result, sink.ref)
     assert sink.records[0].end_sample == len(expected)
     assert progress.updates[-1][0] == len(expected)
     np.testing.assert_array_equal(
