@@ -143,18 +143,54 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 
 ### 4.4 可复现 fingerprint
 
-`processor_fingerprint` 是以下 canonical JSON 的 SHA-256：
+`processor_fingerprint` 是下列 version 1 canonical JSON manifest 的 UTF-8 bytes 的 SHA-256：
 
-- SenseVoice、FSMN-VAD、CAM++ 三个 artifact hash；
-- 本 release processor/adapter 实现的 Git commit；
-- PCM sample rate/downmix、VAD block/cache、30 秒 segment 切分和 padding policy；
-- clean-text、rich-label parser 和 canonical text join policy；
-- speaker window、online centroid、threshold/margin 和 normalization policy；
-- request/response/error schema 定义 hash。
+```json
+{
+  "model_snapshot_manifest_digests": {
+    "campplus": "<sha256>",
+    "fsmn_vad": "<sha256>",
+    "sensevoice": "<sha256>"
+  },
+  "processor_compatibility_version": 1,
+  "processor_policy_manifest_digest": "<sha256>",
+  "result_envelope_version": 1,
+  "speaker_snapshot_wire_version": 1,
+  "version": 1
+}
+```
 
-release manifest、每个 job row 和 `.complete` manifest 必须使用同一个值。恢复器同时比较 job 的 request fingerprint 和 processor fingerprint，不一致则 fail closed `processor_fingerprint_mismatch`，不得用当前实现继续旧结果。
+canonical JSON 使用 UTF-8、对象 key 字典序、无无意义空白、JSON array 保持声明顺序并拒绝 NaN/Infinity。
 
-`request_fingerprint` 是输入内容 SHA-256、canonical request options 以及 job-private profile snapshot hash 的 canonical JSON SHA-256。输入 hash 在上传流中增量计算，不二次读取大文件。fingerprint 只用于一致性，不作为公开资源 ID。
+每个 `model_snapshot_manifest_digests` 值是 ready/loader 已验证的对应完整 runtime model snapshot canonical metadata 的 SHA-256。version 1 metadata 的 exact top-level keys 是 `files,immutable_revision,model_id,provider,version`；`version` 必须是 exact integer `1`。`files` entry 的 exact keys 是 `byte_size,relative_path,sha256`，entries 按 `relative_path` 严格升序且 path 唯一，不在每个 entry 重复 model ID 或 revision。metadata 不得包含 cache/host absolute path、mtime、inode 或其他部署时可变 metadata，也不得只绑定 primary weight。计算 fingerprint 复用 ready/loader 已验证的 canonical metadata，不为 fingerprint 二次读取模型大文件。
+
+`processor_policy_manifest_digest` 是 canonical processor policy manifest 的 SHA-256。该 manifest 的 exact top-level keys 是 `policies,version`，`version` 是 integer `1`；`policies` 的 exact keys 是 `anonymous_clustering,asr_adapter,audio,join,result_projection,rich_label,segment,speaker_embedding,speaker_matching,text,vad`。每个 policy object 的 exact keys 是 `effective_parameters,version`，其中 `version` 是正整数，`effective_parameters` 是只含 JSON scalar/array/object 的 canonical object，并完整列出该 policy 当前生效的命名参数，不得用代码路径、类名或 Git revision 代替参数。
+
+这些 policy object 分别覆盖：audio frontend、ffmpeg argv/protocol/demuxer、downmix、resample、PCM `s16le`/mono/16 kHz、9,600-sample block、EOF 与 sample-count；VAD block/cache、pre-padding 与边界换算；segment 最大长度、切分、padding 与 batching；ASR adapter 输入、语言与模型输出解析；clean text；rich-label parser；canonical join；result projection；anonymous clustering；speaker embedding window/normalization；known-speaker matching threshold/margin。任一 effective value 变化都必须改变对应 canonical policy object。
+
+`processor_compatibility_version` 是兜底兼容版本：任何影响输出或旧 job/result 安全恢复、但不会由上述 model metadata、wire version 或 processor policy manifest 自动体现的代码、依赖、execution backend、adapter、parser、projection 或其他语义变化，都必须递增该值。不影响输出或恢复的重构、文件移动和 HTTP schema 变化不得递增。整个 Git commit 与 request/response/error schema hash 不进入 `processor_fingerprint`。
+
+当前 release 的 `processor_fingerprint` 是进程常量，新 job row 使用该值。只有 queued/running job 的 claim、execute、crash recovery 和 running-result promotion 要求 job 值等于当前 release 值；不一致 fail closed `processor_fingerprint_mismatch`，不得用当前 processor 继续该 job。active job 由持久 metadata 重算出的 request fingerprint 不等于 job row 时 fail closed `request_fingerprint_mismatch`。读取或恢复任意 `.complete` 时，其 request fingerprint 和 processor fingerprint 必须分别等于 job row；request fingerprint 不一致是 result corruption，processor fingerprint 不一致使用 `processor_fingerprint_mismatch`。retained succeeded job 不要求其 processor fingerprint 等于当前 release，只要求 `.complete` 的两个 fingerprint 与该 job row 精确一致。
+
+`request_fingerprint` 是下列 version 1 canonical JSON 的 UTF-8 bytes 的 SHA-256：
+
+```json
+{
+  "canonical_options": {
+    "chunking_strategy": null,
+    "include": [],
+    "known_speaker_ids": [],
+    "language": "auto",
+    "model": "sensevoice",
+    "response_format": "json"
+  },
+  "input_sha256": "<sha256>",
+  "speaker_snapshot_sha256": "<sha256>",
+  "version": 1
+}
+```
+
+`canonical_options` 是 §6.2 已验证的 canonical options JSON object，不是 JSON string，也不再包一层 hash；其数组顺序沿用 §6.2。`input_sha256` 是上传流中增量计算并在 sealed input 上固定的内容 SHA-256，不得为 fingerprint 二次读取输入。`speaker_snapshot_sha256` 是 §9.4 canonical snapshot bytes 的 SHA-256。fingerprint 只用于一致性，不作为公开资源 ID。
 
 ## 5. 用户故事
 
@@ -492,12 +528,12 @@ limits:
 - 每个请求先确定适用的 file limit `B`：带 `Prefer: respond-async` 或 `sync_max_upload_bytes == max_upload_bytes` 时为 `max_upload_bytes`，其余情况为 `sync_max_upload_bytes`。
 - 应用在把 raw body byte 交给 multipart parser 分类前先累计 `R`，并施加联合安全上限 `R <= B + 1 MiB`；累计收到第 `B + 1 MiB + 1` 个 raw body byte 时固定返回 `400 invalid_multipart`。该错误优先于尚未分类的 file 或 overhead 单项错误。
 - 不能只依据 Content-Length；应用层按实际流入的 raw body、`file` payload 和 multipart overhead 分别累计计数，Content-Length 是否存在或其声明值不得改变下述公开错误优先级。
-- duration 在上传完成后由 `ffprobe` 获取并再次校验。
+- 上传完成后由 `ffprobe` 获取有限、非负的 duration，仅用于本次请求的 admission、VAD 要求和 sync/async 前置判断；该临时值不写入 job row，也不作为公开 progress total。
 - 没有 `chunking_strategy=auto` 的请求超过 `direct_max_audio_duration_secs` 时，无论 sync/async 都返回 `422 long_audio_requires_vad`。
 - 联合安全上限未先触发时，带 `Prefer: respond-async` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`。
 - 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes < max_upload_bytes` 的请求累计收到第 `sync_max_upload_bytes + 1` 个 `file` payload 字节便立即停止接收，稳定返回 `422 async_required` 并幂等清理 upload lease、reservation 和 staging 文件；不得继续接收以推测最终是否超过硬上限。
 - 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes == max_upload_bytes` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`，不得返回 `422`。
-- 完成上传后的校验顺序固定为：媒体可解码、总时长硬上限、VAD 要求、基于 sync 时长边界的 async 要求；流式接收期间已按上述累计 byte 规则处理 byte 上限。一次响应只返回首个错误。
+- 完成上传后，所有 POST 都先执行 `ffprobe` 可检查性、probe duration admission、VAD 要求和 sync/async 边界的前置判断；`ffprobe` 只负责 preflight。异步请求通过 preflight 后发布 queued job，不预解码，也不 spool 全量 PCM；实际 decode 错误和 actual PCM 时长越界由 job 执行阶段记录为稳定 terminal failure。实际 decode 的错误优先级按所选路径闭合：direct path 读到超过适用 `effective_direct_max_audio_samples` 的第一个 sample 时立即返回 `422 long_audio_requires_vad`；VAD path 只在超过适用 `effective_max_audio_samples` 或 12 小时发布硬上限时返回 `413 audio_too_long`。同步请求在 request 内遵循同一 actual path 顺序，不宣称 actual PCM 总时长硬上限总是先于 VAD 要求。流式接收期间继续按上述累计 byte 规则处理 byte 上限。
 
 ### 7.2 异步提交
 
@@ -544,6 +580,9 @@ queued/running -> cancelled
 - claim 时将当前 process generation 持久化到 `job.owner_generation`。重启发现 running 且 `job.owner_generation == shutdown_marker.generation`（上一进程）时从头 requeue，不增加 `crash_recoveries`；其他异常遗留令 `crash_recoveries += 1`。
 - 同一 job 最多一次 crash recovery；第二次异常则 `failed`。不实现 segment checkpoint resume。
 - cancel 在当前有界 segment/batch 结束后生效。
+- `effective_max_audio_samples` 在 job 提交时固定为当时适用的部署 `max_audio_duration_secs * 16000`，且不得超过 12 小时发布硬上限对应的 samples；它在 job 生命周期内不可变，重启后的配置变化不得改变旧 job 的限制。
+- `effective_direct_max_audio_samples` 在 job 提交时固定为当时适用的部署 `direct_max_audio_duration_secs * 16000`，并受 `effective_max_audio_samples` 和 480,000 samples（30 秒）发布上限约束；它在 job 生命周期内不可变。同步请求不持久化 job 字段，但必须把本次请求开始时的当前 effective direct cap 传给同一个 processor，direct decoder 不得使用代码内固定的 480,000 threshold。
+- `total_samples` 只表示 ffmpeg 实际输出的连续 mono 16 kHz PCM sample count，不由 `ffprobe` duration 换算。任一 attempt 首次成功到达 decoder EOF 前，`total_samples` 为 `NULL`；首次固定后在整个 job 生命周期内不可变。requeue 保留已经固定的 `total_samples`，只把 `processed_samples` 归零；新 attempt 到达 EOF 时必须得到完全相同的 actual count。succeeded 必须满足 `total_samples IS NOT NULL` 且 `processed_samples == total_samples`；failed/cancelled 可以没有 `total_samples`。
 
 ### 7.5 查询
 
@@ -564,7 +603,7 @@ queued/running：
 }
 ```
 
-`progress` 是处理进度，不是预计完成时间。
+`processed_audio_secs = processed_samples / 16000`。`total_samples` 已固定时，`total_audio_secs = total_samples / 16000`；否则 `total_audio_secs = null`。queued/running 不返回 `ffprobe` estimate，也不把未知总时长伪装为 sample-exact duration；`progress` 是处理进度，不是预计完成时间。
 
 succeeded 始终返回 job envelope：
 
@@ -604,9 +643,9 @@ SQLite 保存：
 - 状态和 attempts；
 - 安全的输入文件内部路径；
 - 经过验证的 canonical request options；
-- duration、size、progress；
+- input size、`effective_max_audio_samples`、`effective_direct_max_audio_samples`、`processed_samples` 和 nullable actual `total_samples`；
 - 当前 attempt、结果文件内部路径或稳定错误码；
-- 已选择人物的 job-private profile snapshot；
+- 已选择人物的 canonical job-private profile snapshot、snapshot SHA-256、request fingerprint 和 processor fingerprint；
 - created/started/finished 时间。
 
 SQLite 还保存 upload/job storage reservation、`cancel_requested`、attempt token、`owner_generation` 和 cleanup phase；内部字段不进入公开响应。
@@ -622,11 +661,12 @@ SQLite 还保存 upload/job storage reservation、`cancel_requested`、attempt t
 写入规则：
 
 - 接收首个 body 字节前，先在 SQLite 原子创建不可见的 receiving 记录和初始 storage reservation，再写确定性 job 路径的 `.partial`。
-- 完成 byte/duration 校验后 `fsync` 文件、原子 rename 为 `.ready`、`fsync` 父目录；随后一个 SQLite 事务写入 canonical options、duration、job-private profile snapshot、request/processor fingerprint 并 CAS 为 queued，commit 后才返回 `202`。
+- 完成 byte 与 `ffprobe` 前置校验后 `fsync` 输入文件、原子 rename 为 `.ready`、`fsync` 父目录；`ffprobe` duration 随本次请求结束丢弃，不持久化。随后在同一个 SQLite `BEGIN IMMEDIATE` 事务内依次：从 sealed input lease 取得 `input_sha256`；按 `canonical_options` 中升序的 speaker ID `SELECT` 当前 profiles 并验证存在性与 compatibility；serialize §9.4 snapshot 并计算 snapshot SHA-256；计算 §4.4 request fingerprint；写入 `canonical_options`、snapshot、request/processor fingerprint、`effective_max_audio_samples` 和 `effective_direct_max_audio_samples`，并以 `total_samples = NULL`、`processed_samples = 0` CAS 为 queued。commit 后才返回 `202`。该事务不预解码输入，也不创建或 spool PCM。
 - 文件系统 rename 与 SQLite 不伪装成同一原子提交。启动时所有仍为 receiving 的记录，无论存在 `.partial` 还是 `.ready`，都转 deleting 并幂等清理；客户端尚未收到 job，不尝试从音频反推 metadata 或提升 queued。
 - queued commit 后、`202` 返回前崩溃可能留下客户端不可见的有效 job，这是 HTTP 边界；它按正常 retention 处理，不引入 idempotency key 或额外查询协议。
 - 每次 attempt 使用独立 JSONL 临时结果，从空文件逐 segment 写入。finalize 只用有界次数的顺序扫描生成内部 envelope：首行 manifest 含 `job_id`、attempt、request fingerprint 和 processor fingerprint，后续是 canonical result；不得整体 `json.dumps` 物化。
 - `.complete` 落盘后才在一个 SQLite 事务中校验 attempt 并标记 succeeded，同时设置 `input_cleanup_pending`；实际 unlink 输入并 `fsync` 目录后才释放其 reservation，恢复器继续未完成 cleanup。
+- 恢复 succeeded 必须同时看到 non-null `total_samples`、`processed_samples == total_samples`，以及 valid、exact-bound 的 `.complete` result；不得从 result body 或 `ffprobe` 值反推 `total_samples`。
 - 若在结果 rename 后、状态提交前崩溃，恢复器验证 `.complete` envelope 后复用完全相同的 `status=running AND attempt_token=<当前值> AND cancel_requested=false` CAS；成功才提交 succeeded。取消已获胜时删除 `.complete` 并完成 cancelled cleanup，不重复推理或覆盖取消。
 - 若 running job 没有有效 `.complete`，删除该 attempt 的 partial artifact，按 §7.4 的单次 crash recovery 重新排队。
 - 恢复器只对 SQLite 引用路径和受控目录的严格文件名布局做对账；不从任意文件内容猜测或创建 job。
@@ -690,11 +730,14 @@ process(
   canonical_options,
   cancellation,
   progress_sink,
-  segment_sink
+  segment_sink,
+  *,
+  effective_max_audio_samples,
+  effective_direct_max_audio_samples
 ) -> result_artifact
 ```
 
-processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只向注入的 `SegmentSink` 追加 sample-based canonical records，并接收 sink 完成后返回的 opaque artifact ref。API composition 在调用 processor 前从 storage 获取带 reservation 的 byte writer，再将其包装为 canonical JSONL `SegmentSink`；pipeline 不依赖 storage。sync 使用 request-owned artifact/progress sink，async 使用 durable attempt artifact/SQLite sink；direct/VAD 只是 processor 内的 segmentation policy，crash recovery 从头调用同一函数。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
+processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只向注入的 `SegmentSink` 追加 sample-based canonical records，并接收 sink 完成后返回的 opaque artifact ref。API composition 在调用 processor 前从 storage 获取带 reservation 的 byte writer，再将其包装为 canonical JSONL `SegmentSink`；pipeline 不依赖 storage。sync 使用 request-owned artifact/progress sink，并传入本次请求的 current effective overall/direct sample caps；async 使用 durable attempt artifact/SQLite sink，并传入 job row 中 immutable 的 `effective_max_audio_samples` 和 `effective_direct_max_audio_samples`。direct/VAD 只是 processor 内的 segmentation policy，crash recovery 从头调用同一函数。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
 
 ### 8.2 Decoder
 
@@ -704,10 +747,12 @@ processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只
 - protocol 只允许本地 `file,pipe`，container 禁止网络；format 必须落在受支持音频/媒体 demuxer allowlist，playlist/concat-like 输入 fail closed。
 - 输出固定为 little-endian signed PCM16（`s16le`）、mono、16 kHz。decoder 以 `DecodedBlock(start_sample, pcm)` 交付一维 C-contiguous `np.int16`，非末块固定为 9,600 samples，末块为 1–9,600 samples，`start_sample` 从 0 起严格连续。
 - pipe read 可跨 read 保留至多 1 byte carry；EOF 仍剩 1 byte 是 malformed decoder output，必须失败，不能丢弃或补零。
+- decoder 只有在成功读到 EOF、确认无残留半个 sample 且子进程成功退出后，processor 才调用 `progress_sink.update(processed_samples=actual_count, total_samples=actual_count)`；processor 不知道 job、attempt token 或 SQLite，也不执行 CAS 或 artifact cleanup。同步 request-local progress sink 只在本次请求内校验并固定 actual count。异步 durable progress sink 把 EOF update 实现为 attempt/cancel fenced CAS；CAS loser 的停止、partial artifact 清理以及禁止 finalize/commit 均由 async composition/storage 层负责。
+- EOF 前的异步 progress update 同样必须要求 job 为 `visible/running`、attempt token 等于当前 token且尚未取消，并只允许 `processed_samples` 单调不减；`total_samples IS NULL` 时还必须满足 `processed_samples <= effective_max_audio_samples`，已有 non-null `total_samples` 时必须满足 `processed_samples <= total_samples`。EOF fenced CAS 还必须要求 `total_samples` 为 `NULL` 或已经等于 actual count、`processed_samples <= actual count` 且 `actual count <= effective_max_audio_samples`；成功时原子设置 `processed_samples = total_samples = actual count`。已有 non-null `total_samples` 与新 attempt actual count 不同必须 fail closed；任何 fence/CAS loser 都由 async composition/storage 停止当前 attempt 并幂等清理其 partial artifact，不得 finalize 或提交结果。
 - processor 边界始终使用 `np.int16`；模型 adapter 只在当前有界 segment 内执行 `pcm.astype(np.float32) / 32768.0`，校验一维、finite 和长度后调用模型，不在 processor 额外保留一份 float32 全量副本。
-- direct path 同样按输出 PCM sample 计数。1–480,000 samples 只产生一个 half-open segment `[0,n)`；第 480,001 个 sample 立即终止 decoder并返回 `422 long_audio_requires_vad`，不得调用模型、追加/完成成功 segment sink 或留下 partial artifact/reservation，也禁止把前 30 秒作为成功响应。
+- direct path 同样按输出 PCM sample 计数，并使用调用方提供的 `effective_direct_max_audio_samples`，不得在 decoder 内写死 480,000。1–effective direct cap samples 只产生一个 half-open segment `[0,n)`；读到第 effective direct cap + 1 个 sample 时立即终止 decoder 并返回 `422 long_audio_requires_vad`，不得调用模型、追加/完成成功 segment sink 或留下 partial artifact/reservation，也禁止把 cap 内前缀作为成功响应。异步执行使用 job 持久化的 immutable cap，同步执行使用本次请求的 current effective cap；首版发布 cap 上限仍为 480,000 samples（30 秒）。
 - direct path 解码为 0 samples 时按 §6.5 返回成功空结果，模型调用数为 0。
-- VAD path 按实际 PCM sample 数再次执行部署时长上限；超过部署值或 12 小时发布硬上限即停止并返回 `413 audio_too_long`，`ffprobe` 只做前置拒绝。
+- VAD path 按实际 PCM sample 数执行调用方提供的 `effective_max_audio_samples`；超过该值或 12 小时发布硬上限即停止并返回 `413 audio_too_long`，`ffprobe` 只做前置拒绝。异步执行使用 job 持久化的 immutable cap，同步执行使用本次请求的 current effective cap。
 - stderr 有界捕获，错误不回传原始命令或宿主路径。
 - 子进程跟随 request/job cancellation。
 - 每个 PCM block 大小固定并有背压。
@@ -833,8 +878,9 @@ DELETE /v1/speakers/{speaker_id}
 - 单请求最多 32 个已知人物。
 - 重复 ID 按 §6.2 返回 `400`；全部 ID 验证存在且与当前 embedding policy 兼容后按 ID 排序。
 - sync 请求在进入 processor 前、async 请求在 job 创建事务中 snapshot profile ID、name 和 embedding，避免运行中更新造成同一会议前后不一致。
-- 排序后的 ID 和对应 profile snapshot 用于 canonical request options、job-private profile snapshot hash 和 request fingerprint。
-- snapshot 只存储在 job 私有数据中，job 清理时一并删除。
+- async publish 在同一个 job 创建事务中按 ID 升序读取 profiles，并编码为 strict canonical UTF-8 JSON。version 1 wire 的唯一 shape 是 `{"speakers":[{"embedding":"...","id":"...","name":"..."}],"version":1}`；top-level exact keys 为 `speakers,version`，speaker entry exact keys 为 `embedding,id,name`，`version` 必须是 exact integer `1`，不得接受 boolean、其他 number 或 string。speaker array 最多 32 项，严格按 ID 升序且拒绝 duplicate ID；`name` 必须等于 speaker profile 的 canonical name。
+- `embedding` 是 canonical little-endian float32 embedding bytes 的 RFC 4648 standard Base64，保留 `=` padding且不得含 whitespace。decode 后必须使用 `SpeakerEmbedding.from_bytes` 和当前 `speaker_embedding_policy_fingerprint` 固定的 expected dimension 验证 byte length、finite 与 normalization；parser 必须拒绝未知/缺失 key、非 canonical Base64，以及任何不能原样 reserialize 的 wire。empty snapshot 的唯一 bytes 是 `{"speakers":[],"version":1}`。整个 canonical snapshot UTF-8 wire 不得超过 64 KiB；它继续内联存储在现有 job 私有数据中，不新增 artifact、table 或 lease。
+- snapshot SHA-256 对上述 exact bytes 计算；snapshot speaker ID 必须与 `canonical_options.known_speaker_ids` 完全一致。snapshot 只存储在 job 私有数据中，job 清理时一并删除；profile 后续更新或删除不改变该 job snapshot。
 
 ### 9.5 匹配规则
 
