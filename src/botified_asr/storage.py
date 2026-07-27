@@ -13,17 +13,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable
 
+from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
 from botified_asr.jobs import (
     DurableJob,
     JobPhase,
     JobProgressOutcome,
+    JobSuccessOutcome,
     JobStatus,
     QueuedJobSpec,
     generate_attempt_token,
     generate_job_id,
     validate_job_id,
 )
+from botified_asr.result_artifact import ResultEnvelopeReader
 from botified_asr.speaker_profiles import (
     KEEP_EXISTING,
     SpeakerEmbedding,
@@ -2022,6 +2025,177 @@ class Storage:
             lease_type="upload",
             directory=self.staging_dir,
         )
+
+    def begin_job_result_artifact(
+        self,
+        job_id: str,
+        attempt_token: str,
+    ) -> ReservedByteWriter:
+        validate_job_id(job_id)
+        _validate_nonempty_text(attempt_token, name="attempt token")
+        lease_id = uuid.uuid4().hex
+        path = self.artifact_dir / f"{lease_id}.partial"
+        reservation = RESERVATION_QUANTUM
+        with self._transaction():
+            running = self._connection.execute(
+                """
+                SELECT 1 FROM transcription_jobs
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'running' AND attempt_token = ?
+                """,
+                (job_id, attempt_token),
+            ).fetchone()
+            if running is None:
+                raise RuntimeError("job attempt is no longer running")
+            duplicate = self._connection.execute(
+                """
+                SELECT 1 FROM storage_leases
+                WHERE lease_type = 'artifact'
+                  AND resource_kind = 'result_complete'
+                  AND owner_kind = 'job' AND owner_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if duplicate is not None:
+                raise RuntimeError("job result artifact already exists")
+            self._admit_delta(reservation)
+            self._connection.execute(
+                """
+                INSERT INTO storage_leases(
+                    id, lease_type, resource_kind, owner_kind, owner_id,
+                    phase, controlled_path, reserved_bytes, actual_bytes
+                ) VALUES (
+                    ?, 'artifact', 'result_complete', 'job', ?,
+                    'writing', ?, ?, 0
+                )
+                """,
+                (lease_id, job_id, str(path), reservation),
+            )
+        try:
+            handle = path.open("xb")
+        except OSError:
+            with self._transaction():
+                self._connection.execute(
+                    "DELETE FROM storage_leases WHERE id = ?",
+                    (lease_id,),
+                )
+            raise
+        self._files[lease_id] = handle
+        return ReservedByteWriter(
+            lease_id,
+            "result_complete",
+            "job",
+            job_id,
+            path,
+            reservation,
+        )
+
+    def commit_job_success(
+        self,
+        job_id: str,
+        attempt_token: str,
+        result_ref: ArtifactRef,
+    ) -> JobSuccessOutcome:
+        validate_job_id(job_id)
+        _validate_nonempty_text(attempt_token, name="attempt token")
+        if type(result_ref) is not ArtifactRef:
+            raise TypeError("commit_job_success requires an ArtifactRef")
+        if (
+            result_ref.resource_kind != "result_complete"
+            or result_ref.owner_kind != "job"
+            or result_ref.owner_id != job_id
+        ):
+            raise ValueError("job result artifact identity is invalid")
+
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["phase"] != "visible"
+            or row["status"] != "running"
+            or row["attempt_token"] != attempt_token
+        ):
+            self.release_artifact(result_ref)
+            return JobSuccessOutcome.STALE
+        if row["cancel_requested"] == 1:
+            self.release_artifact(result_ref)
+            return JobSuccessOutcome.CANCEL_REQUESTED
+        if (
+            row["cancel_requested"] != 0
+            or row["processed_samples"] != row["total_samples"]
+        ):
+            self.release_artifact(result_ref)
+            return JobSuccessOutcome.STALE
+
+        job = _decode_transcription_job(row)
+        manifest = ResultEnvelopeReader(
+            self.resolve_artifact(result_ref),
+            expected_size_bytes=result_ref.actual_bytes,
+            expected_sha256=result_ref.content_sha256,
+            expected_job_id=job.id,
+            expected_attempt_no=job.attempt_no,
+            expected_request_fingerprint=job.request_fingerprint,
+            expected_processor_fingerprint=job.processor_fingerprint,
+            canonical_options=parse_canonical_options_json(
+                job.canonical_options_json
+            ),
+            expected_total_samples=job.total_samples,
+        ).validate()
+        assert job.started_at is not None
+        if manifest.finished_at < job.started_at:
+            raise ValueError(
+                "job result finished before its attempt started"
+            )
+
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET
+                    status = 'succeeded',
+                    attempt_token = NULL,
+                    owner_generation = NULL,
+                    result_lease_id = ?,
+                    input_cleanup_pending = 1,
+                    finished_at = ?
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'running' AND attempt_token = ?
+                  AND cancel_requested = 0
+                  AND processed_samples = total_samples
+                  AND result_lease_id IS NULL
+                """,
+                (
+                    result_ref.id,
+                    _encode_job_timestamp(manifest.finished_at),
+                    job_id,
+                    attempt_token,
+                ),
+            ).rowcount
+            if changed == 1:
+                return JobSuccessOutcome.COMMITTED
+            current = self._connection.execute(
+                """
+                SELECT status, attempt_token, cancel_requested
+                FROM transcription_jobs
+                WHERE id = ? AND phase = 'visible'
+                """,
+                (job_id,),
+            ).fetchone()
+            cancelled = (
+                current is not None
+                and current["status"] == "running"
+                and current["attempt_token"] == attempt_token
+                and current["cancel_requested"] == 1
+            )
+        self.release_artifact(result_ref)
+        if cancelled:
+            return JobSuccessOutcome.CANCEL_REQUESTED
+        return JobSuccessOutcome.STALE
 
     def begin_artifact(
         self,
