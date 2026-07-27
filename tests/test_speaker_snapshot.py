@@ -77,6 +77,28 @@ def _profile(
     )
 
 
+_AXIS_0_BASE64 = "AACAPwAAAAA="
+_AXIS_1_BASE64 = "AAAAAAAAgD8="
+
+
+def _wire_entry(
+    profile_id: str = "00000001",
+    *,
+    name: str = "Alice",
+    embedding: str = _AXIS_0_BASE64,
+) -> str:
+    return (
+        f'{{"embedding":"{embedding}","id":"{profile_id}",'
+        f'"name":"{name}"}}'
+    )
+
+
+def _snapshot_wire(*entries: str) -> bytes:
+    return (
+        f'{{"speakers":[{",".join(entries)}],"version":1}}'
+    ).encode("utf-8")
+
+
 class RecordingReader:
     def __init__(
         self,
@@ -263,3 +285,210 @@ def test_reader_storage_schema_error_is_propagated_unchanged() -> None:
             _policy(),
         )
     assert caught.value is expected
+
+
+def test_snapshot_v1_empty_wire_is_exact() -> None:
+    snapshot_module = _snapshot_module()
+
+    wire = snapshot_module.serialize_selected_speaker_snapshot(
+        snapshot_module.SelectedSpeakerSnapshot(()),
+        _policy(),
+    )
+
+    assert wire == b'{"speakers":[],"version":1}'
+
+
+def test_snapshot_v1_sorted_utf8_wire_and_roundtrip_are_exact() -> None:
+    snapshot_module = _snapshot_module()
+    low = snapshot_module.SelectedSpeaker(
+        "00000001",
+        "艾丽丝",
+        _embedding(),
+    )
+    high = snapshot_module.SelectedSpeaker(
+        "00000002",
+        "Bob",
+        _embedding(axis=1),
+    )
+    snapshot = snapshot_module.SelectedSpeakerSnapshot((low, high))
+
+    wire = snapshot_module.serialize_selected_speaker_snapshot(
+        snapshot_module.SelectedSpeakerSnapshot((high, low)),
+        _policy(),
+    )
+
+    assert wire == (
+        '{"speakers":['
+        '{"embedding":"AACAPwAAAAA=","id":"00000001","name":"艾丽丝"},'
+        '{"embedding":"AAAAAAAAgD8=","id":"00000002","name":"Bob"}'
+        '],"version":1}'
+    ).encode("utf-8")
+    assert snapshot_module.parse_selected_speaker_snapshot(
+        wire,
+        _policy(),
+        expected_ids=("00000001", "00000002"),
+    ) == snapshot
+    assert snapshot_module.parse_selected_speaker_snapshot(
+        snapshot_module.serialize_selected_speaker_snapshot(
+            snapshot,
+            _policy(),
+        ),
+        _policy(),
+        expected_ids=("00000001", "00000002"),
+    ) == snapshot
+
+
+_VALID_ENTRY = _wire_entry()
+_VALID_WIRE = _snapshot_wire(_VALID_ENTRY)
+_TWO_IDS = ("00000001", "00000002")
+_THIRTY_THREE_IDS = tuple(f"{index:08d}" for index in range(1, 34))
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected_ids"),
+    (
+        (
+            b'{"speakers":[],"speakers":[],"version":1}',
+            (),
+        ),
+        (
+            b'{"extra":0,"speakers":[],"version":1}',
+            (),
+        ),
+        (b'{"speakers":[]}', ()),
+        (b'{"version":1}', ()),
+        (
+            _snapshot_wire(
+                '{"embedding":"AACAPwAAAAA=","embedding":"AACAPwAAAAA=",'
+                '"id":"00000001","name":"Alice"}'
+            ),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(
+                '{"embedding":"AACAPwAAAAA=","extra":0,'
+                '"id":"00000001","name":"Alice"}'
+            ),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire('{"id":"00000001","name":"Alice"}'),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(
+                '{"embedding":"AACAPwAAAAA=","name":"Alice"}'
+            ),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(
+                '{"embedding":"AACAPwAAAAA=","id":"00000001"}'
+            ),
+            ("00000001",),
+        ),
+        (b'{"speakers":[],"version":true}', ()),
+        (b'{"speakers":[],"version":2}', ()),
+        (b'{"speakers": [],"version":1}', ()),
+        (b'{"version":1,"speakers":[]}', ()),
+        (
+            _snapshot_wire(
+                _wire_entry(name=r"\u827e\u4e3d\u4e1d")
+            ),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="18c-v2WzKj8=")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="AACAPwAAAAA")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="AACA PwAAAAA=")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="AACAPw==")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="AACAfwAAAAA=")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(embedding="AAAAPwAAAAA=")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(_wire_entry(name=" Alice ")),
+            ("00000001",),
+        ),
+        (
+            _snapshot_wire(
+                _wire_entry("00000002", embedding=_AXIS_1_BASE64),
+                _VALID_ENTRY,
+            ),
+            _TWO_IDS,
+        ),
+        (
+            _snapshot_wire(_VALID_ENTRY, _VALID_ENTRY),
+            _TWO_IDS,
+        ),
+        (_VALID_WIRE, ("00000002",)),
+        (
+            _snapshot_wire(
+                *(
+                    _wire_entry(profile_id)
+                    for profile_id in _THIRTY_THREE_IDS
+                )
+            ),
+            _THIRTY_THREE_IDS,
+        ),
+        (
+            _VALID_WIRE + b" " * (64 * 1024 + 1 - len(_VALID_WIRE)),
+            ("00000001",),
+        ),
+    ),
+    ids=(
+        "duplicate_top_key",
+        "unknown_top_key",
+        "missing_top_version",
+        "missing_top_speakers",
+        "duplicate_entry_key",
+        "unknown_entry_key",
+        "missing_entry_embedding",
+        "missing_entry_id",
+        "missing_entry_name",
+        "version_bool",
+        "version_non_one",
+        "json_whitespace",
+        "json_key_order",
+        "unicode_escape",
+        "urlsafe_base64",
+        "unpadded_base64",
+        "whitespace_base64",
+        "bad_embedding_length",
+        "nonfinite_embedding",
+        "nonunit_embedding",
+        "noncanonical_name",
+        "ids_out_of_order",
+        "duplicate_ids",
+        "expected_ids_mismatch",
+        "too_many_speakers",
+        "wire_over_64_kib",
+    ),
+)
+def test_snapshot_v1_parser_rejects_noncanonical_or_invalid_wire(
+    wire: bytes,
+    expected_ids: tuple[str, ...],
+) -> None:
+    snapshot_module = _snapshot_module()
+
+    with pytest.raises((TypeError, ValueError)):
+        snapshot_module.parse_selected_speaker_snapshot(
+            wire,
+            _policy(),
+            expected_ids=expected_ids,
+        )
