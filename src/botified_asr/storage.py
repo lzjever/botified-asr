@@ -661,41 +661,138 @@ class Storage:
         handle = self._files.get(lease.id)
         if handle is None:
             raise RuntimeError(f"{lease_type} lease is closed")
-        handle.flush()
-        os.fsync(handle.fileno())
-        handle.close()
-        self._files.pop(lease.id, None)
         sealed_path = directory / f"{lease.id}.{sealed_suffix}"
-        os.replace(lease.path, sealed_path)
-        _fsync_directory(directory)
-        digest = lease._hasher.hexdigest()
-        with self._transaction():
-            changed = self._connection.execute(
-                """
-                UPDATE storage_leases
-                SET phase = 'sealed', controlled_path = ?,
-                    reserved_bytes = ?, actual_bytes = ?,
-                    content_sha256 = ?
-                WHERE id = ? AND lease_type = ? AND phase = 'writing'
-                """,
-                (
-                    str(sealed_path),
-                    lease.actual_bytes,
-                    lease.actual_bytes,
-                    digest,
-                    lease.id,
-                    lease_type,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError(
-                    f"{lease_type} lease is no longer writing"
-                )
+        try:
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            self._files.pop(lease.id, None)
+            os.replace(lease.path, sealed_path)
+            _fsync_directory(directory)
+            digest = lease._hasher.hexdigest()
+            with self._transaction():
+                changed = self._connection.execute(
+                    """
+                    UPDATE storage_leases
+                    SET phase = 'sealed', controlled_path = ?,
+                        reserved_bytes = ?, actual_bytes = ?,
+                        content_sha256 = ?
+                    WHERE id = ? AND lease_type = ? AND phase = 'writing'
+                    """,
+                    (
+                        str(sealed_path),
+                        lease.actual_bytes,
+                        lease.actual_bytes,
+                        digest,
+                        lease.id,
+                        lease_type,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        f"{lease_type} lease is no longer writing"
+                    )
+        except BaseException:
+            self._compensate_failed_seal(
+                lease,
+                lease_type=lease_type,
+                directory=directory,
+                sealed_path=sealed_path,
+            )
+            raise
         lease.path = sealed_path
         lease.reserved_bytes = lease.actual_bytes
         lease.content_sha256 = digest
         lease._state = "sealed"
         return sealed_path, digest
+
+    def _compensate_failed_seal(
+        self,
+        lease: UploadLease | ReservedByteWriter,
+        *,
+        lease_type: str,
+        directory: Path,
+        sealed_path: Path,
+    ) -> None:
+        partial_path = lease.path
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT resource_kind, owner_kind, owner_id, phase,
+                       controlled_path
+                FROM storage_leases
+                WHERE id = ? AND lease_type = ?
+                """,
+                (lease.id, lease_type),
+            ).fetchone()
+        if row is None or (
+            row["resource_kind"] != lease.resource_kind
+            or row["owner_kind"] != lease.owner_kind
+            or row["owner_id"] != lease.owner_id
+            or row["phase"] not in {"writing", "sealed"}
+        ):
+            raise RuntimeError(f"{lease_type} lease does not match ledger")
+        expected_path = (
+            partial_path if row["phase"] == "writing" else sealed_path
+        )
+        if (
+            row["controlled_path"] != str(expected_path)
+            or not self._is_controlled_path(
+                lease.id,
+                lease_type,
+                row["phase"],
+                expected_path,
+            )
+            or not self._is_controlled_path(
+                lease.id,
+                lease_type,
+                "writing",
+                partial_path,
+            )
+            or not self._is_controlled_path(
+                lease.id,
+                lease_type,
+                "sealed",
+                sealed_path,
+            )
+        ):
+            raise RuntimeError(
+                f"{lease_type} lease does not match ledger"
+            )
+        handle = self._files.get(lease.id)
+        if handle is not None:
+            handle.close()
+            self._files.pop(lease.id, None)
+        for path in (partial_path, sealed_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        _fsync_directory(directory)
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE id = ? AND lease_type = ?
+                    AND resource_kind = ? AND owner_kind = ?
+                    AND owner_id = ? AND phase IN ('writing', 'sealed')
+                    AND controlled_path IN (?, ?)
+                """,
+                (
+                    lease.id,
+                    lease_type,
+                    lease.resource_kind,
+                    lease.owner_kind,
+                    lease.owner_id,
+                    str(partial_path),
+                    str(sealed_path),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    f"{lease_type} lease changed during seal cleanup"
+                )
+        lease._state = "aborted"
 
     def _abort_writing(
         self,
@@ -708,6 +805,52 @@ class Storage:
         if lease._state == "aborted":
             return
         self._require_writing(lease, lease_type)
+        sealed_path = directory / f"{lease.id}.{suffixes[1]}"
+        with self._lock:
+            phase_row = self._connection.execute(
+                """
+                SELECT lease_type, phase
+                FROM storage_leases
+                WHERE id = ?
+                """,
+                (lease.id,),
+            ).fetchone()
+            handle_is_closed = lease.id not in self._files
+            cleanup_already_complete = (
+                phase_row is None
+                and handle_is_closed
+                and self._is_controlled_path(
+                    lease.id,
+                    lease_type,
+                    "writing",
+                    lease.path,
+                )
+                and self._is_controlled_path(
+                    lease.id,
+                    lease_type,
+                    "sealed",
+                    sealed_path,
+                )
+                and not lease.path.exists()
+                and not sealed_path.exists()
+            )
+            retry_failed_seal = (
+                phase_row is not None
+                and phase_row["lease_type"] == lease_type
+                and phase_row["phase"] == "sealed"
+                and handle_is_closed
+            )
+            if cleanup_already_complete:
+                lease._state = "aborted"
+                return
+        if retry_failed_seal:
+            self._compensate_failed_seal(
+                lease,
+                lease_type=lease_type,
+                directory=directory,
+                sealed_path=sealed_path,
+            )
+            return
         with self._transaction():
             row = self._connection.execute(
                 """

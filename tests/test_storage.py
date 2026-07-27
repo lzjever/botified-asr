@@ -549,6 +549,243 @@ def test_seal_and_release_keep_ledger_until_filesystem_is_durable(
         storage.close()
 
 
+@pytest.mark.parametrize("lease_type", ["artifact", "upload"])
+@pytest.mark.parametrize(
+    ("fault", "expected_type", "message"),
+    [
+        ("rename", OSError, "rename failed"),
+        ("directory_fsync", OSError, "directory fsync failed"),
+        ("database_update", sqlite3.IntegrityError, "seal update failed"),
+        ("commit_ack", OSError, "commit acknowledgement failed"),
+    ],
+)
+def test_seal_failure_windows_compensate_before_returning_public_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_type: str,
+    fault: str,
+    expected_type: type[Exception],
+    message: str,
+) -> None:
+    import botified_asr.storage as storage_module
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    if lease_type == "artifact":
+        lease = storage.begin_artifact(
+            "segment_jsonl",
+            owner_kind="sync",
+            owner_id="request-1",
+        )
+        storage.append_artifact(lease, b"result")
+
+        def seal() -> object:
+            return storage.seal_artifact(lease)
+
+        sealed_path = storage.artifact_dir / f"{lease.id}.complete"
+    else:
+        lease = storage.begin_upload("transcription")
+        storage.append(lease, b"input")
+
+        def seal() -> object:
+            return storage.seal_upload(lease)
+
+        sealed_path = storage.staging_dir / f"{lease.id}.ready"
+
+    if fault == "rename":
+        original_replace = storage_module.os.replace
+        failed = False
+
+        def fail_replace(source: Path, target: Path) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError(message)
+            original_replace(source, target)
+
+        monkeypatch.setattr(storage_module.os, "replace", fail_replace)
+    elif fault == "directory_fsync":
+        original_fsync_directory = storage_module._fsync_directory
+        failed = False
+
+        def fail_fsync(path: Path) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError(message)
+            original_fsync_directory(path)
+
+        monkeypatch.setattr(
+            storage_module,
+            "_fsync_directory",
+            fail_fsync,
+        )
+    elif fault == "database_update":
+        storage._connection.execute(
+            """
+            CREATE TRIGGER reject_seal_update
+            BEFORE UPDATE OF phase ON storage_leases
+            WHEN NEW.phase = 'sealed'
+            BEGIN
+                SELECT RAISE(FAIL, 'seal update failed');
+            END
+            """
+        )
+    else:
+        original_exit = storage_module._Transaction.__exit__
+        failed = False
+
+        def fail_after_commit(
+            transaction,
+            exc_type,
+            exc,
+            traceback,
+        ) -> bool:
+            nonlocal failed
+            result = original_exit(transaction, exc_type, exc, traceback)
+            if exc_type is None and not failed:
+                failed = True
+                raise OSError(message)
+            return result
+
+        monkeypatch.setattr(
+            storage_module._Transaction,
+            "__exit__",
+            fail_after_commit,
+        )
+
+    try:
+        with pytest.raises(expected_type, match=message):
+            seal()
+
+        assert lease._state == "aborted"
+        assert lease.id not in storage._files
+        assert not lease.path.exists()
+        assert not sealed_path.exists()
+        assert (
+            storage._connection.execute(
+                "SELECT 1 FROM storage_leases WHERE id = ?",
+                (lease.id,),
+            ).fetchone()
+            is None
+        )
+        assert storage.total_reserved_bytes() == 0
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("lease_type", ["artifact", "upload"])
+@pytest.mark.parametrize(
+    "ledger_state",
+    ["writing", "sealed", "missing"],
+)
+def test_failed_seal_compensation_remains_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_type: str,
+    ledger_state: str,
+) -> None:
+    import botified_asr.storage as storage_module
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    if lease_type == "artifact":
+        writer = storage.begin_artifact(
+            "segment_jsonl",
+            owner_kind="sync",
+            owner_id="request-1",
+        )
+        storage.append_artifact(writer, b"result")
+
+        def seal() -> object:
+            return storage.seal_artifact(writer)
+
+        def abort() -> None:
+            storage.abort_artifact(writer)
+
+        directory = storage.artifact_dir
+    else:
+        writer = storage.begin_upload("transcription")
+        storage.append(writer, b"input")
+
+        def seal() -> object:
+            return storage.seal_upload(writer)
+
+        def abort() -> None:
+            storage.abort_upload(writer)
+
+        directory = storage.staging_dir
+
+    original_fsync_directory = storage_module._fsync_directory
+    fsync_calls = 0
+
+    def fail_compensation_fsync(path: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if (
+            ledger_state == "writing"
+            and fsync_calls in {1, 2}
+        ) or (
+            ledger_state == "sealed"
+            and fsync_calls == 2
+        ) or (
+            ledger_state == "missing"
+            and fsync_calls == 1
+        ):
+            raise OSError("directory fsync failed")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        storage_module,
+        "_fsync_directory",
+        fail_compensation_fsync,
+    )
+    if ledger_state in {"sealed", "missing"}:
+        original_exit = storage_module._Transaction.__exit__
+        failed = False
+
+        def fail_after_commit(
+            transaction,
+            exc_type,
+            exc,
+            traceback,
+        ) -> bool:
+            nonlocal failed
+            result = original_exit(transaction, exc_type, exc, traceback)
+            if exc_type is None and not failed:
+                failed = True
+                raise OSError("commit acknowledgement failed")
+            return result
+
+        monkeypatch.setattr(
+            storage_module._Transaction,
+            "__exit__",
+            fail_after_commit,
+        )
+    try:
+        expected_error = (
+            "commit acknowledgement failed"
+            if ledger_state == "missing"
+            else "directory fsync failed"
+        )
+        with pytest.raises(OSError, match=expected_error):
+            seal()
+
+        assert writer._state == "writing"
+        row = storage._connection.execute(
+            "SELECT phase FROM storage_leases WHERE id = ?",
+            (writer.id,),
+        ).fetchone()
+        if ledger_state == "missing":
+            assert row is None
+        else:
+            assert row["phase"] == ledger_state
+        abort()
+        assert writer._state == "aborted"
+        assert storage.total_reserved_bytes() == 0
+        assert not list(directory.iterdir())
+    finally:
+        storage.close()
+
+
 def test_competing_reservations_cannot_overcommit(tmp_path: Path) -> None:
     storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     try:
