@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import re
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
 
 import anyio
 from python_multipart import MultipartParser
@@ -22,6 +21,10 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from botified_asr.audio import AudioError, Cancellation
+from botified_asr.canonical_options import (
+    CanonicalOptionsValidationError,
+    canonicalize_option_values,
+)
 from botified_asr.composition import (
     PreparedSyncResponse,
     TranscriptionProcessor,
@@ -42,7 +45,6 @@ from botified_asr.storage import (
     UploadLease,
 )
 
-
 MODEL_CREATED = 1785024000
 MAX_PARTS = 64
 MAX_PART_HEADER_BYTES = 32 * 1024
@@ -56,8 +58,6 @@ SCALAR_FIELDS = {
 }
 ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
-INCLUDE_ORDER = ("funasr.emotion", "funasr.audio_events")
-SPEAKER_ID_PATTERN = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
 
 
@@ -96,125 +96,30 @@ def canonicalize_options(
     unknown = sorted(set(fields) - SCALAR_FIELDS - ARRAY_FIELDS)
     if unknown:
         raise _invalid_multipart(f"Unknown multipart field: {unknown[0]}")
-    scalar = {
-        name: _one(fields, name)
-        for name in SCALAR_FIELDS
-        if name in fields
+    scalar = {name: _one(fields, name) for name in SCALAR_FIELDS if name in fields}
+    option_values: dict[str, object] = {
+        "model": scalar.get("model"),
+        "include": tuple(fields.get("include[]", ())),
+        "known_speaker_ids": tuple(fields.get("known_speaker_ids[]", ())),
     }
-    model = scalar.get("model")
-    if model not in {"sensevoice", "sensevoice-diarize"}:
-        raise ApiError(
-            400,
-            "invalid_model",
-            "model must be sensevoice or sensevoice-diarize",
-            param="model",
+    option_values.update(
+        (name, scalar[name])
+        for name in (
+            "language",
+            "response_format",
+            "chunking_strategy",
         )
-
-    language = scalar.get("language", "auto")
-    if language not in {"auto", "zh", "en", "yue", "ja", "ko"}:
-        raise ApiError(
-            400,
-            "invalid_language",
-            "unsupported language",
-            param="language",
-        )
-
-    response_format = scalar.get("response_format")
-    chunking_strategy = scalar.get("chunking_strategy")
-    if chunking_strategy not in {None, "auto"}:
-        raise ApiError(
-            400,
-            "invalid_chunking_strategy",
-            "chunking_strategy must be auto when provided",
-            param="chunking_strategy",
-        )
-
-    if model == "sensevoice-diarize":
-        if chunking_strategy != "auto":
-            raise ApiError(
-                400,
-                "diarization_requires_vad",
-                "sensevoice-diarize requires explicit chunking_strategy=auto",
-                param="chunking_strategy",
-            )
-        if response_format != "diarized_json":
-            raise ApiError(
-                400,
-                "diarization_requires_format",
-                "sensevoice-diarize requires explicit response_format=diarized_json",
-                param="response_format",
-            )
-    else:
-        response_format = response_format or "json"
-        if response_format == "diarized_json":
-            raise ApiError(
-                400,
-                "diarized_format_requires_model",
-                "diarized_json requires model=sensevoice-diarize",
-                param="response_format",
-            )
-
-    if response_format not in {"json", "text", "verbose_json", "diarized_json"}:
-        raise ApiError(
-            400,
-            "invalid_response_format",
-            "unsupported response_format",
-            param="response_format",
-        )
-
-    include_values = list(fields.get("include[]", ()))
-    invalid_include = next(
-        (value for value in include_values if value not in INCLUDE_ORDER), None
+        if name in scalar
     )
-    if invalid_include is not None:
+    try:
+        return canonicalize_option_values(**option_values)
+    except CanonicalOptionsValidationError as error:
         raise ApiError(
             400,
-            "invalid_include",
-            "unsupported include value",
-            param="include[]",
-        )
-    includes = tuple(value for value in INCLUDE_ORDER if value in include_values)
-    if response_format == "text" and includes:
-        raise ApiError(
-            400,
-            "incompatible_response_format",
-            "response_format=text cannot be combined with include[]",
-            param="response_format",
-        )
-
-    known_ids = list(fields.get("known_speaker_ids[]", ()))
-    if len(known_ids) != len(set(known_ids)):
-        raise ApiError(
-            400,
-            "invalid_known_speaker_ids",
-            "known_speaker_ids[] must not contain duplicates",
-            param="known_speaker_ids[]",
-        )
-    if len(known_ids) > 32 or any(
-        SPEAKER_ID_PATTERN.fullmatch(value) is None for value in known_ids
-    ):
-        raise ApiError(
-            400,
-            "invalid_known_speaker_ids",
-            "known_speaker_ids[] contains an invalid speaker ID",
-            param="known_speaker_ids[]",
-        )
-    if known_ids and model != "sensevoice-diarize":
-        raise ApiError(
-            400,
-            "known_speakers_require_diarization",
-            "known_speaker_ids[] requires model=sensevoice-diarize",
-            param="known_speaker_ids[]",
-        )
-
-    return CanonicalOptions(
-        model=model,
-        language=language,
-        response_format=response_format,
-        chunking_strategy=chunking_strategy,
-        include=includes,
-        known_speaker_ids=tuple(sorted(known_ids)),
-    )
+            error.code,
+            error.message,
+            param=error.param,
+        ) from error
 
 
 def create_app(

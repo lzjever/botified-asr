@@ -15,6 +15,10 @@ from botified_asr.storage import Storage, StorageAdmissionError, StorageSchemaEr
 
 
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+CANONICAL_OPTIONS_JSON = (
+    '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
+    '"language":"auto","model":"sensevoice","response_format":"json"}'
+)
 SPEC_FIELDS = (
     "canonical_options_json",
     "selected_speaker_snapshot",
@@ -40,7 +44,7 @@ def limits(**overrides: int) -> LimitsConfig:
 
 def queued_spec(**overrides: object) -> object:
     values = {
-        "canonical_options_json": '{"model":"sensevoice"}',
+        "canonical_options_json": CANONICAL_OPTIONS_JSON,
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
         "total_samples": 32_000,
@@ -88,7 +92,13 @@ def test_queued_job_spec_and_generated_ids_are_exact() -> None:
 
     invalid_changes = (
         {"canonical_options_json": ""},
-        {"canonical_options_json": b'{"model":"sensevoice"}'},
+        {"canonical_options_json": CANONICAL_OPTIONS_JSON.encode()},
+        {"canonical_options_json": '{"model":"sensevoice"}'},
+        {
+            "canonical_options_json": CANONICAL_OPTIONS_JSON.replace(
+                ":null", ": null"
+            )
+        },
         {"selected_speaker_snapshot": '{"speakers":[]}'},
         {"total_samples": True},
         {"total_samples": 1.0},
@@ -827,6 +837,7 @@ def test_startup_preserves_queued_input_and_cleans_unprotected_files(
         "file",
         "running",
         "marker",
+        "canonical-options",
         "job-artifact",
     ),
 )
@@ -888,6 +899,14 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
                 VALUES (1, 'generation-1', '2026-07-27T12:00:00.000Z')
                 """
             )
+        elif corruption == "canonical-options":
+            connection.execute(
+                """
+                UPDATE transcription_jobs SET canonical_options_json = ?
+                WHERE id = ?
+                """,
+                ('{"model":"sensevoice"}', job_ref.id),
+            )
         else:
             artifact_path = first.artifact_dir / "ABCDEFGH.partial"
             artifact_path.write_bytes(b"artifact")
@@ -904,6 +923,14 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
                 (job_ref.id, str(artifact_path)),
             )
         connection.commit()
+        database_before = tuple(
+            tuple(connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall())
+            for table in (
+                "transcription_jobs",
+                "storage_leases",
+                "shutdown_marker",
+            )
+        )
     finally:
         connection.close()
 
@@ -917,6 +944,25 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
         )
         if path.exists()
     }
+    file_contents_before = {
+        path: path.read_bytes() for path in existing_paths if path.is_file()
+    }
     with pytest.raises(StorageSchemaError):
         Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     assert all(path.exists() for path in existing_paths)
+    assert {
+        path: path.read_bytes() for path in existing_paths if path.is_file()
+    } == file_contents_before
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        database_after = tuple(
+            tuple(connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall())
+            for table in (
+                "transcription_jobs",
+                "storage_leases",
+                "shutdown_marker",
+            )
+        )
+    finally:
+        connection.close()
+    assert database_after == database_before

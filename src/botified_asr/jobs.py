@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+from botified_asr.canonical_options import parse_canonical_options_json
+
 _JOB_ID = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -59,8 +61,7 @@ class QueuedJobSpec:
     def __post_init__(self) -> None:
         if type(self.canonical_options_json) is not str:
             raise TypeError("canonical job options must be a string")
-        if not self.canonical_options_json:
-            raise ValueError("canonical job options must not be empty")
+        parse_canonical_options_json(self.canonical_options_json)
         if type(self.selected_speaker_snapshot) is not bytes:
             raise TypeError("selected speaker snapshot must be bytes")
         if type(self.total_samples) is not int:
@@ -126,6 +127,8 @@ def _validate_local_values(job: DurableJob) -> None:
         "error_code",
     ):
         _validate_optional_nonempty_string(getattr(job, name), name=name)
+    if job.canonical_options_json is not None:
+        parse_canonical_options_json(job.canonical_options_json)
 
     if (
         job.selected_speaker_snapshot is not None

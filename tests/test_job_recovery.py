@@ -15,6 +15,10 @@ from botified_asr.storage import Storage, StorageSchemaError
 
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 CLAIMED_AT = CREATED_AT + timedelta(minutes=1)
+CANONICAL_OPTIONS_JSON = (
+    '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
+    '"language":"auto","model":"sensevoice","response_format":"json"}'
+)
 
 
 def limits() -> LimitsConfig:
@@ -71,7 +75,7 @@ def queue_job(storage: Storage, created_at: datetime) -> jobs.DurableJob:
     return storage.publish_job(
         input_ref,
         jobs.QueuedJobSpec(
-            canonical_options_json='{"model":"sensevoice"}',
+            canonical_options_json=CANONICAL_OPTIONS_JSON,
             selected_speaker_snapshot=b'{"speakers":[]}',
             snapshot_sha256="1" * 64,
             total_samples=32_000,

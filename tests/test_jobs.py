@@ -12,6 +12,10 @@ import pytest
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 STARTED_AT = CREATED_AT + timedelta(seconds=1)
 FINISHED_AT = STARTED_AT + timedelta(seconds=1)
+CANONICAL_OPTIONS_JSON = (
+    '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
+    '"language":"auto","model":"sensevoice","response_format":"json"}'
+)
 JOB_FIELDS = (
     "id",
     "phase",
@@ -49,7 +53,7 @@ def _queued_values(jobs: ModuleType) -> dict[str, object]:
         "phase": jobs.JobPhase.VISIBLE,
         "status": jobs.JobStatus.QUEUED,
         "input_lease_id": "a" * 32,
-        "canonical_options_json": '{"model":"sensevoice"}',
+        "canonical_options_json": CANONICAL_OPTIONS_JSON,
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
         "input_size_bytes": 4,
@@ -153,6 +157,21 @@ def test_transcription_job_rejects_noncanonical_local_values() -> None:
         {"status": "queued"},
         {"input_lease_id": ""},
         {"canonical_options_json": {"model": "sensevoice"}},
+        {
+            "status": jobs.JobStatus.FAILED,
+            "input_lease_id": None,
+            "canonical_options_json": '{"model":"sensevoice"}',
+            "attempt_no": 1,
+            "error_code": "invalid_audio",
+            "started_at": STARTED_AT,
+            "finished_at": FINISHED_AT,
+        },
+        {"canonical_options_json": '{"model":"sensevoice"}'},
+        {
+            "canonical_options_json": CANONICAL_OPTIONS_JSON.replace(
+                ":null", ": null"
+            )
+        },
         {"selected_speaker_snapshot": '{"speakers":[]}'},
         {"snapshot_sha256": "A" * 64},
         {"snapshot_sha256": "1" * 63},

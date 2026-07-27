@@ -271,7 +271,10 @@ def _transcription_job_row(**overrides: object) -> dict[str, object]:
         "phase": "visible",
         "status": "queued",
         "input_lease_id": "a" * 32,
-        "canonical_options_json": '{"model":"sensevoice"}',
+        "canonical_options_json": (
+            '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
+            '"language":"auto","model":"sensevoice","response_format":"json"}'
+        ),
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
         "input_size_bytes": 4,
