@@ -290,6 +290,83 @@ def test_stable_labels_use_count_weighted_centroids_and_allow_revisits() -> None
     assert state.speaker_count == 2
 
 
+def test_finalized_cluster_dto_is_exact_and_empty_finalize_is_terminal() -> None:
+    cluster_fields = fields(speakers.AnonymousSpeakerCluster)
+    assert tuple(item.name for item in cluster_fields) == ("label", "centroid")
+    assert all(
+        item.default is MISSING and item.default_factory is MISSING
+        for item in cluster_fields
+    )
+    cluster = speakers.AnonymousSpeakerCluster(
+        label="A",
+        centroid=(1.0,) + (0.0,) * (EMBEDDING_DIMENSION - 1),
+    )
+    assert not hasattr(cluster, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        cluster.label = "B"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        cluster.centroid = ()  # type: ignore[misc]
+
+    state = _state(threshold=0.5)
+    assert state.finalize_clusters() == ()
+    assert state.speaker_count == 0
+    with pytest.raises(RuntimeError):
+        state.finalize_clusters()
+    with pytest.raises(RuntimeError):
+        state.assign_segment((_window(_unit(1.0, 0.0)),))
+    assert state.speaker_count == 0
+
+
+def test_finalized_clusters_preserve_creation_order_and_recursive_centroids() -> None:
+    state = _state(threshold=0.5)
+    source_a = _unit(1.0, 0.0)
+    source_b = _unit(0.0, 1.0)
+    update_a = _unit(0.8, 0.6)
+    validated_a = source_a.astype(np.float64)
+    validated_a /= np.linalg.norm(validated_a)
+    validated_update = update_a.astype(np.float64)
+    validated_update /= np.linalg.norm(validated_update)
+    expected_a = validated_a + validated_update
+    expected_a /= np.linalg.norm(expected_a)
+
+    assert state.assign_segment((_window(source_a),)) == "A"
+    assert state.assign_segment((_window(source_b),)) == "B"
+    assert state.assign_segment((_window(update_a),)) == "A"
+    source_a[:] = np.nan
+    source_b[:] = np.nan
+    update_a[:] = np.nan
+
+    clusters = state.finalize_clusters()
+    assert type(clusters) is tuple
+    assert tuple(cluster.label for cluster in clusters) == ("A", "B")
+    assert state.speaker_count == 2
+    assert all(type(cluster.centroid) is tuple for cluster in clusters)
+    assert all(
+        len(cluster.centroid) == EMBEDDING_DIMENSION
+        and all(type(value) is float for value in cluster.centroid)
+        and np.isfinite(cluster.centroid).all()
+        and np.linalg.norm(cluster.centroid) == pytest.approx(1.0)
+        for cluster in clusters
+    )
+    np.testing.assert_allclose(
+        clusters[0].centroid,
+        expected_a,
+        rtol=0.0,
+        atol=1e-15,
+    )
+    np.testing.assert_allclose(
+        clusters[1].centroid,
+        _unit(0.0, 1.0).astype(np.float64),
+        rtol=0.0,
+        atol=1e-15,
+    )
+    with pytest.raises(RuntimeError):
+        state.finalize_clusters()
+    with pytest.raises(RuntimeError):
+        state.assign_segment((_window(_unit(1.0, 0.0)),))
+    assert state.speaker_count == 2
+
+
 def test_similarity_threshold_is_inclusive_and_below_creates_a_speaker() -> None:
     at_threshold = _state(threshold=0.0)
     assert at_threshold.assign_segment((_window(_unit(1.0, 0.0)),)) == "A"

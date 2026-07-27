@@ -160,6 +160,12 @@ class _ValidatedWindow:
     embedding: np.ndarray
 
 
+@dataclass(frozen=True, slots=True)
+class AnonymousSpeakerCluster:
+    label: str
+    centroid: tuple[float, ...]
+
+
 class AnonymousSpeakerState:
     def __init__(self, policy: AnonymousSpeakerPolicy) -> None:
         if not isinstance(policy, AnonymousSpeakerPolicy):
@@ -167,6 +173,7 @@ class AnonymousSpeakerState:
         self._policy = policy
         self._centroids: list[np.ndarray] = []
         self._window_counts: list[int] = []
+        self._finalized = False
 
     @property
     def speaker_count(self) -> int:
@@ -176,6 +183,8 @@ class AnonymousSpeakerState:
         self,
         windows: tuple[SpeakerEmbeddingWindow, ...],
     ) -> str:
+        if self._finalized:
+            raise RuntimeError("anonymous speaker state is finalized")
         validated = _validate_windows(windows)
         staged_centroids = [centroid.copy() for centroid in self._centroids]
         staged_counts = list(self._window_counts)
@@ -200,6 +209,19 @@ class AnonymousSpeakerState:
         self._centroids = staged_centroids
         self._window_counts = staged_counts
         return label
+
+    def finalize_clusters(self) -> tuple[AnonymousSpeakerCluster, ...]:
+        if self._finalized:
+            raise RuntimeError("anonymous speaker state is finalized")
+        clusters = tuple(
+            AnonymousSpeakerCluster(
+                label=_speaker_label(ordinal),
+                centroid=tuple(float(component) for component in centroid),
+            )
+            for ordinal, centroid in enumerate(self._centroids)
+        )
+        self._finalized = True
+        return clusters
 
 
 def _validate_windows(
