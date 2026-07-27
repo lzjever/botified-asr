@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import builtins
+import importlib
+import subprocess
+import sys
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from botified_asr import model_artifacts
+from botified_asr.funasr_adapter import (
+    FunAsrSenseVoiceBatchAdapter,
+    FunAsrStreamingVadAdapter,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEVICE = "cpu"
+ASR_NOSPEECH = "<|nospeech|><|EMO_UNKNOWN|><|Event_UNK|><|withitn|>"
+LOAD_ERROR_MESSAGE = "FunASR model bundle could not be loaded"
+
+
+def _model_loader():
+    return importlib.import_module("botified_asr.model_loader")
+
+
+class RecordingResolver:
+    def __init__(
+        self,
+        snapshots: dict[
+            model_artifacts.ModelArtifactSpec,
+            model_artifacts.ResolvedModelSnapshot,
+        ],
+        events: list[object],
+        *,
+        failure_index: int | None = None,
+        failure: Exception | None = None,
+    ) -> None:
+        self._snapshots = snapshots
+        self._events = events
+        self._failure_index = failure_index
+        self._failure = failure
+        self.calls: list[model_artifacts.ModelArtifactSpec] = []
+
+    def resolve(
+        self,
+        spec: model_artifacts.ModelArtifactSpec,
+    ) -> model_artifacts.ResolvedModelSnapshot:
+        self.calls.append(spec)
+        self._events.append(("resolve", spec))
+        if len(self.calls) - 1 == self._failure_index:
+            assert self._failure is not None
+            raise self._failure
+        return self._snapshots[spec]
+
+
+class RecordingAutoModel:
+    def __init__(
+        self,
+        role: str,
+        events: list[object],
+        *,
+        failure: Exception | None = None,
+        vad_markers: list[list[int]] | None = None,
+    ) -> None:
+        self.role = role
+        self._events = events
+        self._failure = failure
+        self._vad_markers = vad_markers
+        self.calls: list[dict[str, object]] = []
+
+    def generate(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        self._events.append(("warmup", self.role))
+        if self._failure is not None:
+            raise self._failure
+        if self.role == "asr":
+            return [{"text": ASR_NOSPEECH}]
+        return [{"value": self._vad_markers or []}]
+
+
+class RecordingAutoModelFactory:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        construct_failure_role: str | None = None,
+        warmup_failure_role: str | None = None,
+        failure: Exception | None = None,
+        vad_markers: list[list[int]] | None = None,
+    ) -> None:
+        self._events = events
+        self._construct_failure_role = construct_failure_role
+        self._warmup_failure_role = warmup_failure_role
+        self._failure = failure
+        self._vad_markers = vad_markers
+        self.calls: list[dict[str, object]] = []
+        self.models: list[RecordingAutoModel] = []
+
+    def __call__(self, **kwargs: object) -> RecordingAutoModel:
+        role = "asr" if not self.calls else "vad"
+        self.calls.append(kwargs)
+        self._events.append(("construct", role))
+        if role == self._construct_failure_role:
+            assert self._failure is not None
+            raise self._failure
+        model = RecordingAutoModel(
+            role,
+            self._events,
+            failure=self._failure if role == self._warmup_failure_role else None,
+            vad_markers=self._vad_markers if role == "vad" else None,
+        )
+        self.models.append(model)
+        return model
+
+
+def _snapshots(
+    tmp_path: Path,
+) -> dict[
+    model_artifacts.ModelArtifactSpec,
+    model_artifacts.ResolvedModelSnapshot,
+]:
+    sensevoice_root = tmp_path / "verified SenseVoice root"
+    vad_root = tmp_path / "verified FSMN root"
+    sensevoice_root.mkdir()
+    vad_root.mkdir()
+    assert sensevoice_root.is_absolute()
+    assert vad_root.is_absolute()
+    return {
+        model_artifacts.SENSEVOICE_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=model_artifacts.SENSEVOICE_SPEC,
+            root=sensevoice_root,
+        ),
+        model_artifacts.FSMN_VAD_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=model_artifacts.FSMN_VAD_SPEC,
+            root=vad_root,
+        ),
+    }
+
+
+def _expected_kwargs(
+    root: Path,
+    *,
+    vad: bool = False,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "model": str(root),
+        "model_path": str(root),
+        "hub": "hf",
+        "device": DEVICE,
+        "disable_update": True,
+        "trust_remote_code": False,
+        "disable_pbar": True,
+        "disable_log": True,
+    }
+    if vad:
+        kwargs["max_single_segment_time"] = 29_790
+    return kwargs
+
+
+def test_default_factory_import_is_lazy_and_resolver_failure_does_not_import_funasr() -> (
+    None
+):
+    script = """
+import builtins
+
+from botified_asr import model_artifacts
+
+real_import = builtins.__import__
+funasr_imports = []
+
+def guarded_import(name, *args, **kwargs):
+    if name == "funasr" or name.startswith("funasr."):
+        funasr_imports.append(name)
+        raise AssertionError("funasr was imported before verified resolution")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from botified_asr import model_loader
+
+failure = model_artifacts.ModelArtifactUnavailable("missing")
+
+class FailingResolver:
+    def resolve(self, _spec):
+        raise failure
+
+try:
+    model_loader.load_funasr_model_bundle(FailingResolver(), device="cpu")
+except model_artifacts.ModelArtifactUnavailable as error:
+    assert error is failure
+else:
+    raise AssertionError("artifact failure was not propagated")
+
+assert funasr_imports == []
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+
+
+def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_and_warmup(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    snapshots = _snapshots(tmp_path)
+    resolver = RecordingResolver(snapshots, events)
+    factory = RecordingAutoModelFactory(events)
+
+    bundle = loader.load_funasr_model_bundle(
+        resolver,
+        device=DEVICE,
+        auto_model_factory=factory,
+    )
+    events.append(("observed", "return"))
+
+    assert resolver.calls == [
+        model_artifacts.SENSEVOICE_SPEC,
+        model_artifacts.FSMN_VAD_SPEC,
+    ]
+    assert factory.calls == [
+        _expected_kwargs(snapshots[model_artifacts.SENSEVOICE_SPEC].root),
+        _expected_kwargs(
+            snapshots[model_artifacts.FSMN_VAD_SPEC].root,
+            vad=True,
+        ),
+    ]
+    assert events == [
+        ("resolve", model_artifacts.SENSEVOICE_SPEC),
+        ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("warmup", "asr"),
+        ("warmup", "vad"),
+        ("observed", "return"),
+    ]
+    assert len(factory.models) == 2
+    assert factory.models[0] is not factory.models[1]
+    assert isinstance(bundle, loader.FunAsrModelBundle)
+    assert isinstance(bundle.asr, FunAsrSenseVoiceBatchAdapter)
+    assert isinstance(bundle.vad, FunAsrStreamingVadAdapter)
+    assert bundle.asr is not bundle.vad
+    with pytest.raises(FrozenInstanceError):
+        bundle.asr = bundle.asr
+
+    asr_call = factory.models[0].calls
+    vad_call = factory.models[1].calls
+    assert len(asr_call) == 1
+    assert len(vad_call) == 1
+    assert set(asr_call[0]) == {
+        "input",
+        "language",
+        "use_itn",
+        "batch_size",
+        "ban_emo_unk",
+    }
+    assert asr_call[0]["language"] == "auto"
+    assert asr_call[0]["use_itn"] is True
+    assert asr_call[0]["batch_size"] == 1
+    assert asr_call[0]["ban_emo_unk"] is False
+    asr_inputs = asr_call[0]["input"]
+    assert isinstance(asr_inputs, list)
+    assert len(asr_inputs) == 1
+    _assert_normalized_one_second_silence(asr_inputs[0])
+
+    assert set(vad_call[0]) == {
+        "input",
+        "cache",
+        "is_final",
+        "chunk_size",
+    }
+    _assert_normalized_one_second_silence(vad_call[0]["input"])
+    assert vad_call[0]["cache"] == {}
+    assert vad_call[0]["is_final"] is True
+    assert vad_call[0]["chunk_size"] == 200
+
+
+def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    sensevoice_root = Path("relative verified SenseVoice root")
+    vad_root = Path("relative verified FSMN root")
+    assert not sensevoice_root.is_absolute()
+    assert not vad_root.is_absolute()
+    snapshots = {
+        model_artifacts.SENSEVOICE_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=model_artifacts.SENSEVOICE_SPEC,
+            root=sensevoice_root,
+        ),
+        model_artifacts.FSMN_VAD_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=model_artifacts.FSMN_VAD_SPEC,
+            root=vad_root,
+        ),
+    }
+    factory = RecordingAutoModelFactory(events)
+
+    loader.load_funasr_model_bundle(
+        RecordingResolver(snapshots, events),
+        device=DEVICE,
+        auto_model_factory=factory,
+    )
+
+    assert factory.calls == [
+        _expected_kwargs(sensevoice_root.absolute()),
+        _expected_kwargs(vad_root.absolute(), vad=True),
+    ]
+    for kwargs in factory.calls:
+        assert kwargs["model"] == kwargs["model_path"]
+        assert Path(kwargs["model"]).is_absolute()
+
+
+def _assert_normalized_one_second_silence(value: object) -> None:
+    assert isinstance(value, np.ndarray)
+    assert value.dtype == np.float32
+    assert value.shape == (16_000,)
+    assert value.flags.c_contiguous
+    assert np.count_nonzero(value) == 0
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    (
+        model_artifacts.ModelArtifactUnavailable,
+        model_artifacts.ModelArtifactIntegrityError,
+    ),
+)
+def test_second_artifact_resolution_error_is_unchanged_and_factory_is_not_called(
+    tmp_path: Path,
+    error_type: type[model_artifacts.ModelArtifactError],
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    failure = error_type("artifact failure")
+    resolver = RecordingResolver(
+        _snapshots(tmp_path),
+        events,
+        failure_index=1,
+        failure=failure,
+    )
+    factory = RecordingAutoModelFactory(events)
+
+    with pytest.raises(error_type) as caught:
+        loader.load_funasr_model_bundle(
+            resolver,
+            device=DEVICE,
+            auto_model_factory=factory,
+        )
+
+    assert caught.value is failure
+    assert factory.calls == []
+    assert resolver.calls == [
+        model_artifacts.SENSEVOICE_SPEC,
+        model_artifacts.FSMN_VAD_SPEC,
+    ]
+
+
+def test_default_factory_import_failure_is_stably_wrapped_after_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    resolver = RecordingResolver(_snapshots(tmp_path), events)
+    failure = ImportError("funasr import failed")
+    real_import = builtins.__import__
+
+    def fail_funasr_import(name, *args, **kwargs):
+        if name == "funasr" or name.startswith("funasr."):
+            raise failure
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_funasr_import)
+
+    with pytest.raises(loader.FunAsrModelLoadError) as caught:
+        loader.load_funasr_model_bundle(resolver, device=DEVICE)
+
+    assert type(caught.value) is loader.FunAsrModelLoadError
+    assert str(caught.value) == LOAD_ERROR_MESSAGE
+    assert caught.value.__cause__ is failure
+    assert resolver.calls == [
+        model_artifacts.SENSEVOICE_SPEC,
+        model_artifacts.FSMN_VAD_SPEC,
+    ]
+    assert events == [
+        ("resolve", model_artifacts.SENSEVOICE_SPEC),
+        ("resolve", model_artifacts.FSMN_VAD_SPEC),
+    ]
+
+
+def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    factory = RecordingAutoModelFactory(
+        events,
+        vad_markers=[[0, 1]],
+    )
+    not_returned = object()
+    result: object = not_returned
+
+    with pytest.raises(loader.FunAsrModelLoadError) as caught:
+        result = loader.load_funasr_model_bundle(
+            RecordingResolver(_snapshots(tmp_path), events),
+            device=DEVICE,
+            auto_model_factory=factory,
+        )
+
+    assert result is not_returned
+    assert type(caught.value) is loader.FunAsrModelLoadError
+    assert str(caught.value) == LOAD_ERROR_MESSAGE
+    assert caught.value.__cause__ is None
+    assert events == [
+        ("resolve", model_artifacts.SENSEVOICE_SPEC),
+        ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("warmup", "asr"),
+        ("warmup", "vad"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_events"),
+    (
+        (
+            "construct_asr",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("construct", "asr"),
+            ),
+        ),
+        (
+            "construct_vad",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("construct", "asr"),
+                ("construct", "vad"),
+            ),
+        ),
+        (
+            "warmup_asr",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("construct", "asr"),
+                ("construct", "vad"),
+                ("warmup", "asr"),
+            ),
+        ),
+        (
+            "warmup_vad",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("construct", "asr"),
+                ("construct", "vad"),
+                ("warmup", "asr"),
+                ("warmup", "vad"),
+            ),
+        ),
+    ),
+)
+def test_construct_and_warmup_failures_are_stably_wrapped_without_later_stages(
+    tmp_path: Path,
+    failure_stage: str,
+    expected_events: tuple[object, ...],
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    failure = RuntimeError(failure_stage)
+    factory = RecordingAutoModelFactory(
+        events,
+        construct_failure_role=(
+            failure_stage.removeprefix("construct_")
+            if failure_stage.startswith("construct_")
+            else None
+        ),
+        warmup_failure_role=(
+            failure_stage.removeprefix("warmup_")
+            if failure_stage.startswith("warmup_")
+            else None
+        ),
+        failure=failure,
+    )
+
+    with pytest.raises(loader.FunAsrModelLoadError) as caught:
+        loader.load_funasr_model_bundle(
+            RecordingResolver(_snapshots(tmp_path), events),
+            device=DEVICE,
+            auto_model_factory=factory,
+        )
+
+    assert type(caught.value) is loader.FunAsrModelLoadError
+    assert str(caught.value) == LOAD_ERROR_MESSAGE
+    assert caught.value.__cause__ is failure
+    assert events == list(expected_events)
