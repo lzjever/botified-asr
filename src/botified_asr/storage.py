@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, Iterator
 
 from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
@@ -259,6 +259,50 @@ class ArtifactRef:
     path: Path
     actual_bytes: int
     content_sha256: str
+
+
+class StoredJobResult:
+    def __init__(
+        self,
+        reader: ResultEnvelopeReader,
+        handle: BinaryIO,
+    ) -> None:
+        self._reader = reader
+        self._handle = handle
+        self._lock = threading.Lock()
+        self._claimed = False
+        self._closed = False
+
+    def iter_body(self) -> Iterator[bytes]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("stored job result is closed")
+            if self._claimed:
+                raise RuntimeError(
+                    "stored job result body was already requested"
+                )
+            self._claimed = True
+        iterator = self._reader.iter_body()
+
+        def chunks() -> Iterator[bytes]:
+            try:
+                yield from iterator
+            finally:
+                try:
+                    close = getattr(iterator, "close", None)
+                    if close is not None:
+                        close()
+                finally:
+                    self.close()
+
+        return chunks()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._handle.close()
+            self._closed = True
 
 
 class Storage:
@@ -2239,6 +2283,118 @@ class Storage:
         if cancelled:
             return JobSuccessOutcome.CANCEL_REQUESTED
         return JobSuccessOutcome.STALE
+
+    def open_succeeded_job_result(
+        self,
+        job_id: str,
+    ) -> StoredJobResult:
+        validate_job_id(job_id)
+        handle: BinaryIO | None = None
+        try:
+            with self._transaction():
+                job_row = self._connection.execute(
+                    f"""
+                    SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                    FROM transcription_jobs
+                    WHERE id = ? AND phase = 'visible'
+                      AND status = 'succeeded'
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if job_row is None:
+                    raise CanonicalArtifactError(
+                        "stored job result is unavailable"
+                    )
+                job = _decode_transcription_job(job_row)
+                lease_row = self._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (job.result_lease_id,),
+                ).fetchone()
+                result_path = self.artifact_dir / (
+                    f"{job.result_lease_id}.complete"
+                )
+                if (
+                    lease_row is None
+                    or lease_row["id"] != job.result_lease_id
+                    or re.fullmatch(
+                        r"[0-9a-f]{32}",
+                        lease_row["id"],
+                    )
+                    is None
+                    or lease_row["lease_type"] != "artifact"
+                    or lease_row["resource_kind"] != "result_complete"
+                    or lease_row["owner_kind"] != "job"
+                    or lease_row["owner_id"] != job_id
+                    or lease_row["phase"] != "sealed"
+                    or lease_row["controlled_path"] != str(result_path)
+                    or lease_row["reserved_bytes"]
+                    != lease_row["actual_bytes"]
+                    or type(lease_row["content_sha256"]) is not str
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        lease_row["content_sha256"],
+                    )
+                    is None
+                    or not self._is_controlled_path(
+                        lease_row["id"],
+                        "artifact",
+                        "sealed",
+                        result_path,
+                    )
+                ):
+                    raise CanonicalArtifactError(
+                        "stored job result identity is invalid"
+                    )
+                descriptor = os.open(
+                    result_path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    handle = os.fdopen(descriptor, "rb")
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                file_stat = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or file_stat.st_size != lease_row["actual_bytes"]
+                ):
+                    raise CanonicalArtifactError(
+                        "stored job result file is invalid"
+                    )
+                reader = ResultEnvelopeReader(
+                    result_path,
+                    expected_size_bytes=lease_row["actual_bytes"],
+                    expected_sha256=lease_row["content_sha256"],
+                    expected_job_id=job.id,
+                    expected_attempt_no=job.attempt_no,
+                    expected_request_fingerprint=(
+                        job.request_fingerprint
+                    ),
+                    expected_processor_fingerprint=(
+                        job.processor_fingerprint
+                    ),
+                    canonical_options=parse_canonical_options_json(
+                        job.canonical_options_json
+                    ),
+                    expected_total_samples=job.total_samples,
+                    opener=lambda: handle,
+                )
+            return StoredJobResult(reader, handle)
+        except CanonicalArtifactError:
+            if handle is not None:
+                handle.close()
+            raise
+        except OSError as error:
+            if handle is not None:
+                handle.close()
+            raise CanonicalArtifactError(
+                "stored job result could not be opened"
+            ) from error
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            raise
 
     def _cleanup_succeeded_job_input(self, job_id: str) -> None:
         input_path = self.staging_dir / f"{job_id}.ready"

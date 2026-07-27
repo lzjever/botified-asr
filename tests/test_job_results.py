@@ -15,6 +15,7 @@ from botified_asr.canonical_options import (
 )
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.result_artifact import (
+    CanonicalArtifactError,
     CanonicalJsonlReader,
     ResultEnvelopeManifest,
     finalize_result_envelope,
@@ -245,6 +246,71 @@ def test_job_result_writer_commits_exact_success_state(
             )
             == result_lease
         )
+    finally:
+        storage.close()
+
+
+def test_open_succeeded_job_result_streams_body_once_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        running = queue_and_claim(storage)
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        expected_body = result_ref.path.read_bytes().split(b"\n", 1)[1]
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+
+        stored = storage.open_succeeded_job_result(running.id)
+        body = stored.iter_body()
+        with pytest.raises(RuntimeError, match="already"):
+            stored.iter_body()
+        assert b"".join(body) == expected_body
+        stored.close()
+        stored.close()
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("corruption", ("missing", "size"))
+def test_open_succeeded_job_result_preflights_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        running = queue_and_claim(storage)
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        if corruption == "missing":
+            result_ref.path.unlink()
+        else:
+            with result_ref.path.open("ab") as handle:
+                handle.write(b"x")
+
+        with pytest.raises(CanonicalArtifactError):
+            storage.open_succeeded_job_result(running.id)
     finally:
         storage.close()
 

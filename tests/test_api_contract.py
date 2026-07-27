@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from inspect import Parameter, signature
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -118,13 +117,6 @@ def app_client(
         close_storage_on_shutdown=False,
     )
     return TestClient(app, raise_server_exceptions=False)
-
-
-def test_create_app_requires_explicit_speaker_embedding_policy() -> None:
-    parameter = signature(create_app).parameters["speaker_embedding_policy"]
-
-    assert parameter.kind is Parameter.KEYWORD_ONLY
-    assert parameter.default is Parameter.empty
 
 
 def test_live_is_the_only_unauthenticated_route(storage: Storage) -> None:

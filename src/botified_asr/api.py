@@ -20,7 +20,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from botified_asr.audio import AudioError, Cancellation
+from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
 from botified_asr.canonical_options import (
     CanonicalOptionsValidationError,
     canonicalize_option_values,
@@ -32,6 +32,7 @@ from botified_asr.composition import (
 )
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import PipelineError, PipelineNotReady
+from botified_asr.jobs import JobStatus
 from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.speaker_profiles import SpeakerProfile
 from botified_asr.speaker_snapshot import (
@@ -42,6 +43,7 @@ from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import (
     Storage,
     StorageAdmissionError,
+    StoredJobResult,
     UploadLease,
 )
 
@@ -311,6 +313,78 @@ def create_app(
                 if prepared is not None and not response_owns_artifact:
                     _close_prepared(prepared)
 
+    async def get_transcription_job(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        job_id = request.path_params["job_id"]
+        try:
+            job = storage.get_visible_job(job_id)
+        except (TypeError, ValueError):
+            raise _job_not_found() from None
+        if job is None:
+            raise _job_not_found()
+        if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            return JSONResponse(
+                {
+                    "id": job.id,
+                    "status": job.status.value,
+                    "progress": {
+                        "processed_audio_secs": (
+                            job.processed_samples / SAMPLE_RATE
+                        ),
+                        "total_audio_secs": (
+                            job.total_samples / SAMPLE_RATE
+                        ),
+                    },
+                }
+            )
+        if job.status is JobStatus.SUCCEEDED:
+            try:
+                stored_result = storage.open_succeeded_job_result(
+                    job.id
+                )
+            except CanonicalArtifactError as error:
+                raise _processing_api_error(error) from error
+            return _StoredJobStreamingResponse(job.id, stored_result)
+        if job.status is JobStatus.FAILED:
+            assert job.finished_at is not None
+            known_error = job.error_code == "worker_crashed"
+            return JSONResponse(
+                {
+                    "id": job.id,
+                    "status": "failed",
+                    "error": {
+                        "message": (
+                            "The transcription worker crashed"
+                            if known_error
+                            else "Internal server error"
+                        ),
+                        "type": "server_error",
+                        "param": None,
+                        "code": (
+                            "worker_crashed"
+                            if known_error
+                            else "internal_error"
+                        ),
+                    },
+                    "finished_at": _public_utc_timestamp(
+                        job.finished_at
+                    ),
+                }
+            )
+        if job.status is JobStatus.CANCELLED:
+            assert job.finished_at is not None
+            return JSONResponse(
+                {
+                    "id": job.id,
+                    "status": "cancelled",
+                    "finished_at": _public_utc_timestamp(
+                        job.finished_at
+                    ),
+                }
+            )
+        raise RuntimeError("visible job has an unsupported status")
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         try:
@@ -341,6 +415,11 @@ def create_app(
                 "/v1/audio/transcriptions",
                 transcriptions,
                 methods=["POST"],
+            ),
+            Route(
+                "/v1/audio/transcriptions/{job_id}",
+                get_transcription_job,
+                methods=["GET"],
             ),
         ],
         exception_handlers={
@@ -391,6 +470,15 @@ def _speaker_not_found() -> ApiError:
     )
 
 
+def _job_not_found() -> ApiError:
+    return ApiError(
+        404,
+        "job_not_found",
+        "Transcription job not found",
+        param="job_id",
+    )
+
+
 class _PreparedStreamingResponse(StreamingResponse):
     def __init__(self, prepared: PreparedSyncResponse) -> None:
         self._prepared = prepared
@@ -405,6 +493,39 @@ class _PreparedStreamingResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             _close_prepared(self._prepared)
+
+
+class _StoredJobStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        job_id: str,
+        stored_result: StoredJobResult,
+    ) -> None:
+        self._stored_result = stored_result
+
+        def body():
+            yield (
+                b'{"id":"'
+                + job_id.encode("ascii")
+                + b'","status":"succeeded","result":'
+            )
+            yield from stored_result.iter_body()
+            yield b"}"
+
+        self._stream = body()
+        super().__init__(
+            self._stream,
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                self._stream.close()
+            finally:
+                self._stored_result.close()
 
 
 def _close_prepared(prepared: PreparedSyncResponse) -> None:
