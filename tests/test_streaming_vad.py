@@ -127,16 +127,18 @@ def test_streaming_vad_session_pairs_typed_cross_block_markers() -> None:
     adapter = FakeStreamingVadAdapter()
     session = pipeline.StreamingVadSession(adapter)
 
-    emissions = [
-        session.process(block, is_final=index == len(blocks) - 1)
-        for index, block in enumerate(blocks)
-    ]
+    emissions: list[tuple[pipeline.SpeechSpan, ...]] = []
+    open_start_samples: list[int | None] = []
+    for index, block in enumerate(blocks):
+        emissions.append(session.process(block, is_final=index == len(blocks) - 1))
+        open_start_samples.append(session.open_start_sample)
 
     assert emissions == [
         (),
         (),
         (pipeline.SpeechSpan(start_sample=1_600, end_sample=7_200),),
     ]
+    assert open_start_samples == [1_600, 1_600, None]
     assert adapter.is_final_values == [False, False, True]
     assert len(adapter.caches) == 3
     assert adapter.caches[0] is adapter.caches[1] is adapter.caches[2]

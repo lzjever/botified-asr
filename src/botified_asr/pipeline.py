@@ -170,6 +170,12 @@ class StreamingVadSession:
         self._pending_start_ms: int | None = None
         self._last_end_ms = 0
 
+    @property
+    def open_start_sample(self) -> int | None:
+        if self._state != "pending" or self._pending_start_ms is None:
+            return None
+        return self._pending_start_ms * 16
+
     def process(
         self,
         block: DecodedBlock,
