@@ -29,6 +29,7 @@ CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 STARTED_AT = CREATED_AT + timedelta(minutes=1)
 FINISHED_AT = STARTED_AT + timedelta(minutes=1)
 TOTAL_SAMPLES = 32_000
+PROCESSOR_FINGERPRINT = "3" * 64
 CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
@@ -193,7 +194,7 @@ def test_job_result_writer_commits_exact_success_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         assert running.attempt_token is not None
@@ -275,7 +276,7 @@ def test_open_succeeded_job_result_streams_body_once_and_closes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         finish_progress(storage, running)
@@ -309,7 +310,7 @@ def test_open_succeeded_job_result_preflights_file(
     corruption: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         finish_progress(storage, running)
@@ -342,7 +343,7 @@ def test_success_commit_retries_failed_input_cleanup(
     fault_stage: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         finish_progress(storage, running)
@@ -489,7 +490,7 @@ def test_startup_recovers_or_retains_valid_job_result(
     restart_state: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     running = queue_and_claim(storage)
     finish_progress(storage, running)
     result_ref = seal_result(storage, running)
@@ -507,7 +508,7 @@ def test_startup_recovers_or_retains_valid_job_result(
         storage.write_shutdown_marker("generation-1", FINISHED_AT)
     storage.close()
 
-    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    reopened = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         succeeded = reopened.get_visible_job(running.id)
         assert succeeded is not None
@@ -528,7 +529,7 @@ def test_startup_recovers_or_retains_valid_job_result(
     clean_restart = Storage(
         tmp_path,
         limits(),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         assert (
@@ -545,7 +546,7 @@ def test_startup_cancel_wins_over_valid_job_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     running = queue_and_claim(storage)
     finish_progress(storage, running)
     result_ref = seal_result(storage, running)
@@ -558,7 +559,7 @@ def test_startup_cancel_wins_over_valid_job_result(
     result_ref.path.write_bytes(b"truncated")
     storage.close()
 
-    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    reopened = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         cancelled = reopened.get_visible_job(running.id)
         assert cancelled is not None
@@ -586,7 +587,7 @@ def test_startup_cleans_uncommitted_result_then_recovers_running_job(
     artifact_state: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     running = queue_and_claim(storage)
     artifact_paths: tuple[Path, ...]
     if artifact_state in {"writing", "renamed-writing"}:
@@ -628,7 +629,7 @@ def test_startup_cleans_uncommitted_result_then_recovers_running_job(
         artifact_paths = (orphan_path,)
         storage.close()
 
-    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    reopened = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         recovered = reopened.get_visible_job(running.id)
         assert recovered is not None
@@ -668,7 +669,7 @@ def test_startup_job_result_corruption_fails_closed_without_mutation(
     corruption: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     running = queue_and_claim(storage)
     finish_progress(storage, running)
     result_ref = seal_result(storage, running)
@@ -771,7 +772,7 @@ def test_startup_job_result_corruption_fails_closed_without_mutation(
     before = recovery_snapshot(tmp_path)
 
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     assert recovery_snapshot(tmp_path) == before
 
@@ -781,7 +782,7 @@ def test_success_commit_rechecks_exact_result_lease_in_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         finish_progress(storage, running)
@@ -823,8 +824,8 @@ def test_job_result_begin_is_token_fenced_and_unique_across_connections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_ids(monkeypatch)
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
-    second = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+    second = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(first)
         assert running.attempt_token is not None
@@ -862,7 +863,7 @@ def test_losing_success_commit_cleans_result_without_overwriting_job(
     expected: str,
 ) -> None:
     patch_ids(monkeypatch)
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         running = queue_and_claim(storage)
         assert running.attempt_token is not None

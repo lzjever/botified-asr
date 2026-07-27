@@ -35,6 +35,7 @@ from botified_asr.storage import Storage
 
 MODEL_ID = "funasr/campplus"
 MODEL_REVISION = "1" * 40
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
@@ -115,7 +116,7 @@ def _storage(
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
 
 

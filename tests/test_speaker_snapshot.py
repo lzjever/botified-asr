@@ -17,6 +17,7 @@ from botified_asr.config import LimitsConfig
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 MODEL_ID = "funasr/campplus"
 MODEL_REVISION = "1" * 40
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def _snapshot_module() -> ModuleType:
@@ -124,7 +125,7 @@ def _storage(path: Path) -> storage_module.Storage:
         max_job_storage_bytes=quantum,
         min_filesystem_free_bytes=1,
     )
-    return storage_module.Storage(path, limits, free_bytes=lambda _path: 1 << 40)
+    return storage_module.Storage(path, limits, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _path: 1 << 40)
 
 
 def test_snapshot_dtos_are_exact_frozen_slots_and_errors_have_no_code() -> None:

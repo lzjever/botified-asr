@@ -16,6 +16,9 @@ from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
 from botified_asr.storage import Storage
 
 
+PROCESSOR_FINGERPRINT = "3" * 64
+
+
 class SdkProcessor:
     def process(
         self,
@@ -61,7 +64,7 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     app = create_app(
         api_key="sdk-secret",

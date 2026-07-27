@@ -21,6 +21,8 @@ from botified_asr.storage import (
     UploadLease,
 )
 
+PROCESSOR_FINGERPRINT = "3" * 64
+
 
 def limits(**overrides: int) -> LimitsConfig:
     values = {
@@ -498,7 +500,7 @@ def _recreate_speaker_profiles_with_column_drift(
 
 
 def test_fresh_schema_is_explicit_v5_with_job_foundation(tmp_path: Path) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         version = storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -653,13 +655,13 @@ def test_fresh_schema_is_explicit_v5_with_job_foundation(tmp_path: Path) -> None
     with pytest.raises(
         StorageSchemaError, match="unexpected legacy upload ledger"
     ):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
 
 def test_job_tables_enforce_local_values_without_encoding_state_machine(
     tmp_path: Path,
 ) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         for changes in (
             {"phase": "receiving", "status": "queued"},
@@ -738,7 +740,7 @@ def test_v3_schema_migrates_through_v5_atomically_preserving_existing_rows(
         connection.close()
     monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -795,7 +797,7 @@ def test_failed_v3_to_v4_migration_rolls_back_then_retries_cleanly(
         sqlite3.IntegrityError,
         match="injected v4 migration failure",
     ):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     connection = sqlite3.connect(database)
     try:
@@ -829,7 +831,7 @@ def test_failed_v3_to_v4_migration_rolls_back_then_retries_cleanly(
 
     with monkeypatch.context() as retry:
         retry.setattr(Storage, "_reconcile_startup", lambda _self: None)
-        storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -851,7 +853,7 @@ def test_empty_exact_v4_schema_migrates_to_v5_atomically(
     create_v4_database(tmp_path)
     monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -882,7 +884,7 @@ def test_v4_schema_with_any_job_fails_closed_without_mutation(
 
     monkeypatch.setattr(Storage, "_reconcile_startup", unexpected_reconcile)
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     assert before[0] == 4
     assert before[1] == storage_module._V4_TRANSCRIPTION_JOBS_DDL
@@ -918,7 +920,7 @@ def test_failed_v4_to_v5_version_update_rolls_back_then_retries_cleanly(
         sqlite3.IntegrityError,
         match="injected v5 migration failure",
     ):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     assert _job_schema_snapshot(database) == before
     connection = sqlite3.connect(database)
@@ -928,7 +930,7 @@ def test_failed_v4_to_v5_version_update_rolls_back_then_retries_cleanly(
     finally:
         connection.close()
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -966,7 +968,7 @@ def test_v5_schema_verifier_rejects_critical_job_foundation_drift(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40).close()
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
         column_drifts = {
@@ -1049,7 +1051,7 @@ def test_v5_schema_verifier_rejects_critical_job_foundation_drift(
         connection.close()
 
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
 
 def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
@@ -1057,7 +1059,7 @@ def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
 ) -> None:
     legacy_path = create_v1_database(tmp_path)
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
@@ -1096,7 +1098,7 @@ def test_unknown_schema_version_fails_closed(tmp_path: Path) -> None:
     connection.close()
 
     with pytest.raises(StorageSchemaError, match="unsupported storage schema"):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     unversioned = tmp_path / "unversioned"
     unversioned.mkdir()
@@ -1107,7 +1109,7 @@ def test_unknown_schema_version_fails_closed(tmp_path: Path) -> None:
     connection.close()
 
     with pytest.raises(StorageSchemaError, match="unversioned"):
-        Storage(unversioned, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(unversioned, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert sentinel.read_bytes() == b"keep"
 
 
@@ -1124,7 +1126,7 @@ def test_failed_v1_migration_rolls_back_structure_and_version(
     connection.close()
 
     with pytest.raises(StorageSchemaError, match="invalid v1 upload lease"):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
@@ -1155,7 +1157,7 @@ def test_v2_schema_migrates_through_v5_without_rewriting_ledger(
     controlled_path = create_v2_database(tmp_path, with_lease=True)
     monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert (
             storage._connection.execute(
@@ -1221,7 +1223,7 @@ def test_failed_v2_migration_rolls_back_then_retries_cleanly(
         sqlite3.IntegrityError,
         match="injected v3 migration failure",
     ):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
@@ -1258,7 +1260,7 @@ def test_failed_v2_migration_rolls_back_then_retries_cleanly(
         storage = Storage(
             tmp_path,
             limits(),
-            free_bytes=lambda _: 1 << 40,
+            current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
         )
     try:
         assert (
@@ -1297,7 +1299,7 @@ def test_failed_v3_verification_rolls_back_then_retries_cleanly(
             create_invalid_speaker_profiles,
         )
         with pytest.raises(StorageSchemaError, match="name index"):
-            Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+            Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
@@ -1322,7 +1324,7 @@ def test_failed_v3_verification_rolls_back_then_retries_cleanly(
     finally:
         connection.close()
 
-    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40).close()
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
         assert (
@@ -1357,7 +1359,7 @@ def test_v3_schema_verifier_rejects_missing_or_wrong_profile_structure(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40).close()
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
         if mutation == "wrong-column-type":
@@ -1394,13 +1396,13 @@ def test_v3_schema_verifier_rejects_missing_or_wrong_profile_structure(
         connection.close()
 
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
 
 def test_v3_schema_verifier_allows_unrelated_tables_and_indexes(
     tmp_path: Path,
 ) -> None:
-    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40).close()
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
         connection.execute("CREATE TABLE extension_data (key TEXT PRIMARY KEY)")
@@ -1411,7 +1413,7 @@ def test_v3_schema_verifier_allows_unrelated_tables_and_indexes(
     finally:
         connection.close()
 
-    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40).close()
 
 
 @pytest.mark.parametrize(
@@ -1422,7 +1424,7 @@ def test_speaker_profile_table_enforces_only_local_storage_checks(
     tmp_path: Path,
     constraint: str,
 ) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         _insert_speaker_profile(
             storage._connection,
@@ -1473,7 +1475,7 @@ def test_storage_rejects_preexisting_control_directory_symlink(
     (data_dir / "staging").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(StorageSchemaError, match="staging"):
-        Storage(data_dir, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(data_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     assert (outside / "keep.txt").read_bytes() == b"keep"
     assert not (data_dir / "botified-asr.sqlite3").exists()
@@ -1483,7 +1485,7 @@ def test_controlled_file_symlink_fails_closed_on_startup_and_resolve(
     tmp_path: Path,
 ) -> None:
     startup_dir = tmp_path / "startup"
-    first = Storage(startup_dir, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(startup_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = first.begin_upload("transcription")
     first.close()
     target = first.staging_dir / f"{'b' * 32}.partial"
@@ -1492,7 +1494,7 @@ def test_controlled_file_symlink_fails_closed_on_startup_and_resolve(
     lease.path.symlink_to(target.name)
 
     with pytest.raises(StorageSchemaError, match="corrupt storage lease"):
-        Storage(startup_dir, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(startup_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert lease.path.is_symlink()
     assert target.read_bytes() == b"target"
     connection = sqlite3.connect(startup_dir / "botified-asr.sqlite3")
@@ -1505,7 +1507,7 @@ def test_controlled_file_symlink_fails_closed_on_startup_and_resolve(
         connection.close()
 
     resolve_dir = tmp_path / "resolve"
-    storage = Storage(resolve_dir, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(resolve_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         upload = storage.begin_upload("transcription")
         storage.append(upload, b"input")
@@ -1553,7 +1555,7 @@ def test_transaction_releases_lock_on_begin_and_commit_failures() -> None:
 
 
 def test_upload_lease_and_initial_reservation_are_atomic(tmp_path: Path) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         lease = storage.begin_upload("transcription")
 
@@ -1570,7 +1572,7 @@ def test_typed_upload_and_artifact_lifecycles_reject_handle_misuse(
     storage = Storage(
         tmp_path,
         limits(max_job_storage_bytes=3 * RESERVATION_QUANTUM),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         upload = storage.begin_upload("transcription")
@@ -1636,7 +1638,7 @@ def test_sealed_upload_releases_slot_artifact_never_consumes_slot(
             max_active_uploads=1,
             max_job_storage_bytes=3 * RESERVATION_QUANTUM,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         first = storage.begin_upload("transcription")
@@ -1673,7 +1675,7 @@ def test_begin_capacity_and_free_floor_share_public_error_code(
     storage = Storage(
         tmp_path,
         limits(),
-        free_bytes=lambda _: RESERVATION_QUANTUM,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: RESERVATION_QUANTUM,
     )
     try:
         with pytest.raises(StorageAdmissionError) as caught:
@@ -1693,7 +1695,7 @@ def test_begin_capacity_and_free_floor_share_public_error_code(
 def test_artifact_expands_reservation_before_writing_next_byte(
     tmp_path: Path,
 ) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         writer = storage.begin_artifact(
             "segment_jsonl",
@@ -1717,7 +1719,7 @@ def test_artifact_expands_reservation_before_writing_next_byte(
 def test_actual_write_failure_is_not_disguised_as_capacity_error(
     tmp_path: Path,
 ) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     writer = storage.begin_artifact(
         "segment_jsonl",
         owner_kind="sync",
@@ -1750,7 +1752,7 @@ def test_seal_and_release_keep_ledger_until_filesystem_is_durable(
 ) -> None:
     import botified_asr.storage as storage_module
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     writer = storage.begin_artifact(
         "segment_jsonl",
         owner_kind="sync",
@@ -1808,7 +1810,7 @@ def test_seal_failure_windows_compensate_before_returning_public_ref(
 ) -> None:
     import botified_asr.storage as storage_module
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     if lease_type == "artifact":
         lease = storage.begin_artifact(
             "segment_jsonl",
@@ -1925,7 +1927,7 @@ def test_failed_seal_compensation_remains_retryable(
 ) -> None:
     import botified_asr.storage as storage_module
 
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     if lease_type == "artifact":
         writer = storage.begin_artifact(
             "segment_jsonl",
@@ -2026,7 +2028,7 @@ def test_failed_seal_compensation_remains_retryable(
 
 
 def test_competing_reservations_cannot_overcommit(tmp_path: Path) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         first = storage.begin_upload("transcription")
         with pytest.raises(StorageAdmissionError) as caught:
@@ -2041,13 +2043,13 @@ def test_competing_reservations_cannot_overcommit(tmp_path: Path) -> None:
 
 
 def test_startup_cleans_receiving_files_and_reservations(tmp_path: Path) -> None:
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = first.begin_upload("transcription")
     first.append(lease, b"unfinished")
     assert lease.path.exists()
     first.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert recovered.active_upload_count() == 0
         assert recovered.total_reserved_bytes() == 0
@@ -2057,7 +2059,7 @@ def test_startup_cleans_receiving_files_and_reservations(tmp_path: Path) -> None
 
 
 def test_abort_is_idempotent_and_removes_file(tmp_path: Path) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         lease = storage.begin_upload("transcription")
         storage.append(lease, b"content")
@@ -2100,7 +2102,7 @@ def test_reservation_expands_before_crossing_quantum(tmp_path: Path) -> None:
             sync_max_upload_bytes=RESERVATION_QUANTUM + 1,
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         lease = storage.begin_upload("transcription")
@@ -2117,14 +2119,14 @@ def test_reservation_expands_before_crossing_quantum(tmp_path: Path) -> None:
 def test_startup_cleans_sealed_sync_input_and_reservation(
     tmp_path: Path,
 ) -> None:
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = first.begin_upload("transcription")
     first.append(lease, b"complete-but-not-promoted")
     input_ref = first.seal_upload(lease)
     assert input_ref.path.exists()
     first.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert recovered.active_upload_count() == 0
         assert recovered.total_reserved_bytes() == 0
@@ -2134,7 +2136,7 @@ def test_startup_cleans_sealed_sync_input_and_reservation(
 
 
 def test_completion_records_incremental_content_hash(tmp_path: Path) -> None:
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     input_ref = None
     try:
         lease = storage.begin_upload("transcription")
@@ -2157,8 +2159,8 @@ def test_completion_records_incremental_content_hash(tmp_path: Path) -> None:
 def test_two_connections_cannot_race_past_storage_capacity(
     tmp_path: Path,
 ) -> None:
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
-    second = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+    second = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     barrier = threading.Barrier(2)
     outcomes: list[tuple[str, object]] = []
 
@@ -2198,7 +2200,7 @@ def test_free_space_admission_includes_outstanding_reservations(
     storage = Storage(
         tmp_path,
         configured,
-        free_bytes=lambda _: 2 * RESERVATION_QUANTUM,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 2 * RESERVATION_QUANTUM,
     )
     try:
         first = storage.begin_upload("transcription")
@@ -2221,7 +2223,7 @@ def test_actual_size_checkpoint_transactions_do_not_follow_network_chunks(
     )
 
     def count_updates(chunk_size: int, directory: Path) -> int:
-        storage = Storage(directory, configured, free_bytes=lambda _: 1 << 40)
+        storage = Storage(directory, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
         updates: list[str] = []
         storage._connection.set_trace_callback(
             lambda sql: updates.append(sql)
@@ -2252,7 +2254,7 @@ def test_cleanup_removes_strict_orphans_but_never_escapes_data_dir(
     storage = Storage(
         tmp_path,
         limits(max_job_storage_bytes=4 * RESERVATION_QUANTUM),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     sync_upload = storage.begin_upload("transcription")
     storage.append(sync_upload, b"sync input")
@@ -2299,7 +2301,7 @@ def test_cleanup_removes_strict_orphans_but_never_escapes_data_dir(
 
     configured = limits(max_job_storage_bytes=4 * RESERVATION_QUANTUM)
     with pytest.raises(StorageSchemaError, match="corrupt storage lease"):
-        Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert sync_input.path.read_bytes() == b"sync input"
     assert sync_artifact.path.read_bytes() == b"sync artifact"
     assert orphan.read_bytes() == b"orphan"
@@ -2316,7 +2318,7 @@ def test_cleanup_removes_strict_orphans_but_never_escapes_data_dir(
     connection.commit()
     connection.close()
 
-    recovered = Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert not sync_input.path.exists()
         assert not sync_artifact.path.exists()
@@ -2329,7 +2331,7 @@ def test_cleanup_removes_strict_orphans_but_never_escapes_data_dir(
     finally:
         recovered.close()
     recovered_again = Storage(
-        tmp_path, configured, free_bytes=lambda _: 1 << 40
+        tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40
     )
     recovered_again.close()
 

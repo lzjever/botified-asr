@@ -15,6 +15,7 @@ CONFIG_PATH = Path("/config/botified-asr.yaml")
 DATA_DIR = Path("/data/botified-asr")
 MODEL_CACHE_DIR = Path("/cache/botified-asr/models")
 API_KEY = "startup-test-token"
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def install_fakes(
@@ -38,7 +39,7 @@ def install_fakes(
         vad=vad,
         speaker=speaker,
         speaker_embedding_policy=speaker_embedding_policy,
-        processor_fingerprint="3" * 64,
+        processor_fingerprint=PROCESSOR_FINGERPRINT,
     )
     processor = object()
     readiness = SimpleNamespace(
@@ -163,7 +164,6 @@ def expected_success_events(
     return [
         ("load_config", (CONFIG_PATH,), {}),
         ("load_api_key", (), {}),
-        ("Storage", (DATA_DIR, scenario.limits), {}),
         ("HuggingFaceSnapshotFetcher", (), {}),
         (
             "ModelArtifactResolver",
@@ -174,6 +174,11 @@ def expected_success_events(
             "load_funasr_model_bundle",
             (scenario.resolver,),
             {"device": "cpu"},
+        ),
+        (
+            "Storage",
+            (DATA_DIR, scenario.limits),
+            {"current_processor_fingerprint": PROCESSOR_FINGERPRINT},
         ),
         ("FfmpegAudioFrontend", (), {}),
         (
@@ -198,7 +203,7 @@ def expected_success_events(
                 "storage": scenario.storage,
                 "processor": scenario.processor,
                 "audio_prober": scenario.frontend.probe,
-                "processor_fingerprint": "3" * 64,
+                "processor_fingerprint": PROCESSOR_FINGERPRINT,
                 "speaker_embedding_policy": (scenario.speaker_embedding_policy),
                 "close_storage_on_shutdown": False,
             },
@@ -232,11 +237,9 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
             [
                 "load_config",
                 "load_api_key",
-                "Storage",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
                 "load_funasr_model_bundle",
-                "storage.close",
             ],
         ),
         (
@@ -244,10 +247,10 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
             [
                 "load_config",
                 "load_api_key",
-                "Storage",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
                 "load_funasr_model_bundle",
+                "Storage",
                 "FfmpegAudioFrontend",
                 "Processor",
                 "Readiness",
@@ -260,10 +263,10 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
             [
                 "load_config",
                 "load_api_key",
-                "Storage",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
                 "load_funasr_model_bundle",
+                "Storage",
                 "FfmpegAudioFrontend",
                 "Processor",
                 "Readiness",
@@ -286,7 +289,9 @@ def test_main_propagates_startup_failures_and_closes_storage_once(
 
     assert caught.value is scenario.failure
     assert [name for name, _, _ in scenario.events] == expected_names
-    assert scenario.storage.close_calls == 1
+    assert scenario.storage.close_calls == (
+        0 if failure_site == "load_funasr_model_bundle" else 1
+    )
 
 
 def test_main_parses_port_before_api_key_or_resource_acquisition(

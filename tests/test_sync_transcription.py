@@ -29,6 +29,7 @@ from botified_asr.storage import ArtifactRef, Storage
 
 
 AUTHORIZATION = (b"authorization", b"Bearer test-secret")
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
@@ -194,7 +195,7 @@ def storage(tmp_path: Path) -> Storage:
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     yield value
     value.close()
@@ -392,7 +393,7 @@ def test_artifact_admission_after_input_seal_is_429_and_cleans(
             max_job_storage_bytes=RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     processor = SpyProcessor()
     try:

@@ -22,6 +22,7 @@ from botified_asr.storage import Storage, StorageAdmissionError, StorageSchemaEr
 
 
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+PROCESSOR_FINGERPRINT = "3" * 64
 CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
@@ -246,7 +247,7 @@ def test_begin_job_upload_atomically_creates_dedicated_rows_and_retries_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567", "01234567", "ABCDEFGH")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         first = storage.begin_job_upload(CREATED_AT)
         second = storage.begin_job_upload(CREATED_AT)
@@ -305,7 +306,7 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "7K3M9Q2W")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         lease = storage.begin_job_upload(CREATED_AT)
         spec = queued_spec()
@@ -392,7 +393,7 @@ def test_publish_reads_and_persists_a_sorted_known_speaker_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         storage.create_speaker_profile(
             speaker_profile("00000002", "Bob", axis=1)
@@ -421,7 +422,7 @@ def test_publish_final_row_decode_failure_rolls_back_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         input_ref = seal_job_input(storage)
 
@@ -466,7 +467,7 @@ def test_publish_rejects_forged_exact_input_refs_before_database_access(
     invalid_value: object,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         input_ref = seal_job_input(storage)
         forged = replace(input_ref, **{field: invalid_value})
@@ -497,7 +498,7 @@ def test_publish_reports_corrupt_sealed_lease_digest_as_schema_error(
     corrupt_digest: str | None,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         input_ref = seal_job_input(storage)
         with storage._transaction():
@@ -528,7 +529,7 @@ def test_publish_snapshot_failure_rolls_back_all_job_metadata(
     failure: str,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         storage.create_speaker_profile(
             speaker_profile("00000001", "艾丽丝", axis=0)
@@ -568,8 +569,8 @@ def test_publish_snapshot_and_profile_mutation_are_transactionally_ordered(
     mutation: str,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    publisher = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
-    mutator = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    publisher = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+    mutator = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     publisher.create_speaker_profile(
         speaker_profile("00000001", "艾丽丝", axis=0)
     )
@@ -692,7 +693,7 @@ def test_abort_job_upload_is_idempotent_without_leaks(
     sealed: bool,
 ) -> None:
     patch_job_ids(monkeypatch, "7K3M9Q2W")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         lease = storage.begin_job_upload(CREATED_AT)
         storage.append_job_upload(lease, b"audio")
@@ -735,8 +736,8 @@ def test_begin_job_upload_admission_and_fault_boundaries(
 ) -> None:
     if scenario == "max-active":
         configured = limits(max_active_uploads=1, max_queued_jobs=2)
-        first = Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
-        second = Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
+        first = Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+        second = Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
         ids = iter(("01234567", "ABCDEFGH"))
         id_lock = threading.Lock()
 
@@ -789,8 +790,8 @@ def test_begin_job_upload_admission_and_fault_boundaries(
 
     if scenario == "max-queued":
         configured = limits(max_active_uploads=2, max_queued_jobs=1)
-        first = Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
-        second = Storage(tmp_path, configured, free_bytes=lambda _: 1 << 40)
+        first = Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+        second = Storage(tmp_path, configured, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
         patch_job_ids(monkeypatch, "01234567", "ABCDEFGH")
         try:
             refs = []
@@ -876,7 +877,7 @@ def test_begin_job_upload_admission_and_fault_boundaries(
         return
 
     patch_job_ids(monkeypatch, "01234567", "ABCDEFGH")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         if scenario == "unknown-partial":
             unknown = storage.staging_dir / "01234567.partial"
@@ -934,7 +935,7 @@ def test_seal_compensation_and_publish_do_not_leave_or_reread_input(
 ) -> None:
     failed_dir = tmp_path / "failed-seal"
     patch_job_ids(monkeypatch, "01234567")
-    failed = Storage(failed_dir, limits(), free_bytes=lambda _: 1 << 40)
+    failed = Storage(failed_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = failed.begin_job_upload(CREATED_AT)
     failed.append_job_upload(lease, b"audio")
     failed._connection.execute(
@@ -972,7 +973,7 @@ def test_seal_compensation_and_publish_do_not_leave_or_reread_input(
 
     published_dir = tmp_path / "publish"
     patch_job_ids(monkeypatch, "ABCDEFGH")
-    storage = Storage(published_dir, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(published_dir, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         upload = storage.begin_job_upload(CREATED_AT)
         storage.append_job_upload(upload, b"audio")
@@ -1009,7 +1010,7 @@ def test_seal_compensation_fsync_failure_remains_restart_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = storage.begin_job_upload(CREATED_AT)
     storage.append_job_upload(lease, b"audio")
     storage._connection.execute(
@@ -1058,7 +1059,7 @@ def test_seal_compensation_fsync_failure_remains_restart_recoverable(
     assert storage.total_reserved_bytes() == RESERVATION_QUANTUM
     storage.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert (
             recovered._connection.execute(
@@ -1086,7 +1087,7 @@ def test_startup_cleans_receiving_inputs_and_abort_fault_resumes(
     sealed: bool,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     lease = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(lease, b"audio")
     path = lease.path
@@ -1118,7 +1119,7 @@ def test_startup_cleans_receiving_inputs_and_abort_fault_resumes(
         recovered = Storage(
             tmp_path,
             limits(),
-            free_bytes=lambda _: 1 << 40,
+            current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
         )
     try:
         assert observed_phases and set(observed_phases) == {"deleting"}
@@ -1145,7 +1146,7 @@ def test_startup_cleans_receiving_inputs_and_abort_fault_resumes(
         storage = Storage(
             fault_dir,
             limits(),
-            free_bytes=lambda _: 1 << 40,
+            current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
         )
         handle = storage.begin_job_upload(CREATED_AT)
         storage.append_job_upload(handle, b"audio")
@@ -1172,7 +1173,7 @@ def test_startup_cleans_receiving_inputs_and_abort_fault_resumes(
         resumed = Storage(
             fault_dir,
             limits(),
-            free_bytes=lambda _: 1 << 40,
+            current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
         )
         try:
             assert (
@@ -1191,7 +1192,7 @@ def test_startup_preflight_rejects_late_invalid_job_path_before_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_job_ids(monkeypatch, "01234567", "ABCDEFGH")
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     ordinary = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(ordinary, b"ordinary")
     invalid = first.begin_job_upload(CREATED_AT)
@@ -1214,7 +1215,7 @@ def test_startup_preflight_rejects_late_invalid_job_path_before_cleanup(
         connection.close()
 
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     assert ordinary.path.read_bytes() == b"ordinary"
     assert invalid.path.is_dir()
@@ -1251,7 +1252,7 @@ def test_startup_preserves_queued_input_and_cleans_unprotected_files(
     first = Storage(
         tmp_path,
         limits(max_job_storage_bytes=4 * RESERVATION_QUANTUM),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     job_upload = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(job_upload, b"job-audio")
@@ -1276,7 +1277,7 @@ def test_startup_preserves_queued_input_and_cleans_unprotected_files(
     recovered = Storage(
         tmp_path,
         limits(max_job_storage_bytes=4 * RESERVATION_QUANTUM),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         assert recovered.get_visible_job(queued.id) == queued
@@ -1318,7 +1319,7 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
     first = Storage(
         tmp_path,
         limits(max_job_storage_bytes=4 * RESERVATION_QUANTUM),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     job_upload = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(job_upload, b"job-audio")
@@ -1420,7 +1421,7 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
         path: path.read_bytes() for path in existing_paths if path.is_file()
     }
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert all(path.exists() for path in existing_paths)
     assert {
         path: path.read_bytes() for path in existing_paths if path.is_file()

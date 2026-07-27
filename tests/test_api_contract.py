@@ -27,6 +27,7 @@ from botified_asr.storage import Storage
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
@@ -106,7 +107,7 @@ def storage(tmp_path: Path) -> Storage:
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     yield value
     value.close()
@@ -461,7 +462,7 @@ def test_equal_sync_and_hard_limit_returns_413(tmp_path: Path) -> None:
             max_job_storage_bytes=8 * 1024 * 1024,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     try:
         with app_client(storage) as client:
@@ -789,7 +790,7 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
         max_job_storage_bytes=3 * RESERVATION_QUANTUM,
         min_filesystem_free_bytes=1,
     )
-    storage = Storage(tmp_path, limits, free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     appended_sizes: list[int] = []
     original_append = storage.append
 
@@ -1080,7 +1081,7 @@ def test_app_composition_closes_owned_storage(tmp_path: Path) -> None:
             max_job_storage_bytes=8 * 1024 * 1024,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
     )
     app = create_app(
         api_key="test-secret",

@@ -18,6 +18,7 @@ CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 UPDATED_AT = datetime(2026, 7, 27, 12, 1, tzinfo=timezone.utc)
 KEEP = object()
 THREAD_TIMEOUT = 5.0
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 def _storage(path: Path) -> storage_module.Storage:
@@ -29,7 +30,7 @@ def _storage(path: Path) -> storage_module.Storage:
         max_job_storage_bytes=quantum,
         min_filesystem_free_bytes=1,
     )
-    return storage_module.Storage(path, limits, free_bytes=lambda _path: 1 << 40)
+    return storage_module.Storage(path, limits, current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _path: 1 << 40)
 
 
 def _embedding(

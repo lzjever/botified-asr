@@ -24,7 +24,7 @@ def main() -> None:
     host, port_text = config.server.listen.rsplit(":", 1)
     port = int(port_text)
     api_key = load_api_key()
-    storage = Storage(config.storage.data_dir, config.limits)
+    storage: Storage | None = None
     try:
         fetcher = HuggingFaceSnapshotFetcher()
         resolver = ModelArtifactResolver(
@@ -34,6 +34,11 @@ def main() -> None:
         bundle = load_funasr_model_bundle(
             resolver,
             device=config.runtime.device,
+        )
+        storage = Storage(
+            config.storage.data_dir,
+            config.limits,
+            current_processor_fingerprint=bundle.processor_fingerprint,
         )
         frontend = FfmpegAudioFrontend()
         processor = Processor(
@@ -59,7 +64,8 @@ def main() -> None:
         )
         uvicorn.run(app, host=host, port=port, workers=1)
     finally:
-        storage.close()
+        if storage is not None:
+            storage.close()
 
 
 def _default_config_path() -> Path:

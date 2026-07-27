@@ -16,6 +16,7 @@ from botified_asr.storage import Storage
 
 AUTH = {"Authorization": "Bearer test-secret"}
 MODEL_REVISION = "1" * 40
+PROCESSOR_FINGERPRINT = "3" * 64
 
 
 class BombProcessor:
@@ -119,7 +120,7 @@ def storage(tmp_path: Path) -> Iterator[Storage]:
             max_job_storage_bytes=RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        free_bytes=lambda _path: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _path: 1 << 40,
     )
     yield value
     value.close()

@@ -16,6 +16,7 @@ from botified_asr.storage import Storage, StorageSchemaError
 
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 CLAIMED_AT = CREATED_AT + timedelta(minutes=1)
+PROCESSOR_FINGERPRINT = "3" * 64
 CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
@@ -130,6 +131,88 @@ def recovery_snapshot(data_dir: Path) -> tuple[object, ...]:
     return (*database, tuple(files))
 
 
+@pytest.mark.parametrize("running", (False, True))
+def test_startup_rejects_processor_fingerprint_mismatch_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    patch_attempt_tokens(monkeypatch, "token-1")
+    first = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    queue_job(first, CREATED_AT)
+    if running:
+        first.claim_next_job("generation-1", CLAIMED_AT)
+    first.close()
+    before = recovery_snapshot(tmp_path)
+
+    with pytest.raises(StorageSchemaError) as caught:
+        Storage(
+            tmp_path,
+            limits(),
+            current_processor_fingerprint="4" * 64,
+            free_bytes=lambda _: 1 << 40,
+        )
+
+    assert str(caught.value) == "processor_fingerprint_mismatch"
+    assert recovery_snapshot(tmp_path) == before
+
+
+def test_claim_rejects_runtime_processor_fingerprint_mismatch_before_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    try:
+        queued = queue_job(storage, CREATED_AT)
+        storage._connection.execute(
+            """
+            UPDATE transcription_jobs SET processor_fingerprint = ?
+            WHERE id = ?
+            """,
+            ("4" * 64, queued.id),
+        )
+        token_calls = 0
+
+        def reject_token_generation() -> str:
+            nonlocal token_calls
+            token_calls += 1
+            raise AssertionError("claim generated an attempt token before fingerprint check")
+
+        monkeypatch.setattr(
+            storage_module,
+            "generate_attempt_token",
+            reject_token_generation,
+        )
+
+        with pytest.raises(StorageSchemaError) as caught:
+            storage.claim_next_job("generation-1", CLAIMED_AT)
+
+        assert str(caught.value) == "processor_fingerprint_mismatch"
+        assert token_calls == 0
+        row = storage._connection.execute(
+            """
+            SELECT status, attempt_no, attempt_token, owner_generation, started_at
+            FROM transcription_jobs WHERE id = ?
+            """,
+            (queued.id,),
+        ).fetchone()
+        assert tuple(row) == ("queued", 0, None, None, None)
+    finally:
+        storage.close()
+
+
 def test_claim_is_fifo_and_starts_a_token_owned_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -141,7 +224,7 @@ def test_claim_is_fifo_and_starts_a_token_owned_attempt(
     )
     patch_job_ids(monkeypatch, "ABCDEFGH", "01234567", "7K3M9Q2W")
     patch_attempt_tokens(monkeypatch, "token-1", "token-2", "token-3")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         queue_job(storage, CREATED_AT)
         queue_job(storage, CREATED_AT)
@@ -183,8 +266,8 @@ def test_two_connections_cannot_claim_the_same_job(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
     patch_attempt_tokens(monkeypatch, "only-token")
-    first = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
-    second = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
+    second = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     queue_job(first, CREATED_AT)
     barrier = threading.Barrier(2)
     outcomes: list[object] = []
@@ -222,7 +305,7 @@ def test_progress_is_monotonic_token_fenced_and_cancel_aware(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567", "ABCDEFGH", "7K3M9Q2W")
     patch_attempt_tokens(monkeypatch, "token-1", "token-2")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert (
             storage.update_job_progress(
@@ -364,7 +447,7 @@ def test_requeued_attempt_preserves_its_fixed_total_until_eof_confirmation(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
     patch_attempt_tokens(monkeypatch, "token-1", "token-2")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     first = queue_job(storage, CREATED_AT)
     first = storage.claim_next_job("generation-1", CLAIMED_AT)
     assert (
@@ -378,7 +461,7 @@ def test_requeued_attempt_preserves_its_fixed_total_until_eof_confirmation(
     )
     storage.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         requeued = recovered.get_visible_job(first.id)
         assert requeued.status is jobs.JobStatus.QUEUED
@@ -423,7 +506,7 @@ def test_shutdown_marker_is_idempotent_and_fences_requeue(
         "JKMNPQRT",
     )
     patch_attempt_tokens(monkeypatch, "token-1", "token-2", "token-3")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         first = queue_job(storage, CREATED_AT)
         second = queue_job(storage, CREATED_AT + timedelta(seconds=1))
@@ -524,7 +607,7 @@ def test_startup_classifies_all_running_jobs_and_clears_marker(
         "JKMNPQRT",
     )
     patch_attempt_tokens(monkeypatch, "token-1", "token-2", "token-3", "token-4")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     for offset in range(4):
         queue_job(storage, CREATED_AT + timedelta(seconds=offset))
     claimed = (
@@ -565,7 +648,7 @@ def test_startup_classifies_all_running_jobs_and_clears_marker(
         lambda: CLAIMED_AT - timedelta(seconds=1),
         raising=False,
     )
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         cancelled, graceful, retried, failed = (
             recovered.get_visible_job(job.id) for job in claimed
@@ -631,7 +714,7 @@ def test_startup_marker_delete_fault_rolls_back_classification(
         "token-3",
         "token-4",
     )
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     queue_job(storage, CREATED_AT)
     queue_job(storage, CREATED_AT + timedelta(seconds=1))
     graceful = storage.claim_next_job("generation-1", CLAIMED_AT)
@@ -659,7 +742,7 @@ def test_startup_marker_delete_fault_rolls_back_classification(
         sqlite3.IntegrityError,
         match="injected marker delete failure",
     ):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert recovery_snapshot(tmp_path) == before
 
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
@@ -668,7 +751,7 @@ def test_startup_marker_delete_fault_rolls_back_classification(
         connection.commit()
     finally:
         connection.close()
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert recovered.get_visible_job(graceful.id).crash_recoveries == 0
     assert recovered.get_visible_job(crashed.id).crash_recoveries == 1
     assert recovered.claim_next_job("generation-3", CLAIMED_AT).id == graceful.id
@@ -677,7 +760,7 @@ def test_startup_marker_delete_fault_rolls_back_classification(
     assert crashed_again.attempt_no == 2
     recovered.close()
 
-    after_crash = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    after_crash = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         failed = after_crash.get_visible_job(crashed.id)
         assert failed.status is jobs.JobStatus.FAILED
@@ -689,7 +772,7 @@ def test_startup_marker_delete_fault_rolls_back_classification(
         assert not (after_crash.staging_dir / f"{failed.id}.ready").exists()
     finally:
         after_crash.close()
-    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    reopened = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         assert reopened.get_visible_job(crashed.id) == failed
     finally:
@@ -708,7 +791,7 @@ def test_startup_recovers_jobs_alongside_generic_transient_storage(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
     patch_attempt_tokens(monkeypatch, "token-1")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     queued = queue_job(storage, CREATED_AT)
     running = storage.claim_next_job("generation-1", CLAIMED_AT)
     assert (
@@ -741,7 +824,7 @@ def test_startup_recovers_jobs_alongside_generic_transient_storage(
     storage.write_shutdown_marker("generation-1", CLAIMED_AT)
     storage.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         job = recovered.get_visible_job(running.id)
         assert job.status is jobs.JobStatus.QUEUED
@@ -790,7 +873,7 @@ def test_startup_terminal_cleanup_resumes_after_phase_failure(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567")
     patch_attempt_tokens(monkeypatch, "token-1")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     queued = queue_job(storage, CREATED_AT)
     owner = "generation-2" if terminal_status == "failed" else "generation-1"
     running = storage.claim_next_job(owner, CLAIMED_AT)
@@ -829,7 +912,7 @@ def test_startup_terminal_cleanup_resumes_after_phase_failure(
                 OSError,
                 match="injected terminal cleanup fsync failure",
             ):
-                Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+                Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     else:
         connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
         try:
@@ -853,7 +936,7 @@ def test_startup_terminal_cleanup_resumes_after_phase_failure(
             sqlite3.IntegrityError,
             match="injected terminal cleanup database failure",
         ):
-            Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+            Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
 
     connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
     try:
@@ -898,7 +981,7 @@ def test_startup_terminal_cleanup_resumes_after_phase_failure(
         finally:
             connection.close()
 
-    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    recovered = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     try:
         terminal = recovered.get_visible_job(running.id)
         assert terminal.status.value == terminal_status
@@ -929,7 +1012,7 @@ def test_startup_preflights_full_recovery_graph_before_mutating(
 ) -> None:
     patch_job_ids(monkeypatch, "01234567", "ABCDEFGH")
     patch_attempt_tokens(monkeypatch, "token-1", "token-2")
-    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    storage = Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     queue_job(storage, CREATED_AT)
     queue_job(storage, CREATED_AT + timedelta(seconds=1))
     storage.claim_next_job("generation-1", CLAIMED_AT)
@@ -969,5 +1052,5 @@ def test_startup_preflights_full_recovery_graph_before_mutating(
 
     before = recovery_snapshot(tmp_path)
     with pytest.raises(StorageSchemaError):
-        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+        Storage(tmp_path, limits(), current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40)
     assert recovery_snapshot(tmp_path) == before

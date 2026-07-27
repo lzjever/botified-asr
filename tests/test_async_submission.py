@@ -55,6 +55,7 @@ def make_storage(path: Path, *, max_queued_jobs: int = 4) -> Storage:
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
+        current_processor_fingerprint="3" * 64,
         free_bytes=lambda _: 1 << 40,
     )
 

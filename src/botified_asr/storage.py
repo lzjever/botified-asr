@@ -389,8 +389,14 @@ class Storage:
         data_dir: str | Path,
         limits: LimitsConfig,
         *,
+        current_processor_fingerprint: str,
         free_bytes: Callable[[Path], int] | None = None,
     ) -> None:
+        if type(current_processor_fingerprint) is not str:
+            raise TypeError("current processor fingerprint must be a string")
+        if re.fullmatch(r"[0-9a-f]{64}", current_processor_fingerprint) is None:
+            raise ValueError("current processor fingerprint is invalid")
+        self._current_processor_fingerprint = current_processor_fingerprint
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.staging_dir = self.data_dir / "staging"
         self.artifact_dir = self.data_dir / "artifacts"
@@ -418,10 +424,28 @@ class Storage:
                 self._connection.execute("PRAGMA database_list").fetchone()[2]
             ).chmod(0o600)
             self._initialize_schema()
+            self._verify_active_processor_fingerprints()
             self._reconcile_startup()
         except BaseException:
             self._connection.close()
             raise
+
+    def _verify_active_processor_fingerprints(self) -> None:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT processor_fingerprint
+                FROM transcription_jobs
+                WHERE phase = 'visible'
+                  AND status IN ('queued', 'running')
+                """
+            ).fetchall()
+        if any(
+            row["processor_fingerprint"]
+            != self._current_processor_fingerprint
+            for row in rows
+        ):
+            raise StorageSchemaError("processor_fingerprint_mismatch")
 
     def _prepare_control_directory(self, path: Path) -> None:
         if path.is_symlink() or (path.exists() and not path.is_dir()):
@@ -1715,6 +1739,13 @@ class Storage:
             if row is None:
                 return None
             queued = _decode_transcription_job(row)
+            if (
+                queued.processor_fingerprint
+                != self._current_processor_fingerprint
+            ):
+                raise StorageSchemaError(
+                    "processor_fingerprint_mismatch"
+                )
             if claimed_at < queued.created_at:
                 raise ValueError(
                     "job claim time must not precede creation"
