@@ -110,9 +110,32 @@ class SegmentRecord:
     annotations: RichAnnotations
 
 
+@dataclass(frozen=True)
+class VadMarker:
+    start_ms: int | None
+    end_ms: int | None
+
+
+@dataclass(frozen=True)
+class SpeechSpan:
+    start_sample: int
+    end_sample: int
+
+
 @runtime_checkable
 class AsrAdapter(Protocol):
     def transcribe(self, pcm: np.ndarray) -> AsrResult: ...
+
+
+@runtime_checkable
+class StreamingVadAdapter(Protocol):
+    def generate(
+        self,
+        pcm: np.ndarray,
+        *,
+        cache: dict[str, object],
+        is_final: bool,
+    ) -> tuple[VadMarker, ...]: ...
 
 
 @runtime_checkable
@@ -137,6 +160,110 @@ class NormalizingAsrAdapter:
         if not np.isfinite(normalized).all():
             raise PipelineError("invalid_audio", "ASR input segment is invalid")
         return self._model.infer(normalized)
+
+
+class StreamingVadSession:
+    def __init__(self, adapter: StreamingVadAdapter) -> None:
+        self._adapter = adapter
+        self._cache: dict[str, object] = {}
+        self._state = "idle"
+        self._pending_start_ms: int | None = None
+        self._last_end_ms = 0
+
+    def process(
+        self,
+        block: DecodedBlock,
+        *,
+        is_final: bool,
+    ) -> tuple[SpeechSpan, ...]:
+        if self._state == "closed":
+            self._raise_invalid_output()
+
+        try:
+            markers = self._adapter.generate(
+                block.pcm,
+                cache=self._cache,
+                is_final=is_final,
+            )
+            next_state = self._state
+            pending_start_ms = self._pending_start_ms
+            last_end_ms = self._last_end_ms
+            spans: list[SpeechSpan] = []
+            for marker in markers:
+                start_ms = marker.start_ms
+                end_ms = marker.end_ms
+                if (
+                    start_ms is not None
+                    and (type(start_ms) is not int or start_ms < 0)
+                    or end_ms is not None
+                    and (type(end_ms) is not int or end_ms < 0)
+                ):
+                    self._raise_invalid_output()
+
+                if start_ms is not None and end_ms is None:
+                    if next_state != "idle" or start_ms < last_end_ms:
+                        self._raise_invalid_output()
+                    next_state = "pending"
+                    pending_start_ms = start_ms
+                    continue
+
+                if start_ms is None and end_ms is not None:
+                    if (
+                        next_state != "pending"
+                        or pending_start_ms is None
+                        or end_ms <= pending_start_ms
+                    ):
+                        self._raise_invalid_output()
+                    spans.append(
+                        SpeechSpan(
+                            start_sample=pending_start_ms * 16,
+                            end_sample=end_ms * 16,
+                        )
+                    )
+                    next_state = "idle"
+                    pending_start_ms = None
+                    last_end_ms = end_ms
+                    continue
+
+                if start_ms is not None and end_ms is not None:
+                    if (
+                        next_state != "idle"
+                        or start_ms < last_end_ms
+                        or end_ms <= start_ms
+                    ):
+                        self._raise_invalid_output()
+                    spans.append(
+                        SpeechSpan(
+                            start_sample=start_ms * 16,
+                            end_sample=end_ms * 16,
+                        )
+                    )
+                    last_end_ms = end_ms
+                    continue
+
+                self._raise_invalid_output()
+
+            if is_final:
+                if next_state != "idle":
+                    self._raise_invalid_output()
+                next_state = "closed"
+
+            self._state = next_state
+            self._pending_start_ms = pending_start_ms
+            self._last_end_ms = last_end_ms
+            return tuple(spans)
+        except Exception:
+            self._state = "closed"
+            self._pending_start_ms = None
+            raise
+
+    def _raise_invalid_output(self) -> None:
+        self._state = "closed"
+        self._pending_start_ms = None
+        raise PipelineError(
+            "invalid_model_output",
+            "VAD model returned an invalid marker transition",
+        )
 
 
 @runtime_checkable
