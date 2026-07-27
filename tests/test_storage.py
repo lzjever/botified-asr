@@ -155,6 +155,43 @@ def create_v2_database(
     return controlled_path if with_lease else None
 
 
+def create_v3_database(data_dir: Path) -> None:
+    create_v2_database(data_dir, with_lease=True)
+    connection = sqlite3.connect(data_dir / "botified-asr.sqlite3")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE speaker_profiles (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                name_key TEXT NOT NULL,
+                description TEXT,
+                embedding BLOB NOT NULL
+                    CHECK (
+                        typeof(embedding) = 'blob'
+                        AND length(embedding) = 4 * embedding_dimension
+                    ),
+                embedding_model_id TEXT NOT NULL,
+                embedding_model_revision TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL
+                    CHECK (embedding_dimension > 0),
+                embedding_policy_fingerprint TEXT NOT NULL,
+                sample_count INTEGER NOT NULL
+                    CHECK (sample_count BETWEEN 2 AND 5),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX speaker_profiles_name_key_uq
+                ON speaker_profiles(name_key);
+            UPDATE schema_meta SET version = 3 WHERE singleton = 1;
+            """
+        )
+        _insert_speaker_profile(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _speaker_profile_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "id": "01234567",
@@ -196,6 +233,166 @@ def _insert_speaker_profile(
     )
 
 
+JOB_COLUMNS = (
+    ("id", "TEXT", 1, None, 1),
+    ("phase", "TEXT", 1, None, 0),
+    ("status", "TEXT", 0, None, 0),
+    ("input_lease_id", "TEXT", 0, None, 0),
+    ("canonical_options_json", "TEXT", 0, None, 0),
+    ("selected_speaker_snapshot", "BLOB", 0, None, 0),
+    ("snapshot_sha256", "TEXT", 0, None, 0),
+    ("input_size_bytes", "INTEGER", 0, None, 0),
+    ("total_samples", "INTEGER", 0, None, 0),
+    ("processed_samples", "INTEGER", 1, None, 0),
+    ("request_fingerprint", "TEXT", 0, None, 0),
+    ("processor_fingerprint", "TEXT", 0, None, 0),
+    ("attempt_no", "INTEGER", 1, None, 0),
+    ("attempt_token", "TEXT", 0, None, 0),
+    ("owner_generation", "TEXT", 0, None, 0),
+    ("crash_recoveries", "INTEGER", 1, None, 0),
+    ("cancel_requested", "INTEGER", 1, None, 0),
+    ("result_lease_id", "TEXT", 0, None, 0),
+    ("error_code", "TEXT", 0, None, 0),
+    ("input_cleanup_pending", "INTEGER", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("started_at", "TEXT", 0, None, 0),
+    ("finished_at", "TEXT", 0, None, 0),
+)
+MARKER_COLUMNS = (
+    ("singleton", "INTEGER", 0, None, 1),
+    ("generation", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+)
+
+
+def _transcription_job_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "7K3M9Q2W",
+        "phase": "visible",
+        "status": "queued",
+        "input_lease_id": "a" * 32,
+        "canonical_options_json": '{"model":"sensevoice"}',
+        "selected_speaker_snapshot": b'{"speakers":[]}',
+        "snapshot_sha256": "1" * 64,
+        "input_size_bytes": 4,
+        "total_samples": 32_000,
+        "processed_samples": 0,
+        "request_fingerprint": "2" * 64,
+        "processor_fingerprint": "3" * 64,
+        "attempt_no": 0,
+        "attempt_token": None,
+        "owner_generation": None,
+        "crash_recoveries": 0,
+        "cancel_requested": 0,
+        "result_lease_id": None,
+        "error_code": None,
+        "input_cleanup_pending": 0,
+        "created_at": "2026-07-27T12:00:00Z",
+        "started_at": None,
+        "finished_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _insert_transcription_job(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    columns = ", ".join(name for name, *_ in JOB_COLUMNS)
+    values = ", ".join(f":{name}" for name, *_ in JOB_COLUMNS)
+    connection.execute(
+        f"INSERT INTO transcription_jobs({columns}) VALUES ({values})",
+        _transcription_job_row(**overrides),
+    )
+
+
+def _recreate_v4_table_with_column_drift(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    column: str | None = None,
+    replacement: str | None = None,
+    include_critical_check: bool = True,
+) -> None:
+    columns = JOB_COLUMNS if table == "transcription_jobs" else MARKER_COLUMNS
+    old_table = f"old_{table}"
+    connection.execute(f"ALTER TABLE {table} RENAME TO {old_table}")
+    if table == "transcription_jobs":
+        connection.execute("DROP INDEX transcription_jobs_fifo_idx")
+        connection.execute("DROP INDEX transcription_jobs_retention_idx")
+
+    definitions = []
+    for name, data_type, not_null, default, primary_key in columns:
+        if name == column:
+            assert replacement is not None
+            definitions.append(replacement)
+            continue
+        definition = f"{name} {data_type}"
+        if primary_key:
+            definition += " PRIMARY KEY"
+        if not_null:
+            definition += " NOT NULL"
+        if default is not None:
+            definition += f" DEFAULT {default}"
+        definitions.append(definition)
+    if table == "transcription_jobs":
+        definitions.extend(
+            (
+                "CHECK (length(id) = 8)",
+                "CHECK (id NOT GLOB '*[^0-9A-HJKMNP-TV-Z]*')",
+                "CHECK (phase IN ('receiving', 'visible', 'deleting'))",
+                "CHECK (status IS NULL OR status IN "
+                "('queued', 'running', 'succeeded', 'failed', 'cancelled'))",
+                "CHECK (snapshot_sha256 IS NULL OR "
+                "(length(snapshot_sha256) = 64 AND "
+                "snapshot_sha256 NOT GLOB '*[^0-9a-f]*'))",
+                "CHECK (input_size_bytes IS NULL OR input_size_bytes >= 0)",
+                "CHECK (total_samples IS NULL OR total_samples >= 0)",
+                "CHECK (processed_samples >= 0)",
+                "CHECK (request_fingerprint IS NULL OR "
+                "(length(request_fingerprint) = 64 AND "
+                "request_fingerprint NOT GLOB '*[^0-9a-f]*'))",
+                "CHECK (processor_fingerprint IS NULL OR "
+                "(length(processor_fingerprint) = 64 AND "
+                "processor_fingerprint NOT GLOB '*[^0-9a-f]*'))",
+                "CHECK (attempt_no >= 0)",
+                "CHECK (crash_recoveries BETWEEN 0 AND 1)",
+                "CHECK (cancel_requested IN (0, 1))",
+                "CHECK (input_cleanup_pending IN (0, 1))",
+            )
+        )
+        if include_critical_check:
+            definitions.append(
+                "CHECK ("
+                "(phase = 'receiving' AND status IS NULL) OR "
+                "(phase = 'visible' AND status IS NOT NULL) OR "
+                "(phase = 'deleting' AND (status IS NULL OR status IN "
+                "('succeeded', 'failed', 'cancelled')))"
+                ")"
+            )
+    else:
+        definitions.append("CHECK (singleton = 1)")
+        if include_critical_check:
+            definitions.append("CHECK (length(generation) > 0)")
+    connection.execute(f"CREATE TABLE {table} ({', '.join(definitions)})")
+    connection.execute(f"DROP TABLE {old_table}")
+
+    if table == "transcription_jobs":
+        connection.execute(
+            """
+            CREATE INDEX transcription_jobs_fifo_idx
+            ON transcription_jobs(phase, status, created_at, id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX transcription_jobs_retention_idx
+            ON transcription_jobs(phase, status, finished_at, id)
+            """
+        )
+
+
 def _recreate_speaker_profiles_with_column_drift(
     connection: sqlite3.Connection,
     *,
@@ -233,7 +430,7 @@ def _recreate_speaker_profiles_with_column_drift(
     )
 
 
-def test_fresh_schema_is_explicit_v3_with_speaker_profiles(tmp_path: Path) -> None:
+def test_fresh_schema_is_explicit_v4_with_job_foundation(tmp_path: Path) -> None:
     storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     try:
         version = storage._connection.execute(
@@ -248,8 +445,38 @@ def test_fresh_schema_is_explicit_v3_with_speaker_profiles(tmp_path: Path) -> No
                 "PRAGMA index_list(speaker_profiles)"
             )
         }
+        job_columns = tuple(
+            (
+                row["name"],
+                row["type"],
+                row["notnull"],
+                row["dflt_value"],
+                row["pk"],
+            )
+            for row in storage._connection.execute(
+                "PRAGMA table_info(transcription_jobs)"
+            )
+        )
+        job_indexes = {
+            row["name"]: row
+            for row in storage._connection.execute(
+                "PRAGMA index_list(transcription_jobs)"
+            )
+        }
+        marker_columns = tuple(
+            (
+                row["name"],
+                row["type"],
+                row["notnull"],
+                row["dflt_value"],
+                row["pk"],
+            )
+            for row in storage._connection.execute(
+                "PRAGMA table_info(shutdown_marker)"
+            )
+        )
 
-        assert version == 3
+        assert version == 4
         assert {
             row["name"]
             for row in storage._connection.execute(
@@ -310,6 +537,38 @@ def test_fresh_schema_is_explicit_v3_with_speaker_profiles(tmp_path: Path) -> No
                 "PRAGMA index_list(storage_leases)"
             )
         }
+        assert job_columns == JOB_COLUMNS
+        assert marker_columns == MARKER_COLUMNS
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM shutdown_marker"
+            ).fetchone()[0]
+            == 0
+        )
+        assert {
+            "transcription_jobs_fifo_idx",
+            "transcription_jobs_retention_idx",
+        } <= set(job_indexes)
+        assert all(
+            job_indexes[name]["unique"] == 0
+            and job_indexes[name]["partial"] == 0
+            for name in (
+                "transcription_jobs_fifo_idx",
+                "transcription_jobs_retention_idx",
+            )
+        )
+        assert tuple(
+            row["name"]
+            for row in storage._connection.execute(
+                "PRAGMA index_info(transcription_jobs_fifo_idx)"
+            )
+        ) == ("phase", "status", "created_at", "id")
+        assert tuple(
+            row["name"]
+            for row in storage._connection.execute(
+                "PRAGMA index_info(transcription_jobs_retention_idx)"
+            )
+        ) == ("phase", "status", "finished_at", "id")
 
         _insert_speaker_profile(storage._connection)
         with pytest.raises(sqlite3.IntegrityError):
@@ -330,6 +589,303 @@ def test_fresh_schema_is_explicit_v3_with_speaker_profiles(tmp_path: Path) -> No
         Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
 
 
+def test_job_tables_enforce_local_values_without_encoding_state_machine(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        for changes in (
+            {"phase": "receiving", "status": "queued"},
+            {"phase": "visible", "status": None},
+            {"phase": "deleting", "status": "queued"},
+            {"phase": "deleting", "status": "running"},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_transcription_job(storage._connection, **changes)
+
+        for status in (None, "succeeded"):
+            _insert_transcription_job(
+                storage._connection,
+                phase="deleting",
+                status=status,
+            )
+            storage._connection.execute("DELETE FROM transcription_jobs")
+
+        invalid_rows = (
+            {"id": "ABCDEFGI"},
+            {"phase": "hidden"},
+            {"status": "retrying"},
+            {"snapshot_sha256": "x" * 64},
+            {"input_size_bytes": -1},
+            {"total_samples": -1},
+            {"processed_samples": -1},
+            {"request_fingerprint": "2" * 63},
+            {"processor_fingerprint": "G" * 64},
+            {"attempt_no": -1},
+            {"crash_recoveries": 2},
+            {"cancel_requested": 2},
+            {"input_cleanup_pending": 2},
+        )
+        for changes in invalid_rows:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_transcription_job(storage._connection, **changes)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            storage._connection.execute(
+                """
+                INSERT INTO shutdown_marker(singleton, generation, created_at)
+                VALUES (1, '', '2026-07-27T12:00:00Z')
+                """
+            )
+        storage._connection.execute(
+            """
+            INSERT INTO shutdown_marker(singleton, generation, created_at)
+            VALUES (1, 'generation-1', '2026-07-27T12:00:00Z')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            storage._connection.execute(
+                """
+                INSERT INTO shutdown_marker(singleton, generation, created_at)
+                VALUES (2, 'generation-2', '2026-07-27T12:00:01Z')
+                """
+            )
+    finally:
+        storage.close()
+
+
+def test_v3_schema_migrates_to_v4_atomically_preserving_existing_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v3_database(tmp_path)
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        lease_before = tuple(
+            connection.execute("SELECT * FROM storage_leases").fetchone()
+        )
+        profile_before = tuple(
+            connection.execute("SELECT * FROM speaker_profiles").fetchone()
+        )
+    finally:
+        connection.close()
+    monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        assert storage._connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0] == 4
+        assert tuple(
+            storage._connection.execute(
+                "SELECT * FROM storage_leases"
+            ).fetchone()
+        ) == lease_before
+        assert tuple(
+            storage._connection.execute(
+                "SELECT * FROM speaker_profiles"
+            ).fetchone()
+        ) == profile_before
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM transcription_jobs"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM shutdown_marker"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        storage.close()
+
+
+def test_failed_v3_to_v4_migration_rolls_back_then_retries_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v3_database(tmp_path)
+    database = tmp_path / "botified-asr.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_v4_schema_version
+            BEFORE UPDATE OF version ON schema_meta
+            WHEN NEW.version = 4
+            BEGIN
+                SELECT RAISE(ABORT, 'injected v4 migration failure');
+            END;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected v4 migration failure",
+    ):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0] == 3
+        assert {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE name IN (
+                    'transcription_jobs',
+                    'transcription_jobs_fifo_idx',
+                    'transcription_jobs_retention_idx',
+                    'shutdown_marker'
+                )
+                """
+            )
+        } == set()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM storage_leases"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM speaker_profiles"
+        ).fetchone()[0] == 1
+        connection.execute("DROP TRIGGER reject_v4_schema_version")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with monkeypatch.context() as retry:
+        retry.setattr(Storage, "_reconcile_startup", lambda _self: None)
+        storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        assert storage._connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0] == 4
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM storage_leases"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM speaker_profiles"
+        ).fetchone()[0] == 1
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-job-table",
+        "wrong-job-column",
+        "missing-fifo-index",
+        "wrong-retention-index",
+        "missing-marker-table",
+        "wrong-marker-column",
+        "job-column-type",
+        "job-column-nullability",
+        "job-column-default",
+        "marker-column-type",
+        "marker-column-nullability",
+        "marker-column-default",
+        "job-phase-status-check",
+        "marker-generation-check",
+    ),
+)
+def test_v4_schema_verifier_rejects_critical_job_foundation_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        column_drifts = {
+            "job-column-type": (
+                "transcription_jobs",
+                "processor_fingerprint",
+                "processor_fingerprint BLOB",
+            ),
+            "job-column-nullability": (
+                "transcription_jobs",
+                "status",
+                "status TEXT NOT NULL",
+            ),
+            "job-column-default": (
+                "transcription_jobs",
+                "attempt_no",
+                "attempt_no INTEGER NOT NULL DEFAULT 0",
+            ),
+            "marker-column-type": (
+                "shutdown_marker",
+                "generation",
+                "generation BLOB NOT NULL",
+            ),
+            "marker-column-nullability": (
+                "shutdown_marker",
+                "generation",
+                "generation TEXT",
+            ),
+            "marker-column-default": (
+                "shutdown_marker",
+                "created_at",
+                "created_at TEXT NOT NULL DEFAULT 'unexpected'",
+            ),
+        }
+        check_drifts = {
+            "job-phase-status-check": "transcription_jobs",
+            "marker-generation-check": "shutdown_marker",
+        }
+        if mutation in check_drifts:
+            _recreate_v4_table_with_column_drift(
+                connection,
+                table=check_drifts[mutation],
+                include_critical_check=False,
+            )
+            connection.commit()
+        elif mutation in column_drifts:
+            table, column, replacement = column_drifts[mutation]
+            _recreate_v4_table_with_column_drift(
+                connection,
+                table=table,
+                column=column,
+                replacement=replacement,
+            )
+            connection.commit()
+        else:
+            statements = {
+                "missing-job-table": ("DROP TABLE transcription_jobs",),
+                "wrong-job-column": (
+                    "ALTER TABLE transcription_jobs "
+                    "RENAME COLUMN finished_at TO completed_at",
+                ),
+                "missing-fifo-index": (
+                    "DROP INDEX transcription_jobs_fifo_idx",
+                ),
+                "wrong-retention-index": (
+                    "DROP INDEX transcription_jobs_retention_idx",
+                    "CREATE INDEX transcription_jobs_retention_idx "
+                    "ON transcription_jobs(status, phase, finished_at, id)",
+                ),
+                "missing-marker-table": ("DROP TABLE shutdown_marker",),
+                "wrong-marker-column": (
+                    "ALTER TABLE shutdown_marker "
+                    "RENAME COLUMN created_at TO marked_at",
+                ),
+            }[mutation]
+            for statement in statements:
+                connection.execute(statement)
+            connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StorageSchemaError):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+
 def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
     tmp_path: Path,
 ) -> None:
@@ -339,7 +895,7 @@ def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 4
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM storage_leases"
         ).fetchone()[0] == 0
@@ -426,7 +982,7 @@ def test_failed_v1_migration_rolls_back_structure_and_version(
         connection.close()
 
 
-def test_v2_schema_migrates_to_v3_without_rewriting_ledger(
+def test_v2_schema_migrates_through_v4_without_rewriting_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -439,7 +995,7 @@ def test_v2_schema_migrates_to_v3_without_rewriting_ledger(
             storage._connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 3
+            == 4
         )
         lease = storage._connection.execute(
             """
@@ -543,7 +1099,7 @@ def test_failed_v2_migration_rolls_back_then_retries_cleanly(
             storage._connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 3
+            == 4
         )
         assert (
             storage._connection.execute(
@@ -607,7 +1163,7 @@ def test_failed_v3_verification_rolls_back_then_retries_cleanly(
             connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 3
+            == 4
         )
         assert (
             connection.execute(

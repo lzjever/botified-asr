@@ -22,7 +22,7 @@ from botified_asr.speaker_profiles import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_SPEAKER_PROFILES = 256
 LEASE_ID_PATTERN = re.compile(
     r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})$"
@@ -41,6 +41,84 @@ _SPEAKER_PROFILE_COLUMNS = """
     embedding_dimension, embedding_policy_fingerprint,
     sample_count, created_at, updated_at
 """
+_V4_TRANSCRIPTION_JOBS_DDL = """CREATE TABLE transcription_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                phase TEXT NOT NULL,
+                status TEXT,
+                input_lease_id TEXT,
+                canonical_options_json TEXT,
+                selected_speaker_snapshot BLOB,
+                snapshot_sha256 TEXT,
+                input_size_bytes INTEGER,
+                total_samples INTEGER,
+                processed_samples INTEGER NOT NULL,
+                request_fingerprint TEXT,
+                processor_fingerprint TEXT,
+                attempt_no INTEGER NOT NULL,
+                attempt_token TEXT,
+                owner_generation TEXT,
+                crash_recoveries INTEGER NOT NULL,
+                cancel_requested INTEGER NOT NULL,
+                result_lease_id TEXT,
+                error_code TEXT,
+                input_cleanup_pending INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                CHECK (length(id) = 8),
+                CHECK (id NOT GLOB '*[^0-9A-HJKMNP-TV-Z]*'),
+                CHECK (phase IN ('receiving', 'visible', 'deleting')),
+                CHECK (
+                    status IS NULL
+                    OR status IN (
+                        'queued', 'running', 'succeeded', 'failed', 'cancelled'
+                    )
+                ),
+                CHECK (
+                    (phase = 'receiving' AND status IS NULL)
+                    OR (phase = 'visible' AND status IS NOT NULL)
+                    OR (
+                        phase = 'deleting'
+                        AND (
+                            status IS NULL
+                            OR status IN ('succeeded', 'failed', 'cancelled')
+                        )
+                    )
+                ),
+                CHECK (
+                    snapshot_sha256 IS NULL
+                    OR (
+                        length(snapshot_sha256) = 64
+                        AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+                CHECK (input_size_bytes IS NULL OR input_size_bytes >= 0),
+                CHECK (total_samples IS NULL OR total_samples >= 0),
+                CHECK (processed_samples >= 0),
+                CHECK (
+                    request_fingerprint IS NULL
+                    OR (
+                        length(request_fingerprint) = 64
+                        AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+                CHECK (
+                    processor_fingerprint IS NULL
+                    OR (
+                        length(processor_fingerprint) = 64
+                        AND processor_fingerprint NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+                CHECK (attempt_no >= 0),
+                CHECK (crash_recoveries BETWEEN 0 AND 1),
+                CHECK (cancel_requested IN (0, 1)),
+                CHECK (input_cleanup_pending IN (0, 1))
+            )"""
+_V4_SHUTDOWN_MARKER_DDL = """CREATE TABLE shutdown_marker (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation TEXT NOT NULL CHECK (length(generation) > 0),
+                created_at TEXT NOT NULL
+            )"""
 
 
 class StorageSchemaError(RuntimeError):
@@ -206,6 +284,7 @@ class Storage:
                 )
                 self._create_v2_ledger()
                 self._create_v3_speaker_profiles()
+                self._create_v4_job_foundation()
                 self._connection.execute(
                     "INSERT INTO schema_meta(singleton, version) VALUES (1, ?)",
                     (SCHEMA_VERSION,),
@@ -220,13 +299,16 @@ class Storage:
             raise StorageSchemaError("storage schema version is missing")
         version = int(row["version"])
         if version == SCHEMA_VERSION:
-            self._verify_v3_schema()
+            self._verify_v4_schema()
             return
         if version == 1:
             self._migrate_v1_to_v2()
             version = 2
         if version == 2:
             self._migrate_v2_to_v3()
+            version = 3
+        if version == 3:
+            self._migrate_v3_to_v4()
             return
         raise StorageSchemaError(
             f"unsupported storage schema version: {version}"
@@ -521,6 +603,160 @@ class Storage:
                     "storage schema version changed during migration"
                 )
             self._verify_v3_schema()
+
+    def _create_v4_job_foundation(self) -> None:
+        self._connection.execute(_V4_TRANSCRIPTION_JOBS_DDL)
+        self._connection.execute(
+            """
+            CREATE INDEX transcription_jobs_fifo_idx
+            ON transcription_jobs(phase, status, created_at, id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX transcription_jobs_retention_idx
+            ON transcription_jobs(phase, status, finished_at, id)
+            """
+        )
+        self._connection.execute(_V4_SHUTDOWN_MARKER_DDL)
+
+    def _verify_v4_schema(self) -> None:
+        self._verify_v3_schema()
+        expected_job_columns = (
+            ("id", "TEXT", 1, None, 1),
+            ("phase", "TEXT", 1, None, 0),
+            ("status", "TEXT", 0, None, 0),
+            ("input_lease_id", "TEXT", 0, None, 0),
+            ("canonical_options_json", "TEXT", 0, None, 0),
+            ("selected_speaker_snapshot", "BLOB", 0, None, 0),
+            ("snapshot_sha256", "TEXT", 0, None, 0),
+            ("input_size_bytes", "INTEGER", 0, None, 0),
+            ("total_samples", "INTEGER", 0, None, 0),
+            ("processed_samples", "INTEGER", 1, None, 0),
+            ("request_fingerprint", "TEXT", 0, None, 0),
+            ("processor_fingerprint", "TEXT", 0, None, 0),
+            ("attempt_no", "INTEGER", 1, None, 0),
+            ("attempt_token", "TEXT", 0, None, 0),
+            ("owner_generation", "TEXT", 0, None, 0),
+            ("crash_recoveries", "INTEGER", 1, None, 0),
+            ("cancel_requested", "INTEGER", 1, None, 0),
+            ("result_lease_id", "TEXT", 0, None, 0),
+            ("error_code", "TEXT", 0, None, 0),
+            ("input_cleanup_pending", "INTEGER", 1, None, 0),
+            ("created_at", "TEXT", 1, None, 0),
+            ("started_at", "TEXT", 0, None, 0),
+            ("finished_at", "TEXT", 0, None, 0),
+        )
+        expected_marker_columns = (
+            ("singleton", "INTEGER", 0, None, 1),
+            ("generation", "TEXT", 1, None, 0),
+            ("created_at", "TEXT", 1, None, 0),
+        )
+        with self._lock:
+            job_exists = self._connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'transcription_jobs'
+                """
+            ).fetchone()
+            marker_exists = self._connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'shutdown_marker'
+                """
+            ).fetchone()
+            job_columns = self._table_columns("transcription_jobs")
+            marker_columns = self._table_columns("shutdown_marker")
+            job_indexes = {
+                row["name"]: row
+                for row in self._connection.execute(
+                    "PRAGMA index_list(transcription_jobs)"
+                )
+            }
+        if job_exists is None:
+            raise StorageSchemaError(
+                "storage schema v4 transcription job table is missing"
+            )
+        if job_exists["sql"] != _V4_TRANSCRIPTION_JOBS_DDL:
+            raise StorageSchemaError(
+                "storage schema v4 transcription job table has unexpected definition"
+            )
+        if job_columns != expected_job_columns:
+            raise StorageSchemaError(
+                "storage schema v4 transcription job table has unexpected columns"
+            )
+        if marker_exists is None:
+            raise StorageSchemaError(
+                "storage schema v4 shutdown marker table is missing"
+            )
+        if marker_exists["sql"] != _V4_SHUTDOWN_MARKER_DDL:
+            raise StorageSchemaError(
+                "storage schema v4 shutdown marker table has unexpected definition"
+            )
+        if marker_columns != expected_marker_columns:
+            raise StorageSchemaError(
+                "storage schema v4 shutdown marker table has unexpected columns"
+            )
+        expected_indexes = {
+            "transcription_jobs_fifo_idx": (
+                "phase",
+                "status",
+                "created_at",
+                "id",
+            ),
+            "transcription_jobs_retention_idx": (
+                "phase",
+                "status",
+                "finished_at",
+                "id",
+            ),
+        }
+        for name, expected_columns in expected_indexes.items():
+            index = job_indexes.get(name)
+            if index is None or index["unique"] != 0 or index["partial"] != 0:
+                raise StorageSchemaError(
+                    f"storage schema v4 job index {name} is invalid"
+                )
+            with self._lock:
+                indexed_columns = tuple(
+                    row["name"]
+                    for row in self._connection.execute(f"PRAGMA index_info({name})")
+                )
+            if indexed_columns != expected_columns:
+                raise StorageSchemaError(
+                    f"storage schema v4 job index {name} is invalid"
+                )
+
+    def _table_columns(
+        self,
+        table: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                row["name"],
+                row["type"],
+                row["notnull"],
+                row["dflt_value"],
+                row["pk"],
+            )
+            for row in self._connection.execute(f"PRAGMA table_info({table})")
+        )
+
+    def _migrate_v3_to_v4(self) -> None:
+        with self._transaction():
+            self._verify_v3_schema()
+            self._create_v4_job_foundation()
+            changed = self._connection.execute(
+                """
+                UPDATE schema_meta SET version = 4
+                WHERE singleton = 1 AND version = 3
+                """
+            ).rowcount
+            if changed != 1:
+                raise StorageSchemaError(
+                    "storage schema version changed during migration"
+                )
+            self._verify_v4_schema()
 
     def create_speaker_profile(
         self,
