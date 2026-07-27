@@ -5,8 +5,12 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
 
-from botified_asr.audio import Cancellation
-from botified_asr.contracts import MAX_AUDIO_SAMPLES, CanonicalOptions
+from botified_asr.audio import SAMPLE_RATE, Cancellation
+from botified_asr.contracts import (
+    DIRECT_MAX_SAMPLES,
+    MAX_AUDIO_SAMPLES,
+    CanonicalOptions,
+)
 from botified_asr.pipeline import (
     CanonicalJsonlSegmentSink,
     ProcessorResult,
@@ -37,6 +41,8 @@ class TranscriptionProcessor(Protocol):
         segment_sink: SegmentSink,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ) -> ProcessorResult: ...
 
 
@@ -110,6 +116,7 @@ class StorageArtifactByteWriter:
 class ProgressAccumulator:
     def __init__(self) -> None:
         self._last_processed: int | None = None
+        self._exact_total: int | None = None
 
     def update(
         self,
@@ -117,6 +124,8 @@ class ProgressAccumulator:
         processed_samples: int,
         total_samples: int | None,
     ) -> None:
+        if self._exact_total is not None:
+            raise RuntimeError("progress was updated after EOF")
         _validate_sample_count(
             processed_samples,
             name="processed sample count",
@@ -126,17 +135,25 @@ class ProgressAccumulator:
                 total_samples,
                 name="total sample count",
             )
+            if total_samples != processed_samples:
+                raise ValueError(
+                    "EOF progress must have equal processed and total sample counts"
+                )
         if (
             self._last_processed is not None
             and processed_samples < self._last_processed
         ):
             raise ValueError("processed sample count must be monotonic")
         self._last_processed = processed_samples
+        if total_samples is not None:
+            self._exact_total = total_samples
 
     def finish(self) -> int:
         if self._last_processed is None:
             raise RuntimeError("progress did not report processed samples")
-        return self._last_processed
+        if self._exact_total is None:
+            raise RuntimeError("progress did not report EOF")
+        return self._exact_total
 
 
 def _validate_sample_count(value: int, *, name: str) -> None:
@@ -204,6 +221,14 @@ def prepare_sync_transcription(
     *,
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
 ) -> PreparedSyncResponse:
+    effective_max_audio_samples = (
+        storage.limits.max_audio_duration_secs * SAMPLE_RATE
+    )
+    effective_direct_max_audio_samples = min(
+        storage.limits.direct_max_audio_duration_secs * SAMPLE_RATE,
+        effective_max_audio_samples,
+        DIRECT_MAX_SAMPLES,
+    )
     selected_speaker_snapshot = resolve_selected_speaker_snapshot(
         storage,
         options.known_speaker_ids,
@@ -226,6 +251,8 @@ def prepare_sync_transcription(
             progress,
             sink,
             selected_speaker_snapshot=selected_speaker_snapshot,
+            effective_max_audio_samples=effective_max_audio_samples,
+            effective_direct_max_audio_samples=effective_direct_max_audio_samples,
         )
         if type(result) is not ProcessorResult:
             raise RuntimeError("processor returned an invalid result")

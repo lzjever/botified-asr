@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import wave
 from datetime import datetime, timezone
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 
@@ -96,12 +97,21 @@ def _options(
     )
 
 
-def _storage(tmp_path: Path) -> Storage:
+def _storage(
+    tmp_path: Path,
+    *,
+    max_audio_duration_secs: int = 43_200,
+    direct_max_audio_duration_secs: int = 30,
+    sync_max_audio_duration_secs: int = 3_600,
+) -> Storage:
     return Storage(
         tmp_path / "storage",
         LimitsConfig(
             max_upload_bytes=RESERVATION_QUANTUM,
+            max_audio_duration_secs=max_audio_duration_secs,
+            direct_max_audio_duration_secs=direct_max_audio_duration_secs,
             sync_max_upload_bytes=RESERVATION_QUANTUM,
+            sync_max_audio_duration_secs=sync_max_audio_duration_secs,
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
@@ -136,6 +146,7 @@ class EmittingProcessor:
         self.events = events
         self.calls = 0
         self.selected_snapshots: list[SelectedSpeakerSnapshot] = []
+        self.effective_caps: list[tuple[int, int]] = []
 
     def process(
         self,
@@ -146,9 +157,17 @@ class EmittingProcessor:
         sink: Any,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ) -> object:
         self.calls += 1
         self.selected_snapshots.append(selected_speaker_snapshot)
+        self.effective_caps.append(
+            (
+                effective_max_audio_samples,
+                effective_direct_max_audio_samples,
+            )
+        )
         if self.events is not None:
             self.events.append("processor")
         if self.behavior == "480001":
@@ -179,6 +198,12 @@ class EmittingProcessor:
             )
         elif self.behavior == "zero":
             progress.update(processed_samples=0, total_samples=None)
+        if self.behavior not in {"missing_progress", "missing_eof"}:
+            total_samples = 0 if self.behavior == "zero" else 16_000
+            progress.update(
+                processed_samples=total_samples,
+                total_samples=total_samples,
+            )
         ref = sink.finalize()
         if self.behavior == "bare_ref":
             return ref
@@ -287,11 +312,65 @@ def test_progress_accumulator_is_exact_monotonic_and_requires_update() -> None:
                 total_samples=total,  # type: ignore[arg-type]
             )
 
-    progress.update(processed_samples=2, total_samples=0)
+    progress.update(processed_samples=2, total_samples=None)
     progress.update(processed_samples=3, total_samples=None)
     with pytest.raises(ValueError, match="monotonic"):
         progress.update(processed_samples=2, total_samples=None)
+    with pytest.raises(RuntimeError, match="EOF"):
+        progress.finish()
+    with pytest.raises(ValueError):
+        progress.update(processed_samples=3, total_samples=4)
+
+    progress.update(processed_samples=3, total_samples=3)
     assert progress.finish() == 3
+    for total_samples in (None, 3):
+        with pytest.raises((RuntimeError, ValueError)):
+            progress.update(
+                processed_samples=3,
+                total_samples=total_samples,
+            )
+
+
+def test_sync_composition_protocol_and_current_effective_caps(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.composition import (
+        TranscriptionProcessor,
+        prepare_sync_transcription,
+    )
+
+    parameters = signature(TranscriptionProcessor.process).parameters
+    for name in (
+        "selected_speaker_snapshot",
+        "effective_max_audio_samples",
+        "effective_direct_max_audio_samples",
+    ):
+        assert parameters[name].kind is Parameter.KEYWORD_ONLY
+
+    storage = _storage(
+        tmp_path,
+        max_audio_duration_secs=90,
+        direct_max_audio_duration_secs=7,
+        sync_max_audio_duration_secs=60,
+    )
+    processor = EmittingProcessor()
+    try:
+        prepared = prepare_sync_transcription(
+            storage,
+            processor,
+            tmp_path / "input.ready",
+            owner_id="request-1",
+            options=_options(),
+            cancellation=Cancellation(),
+            speaker_embedding_policy=_speaker_embedding_policy(),
+            projector=SpyProjector(),
+        )
+
+        assert processor.effective_caps == [(90 * 16_000, 7 * 16_000)]
+        assert b"".join(prepared.iter_body()) == b'{"text":"hello"}'
+        _assert_no_artifact(storage)
+    finally:
+        storage.close()
 
 
 def test_real_wav_processor_storage_and_three_projections(
@@ -363,6 +442,7 @@ def test_real_wav_processor_storage_and_three_projections(
         "invalid_mapping",
         "invalid_progress",
         "missing_progress",
+        "missing_eof",
     ],
 )
 def test_composition_faults_discard_every_artifact(

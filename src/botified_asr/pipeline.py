@@ -808,6 +808,8 @@ class Processor:
         segment_sink: SegmentSink,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ) -> ProcessorResult:
         failed = True
         blocks: DecodedBlocks | None = None
@@ -822,6 +824,10 @@ class Processor:
             blocks.close()
 
         try:
+            _validate_effective_sample_caps(
+                effective_max_audio_samples,
+                effective_direct_max_audio_samples,
+            )
             if (
                 type(selected_speaker_snapshot) is not SelectedSpeakerSnapshot
                 or type(selected_speaker_snapshot.speakers) is not tuple
@@ -874,25 +880,33 @@ class Processor:
                     if is_diarize and self._speaker_policy is not None
                     else None
                 )
-                self._process_vad(
+                actual_samples = self._process_vad(
                     blocks,
                     cancellation,
                     progress_sink,
                     segment_sink,
                     vad_adapter=vad_adapter,
                     language=canonical_options.language,
+                    effective_max_audio_samples=effective_max_audio_samples,
                     speaker_adapter=speaker_adapter,
                     speaker_state=speaker_state,
                 )
             else:
-                self._process_direct(
+                actual_samples = self._process_direct(
                     blocks,
                     cancellation,
                     progress_sink,
                     segment_sink,
                     language=canonical_options.language,
+                    effective_direct_max_audio_samples=(
+                        effective_direct_max_audio_samples
+                    ),
                 )
             close_decoder()
+            progress_sink.update(
+                processed_samples=actual_samples,
+                total_samples=actual_samples,
+            )
             speaker_mapping = SpeakerLabelMapping(())
             if is_diarize:
                 if speaker_state is None:
@@ -931,9 +945,10 @@ class Processor:
         *,
         vad_adapter: StreamingVadAdapter,
         language: str,
+        effective_max_audio_samples: int,
         speaker_adapter: SpeakerEmbeddingAdapter | None = None,
         speaker_state: AnonymousSpeakerState | None = None,
-    ) -> None:
+    ) -> int:
         segmenter = StreamingSpeechSegmenter(vad_adapter)
         pending: list[BufferedSpeechSegment] = []
         pending_pcm_samples = 0
@@ -1041,7 +1056,7 @@ class Processor:
                 processed_samples=0,
                 total_samples=None,
             )
-            return
+            return 0
 
         processed_end_sample = 0
         while True:
@@ -1061,6 +1076,12 @@ class Processor:
                     "invalid_audio",
                     "Decoded audio has a non-final short block",
                 )
+            next_processed_end_sample = processed_end_sample + len(current.pcm)
+            if next_processed_end_sample > effective_max_audio_samples:
+                raise PipelineError(
+                    "audio_too_long",
+                    "Decoded audio exceeds the configured duration limit",
+                )
             check_cancellation()
             emitted = segmenter.process(current, is_final=is_final)
             check_cancellation()
@@ -1072,7 +1093,7 @@ class Processor:
             for segment in emitted:
                 enqueue(segment)
 
-            processed_end_sample += len(current.pcm)
+            processed_end_sample = next_processed_end_sample
             progress_sink.update(
                 processed_samples=processed_end_sample,
                 total_samples=None,
@@ -1082,6 +1103,7 @@ class Processor:
             current = following
 
         flush()
+        return processed_end_sample
 
     def _process_direct(
         self,
@@ -1091,7 +1113,8 @@ class Processor:
         segment_sink: SegmentSink,
         *,
         language: str,
-    ) -> None:
+        effective_direct_max_audio_samples: int,
+    ) -> int:
         chunks: list[np.ndarray] = []
         sample_count = 0
         saw_short_block = False
@@ -1109,7 +1132,7 @@ class Processor:
                     "Decoded audio blocks are not contiguous",
                 )
             next_count = sample_count + len(block.pcm)
-            if next_count > DIRECT_MAX_SAMPLES:
+            if next_count > effective_direct_max_audio_samples:
                 raise PipelineError(
                     "long_audio_requires_vad",
                     "chunking_strategy=auto is required for long audio",
@@ -1127,13 +1150,13 @@ class Processor:
                 processed_samples=0,
                 total_samples=None,
             )
-            return
+            return 0
         int16_pcm = np.concatenate(chunks)
         if (
             int16_pcm.dtype != np.int16
             or int16_pcm.ndim != 1
             or not int16_pcm.flags.c_contiguous
-            or len(int16_pcm) > DIRECT_MAX_SAMPLES
+            or len(int16_pcm) > effective_direct_max_audio_samples
         ):
             raise PipelineError("invalid_audio", "Decoded audio is invalid")
         batch_result = self._adapter.transcribe_batch(
@@ -1151,7 +1174,7 @@ class Processor:
             )
         result = batch_result[0]
         if result.text == "":
-            return
+            return sample_count
         segment_sink.append(
             SegmentRecord(
                 index=0,
@@ -1161,6 +1184,27 @@ class Processor:
                 language=result.language,
                 annotations=result.annotations,
             )
+        )
+        return sample_count
+
+
+def _validate_effective_sample_caps(
+    effective_max_audio_samples: int,
+    effective_direct_max_audio_samples: int,
+) -> None:
+    if type(effective_max_audio_samples) is not int:
+        raise TypeError("effective maximum audio samples must be an integer")
+    if type(effective_direct_max_audio_samples) is not int:
+        raise TypeError("effective direct maximum audio samples must be an integer")
+    if not 1 <= effective_max_audio_samples <= MAX_AUDIO_SAMPLES:
+        raise ValueError("effective maximum audio samples is outside the allowed range")
+    if not (
+        1
+        <= effective_direct_max_audio_samples
+        <= min(effective_max_audio_samples, DIRECT_MAX_SAMPLES)
+    ):
+        raise ValueError(
+            "effective direct maximum audio samples is outside the allowed range"
         )
 
 

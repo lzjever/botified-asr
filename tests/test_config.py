@@ -207,6 +207,17 @@ def test_cpu_runtime_rejects_unsupported_device(
             "duration limits",
         ),
         (
+            "direct_max_audio_duration_secs: 31\n"
+            "  sync_max_audio_duration_secs: 31\n"
+            "  max_audio_duration_secs: 31",
+            "duration limits",
+        ),
+        (
+            "sync_max_audio_duration_secs: 3601\n"
+            "  max_audio_duration_secs: 3601",
+            "duration limits",
+        ),
+        (
             "sync_max_upload_bytes: 9\n  max_upload_bytes: 8",
             "upload byte limits",
         ),
@@ -221,6 +232,22 @@ def test_limit_constraints_are_validated(
 
     with pytest.raises(ConfigError, match=match):
         load_config(path)
+
+
+def test_duration_release_boundaries_are_accepted(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path,
+        "limits:\n"
+        "  direct_max_audio_duration_secs: 30\n"
+        "  sync_max_audio_duration_secs: 3600\n"
+        "  max_audio_duration_secs: 43200\n",
+    )
+
+    limits = load_config(path).limits
+
+    assert limits.direct_max_audio_duration_secs == 30
+    assert limits.sync_max_audio_duration_secs == 3600
+    assert limits.max_audio_duration_secs == 43_200
 
 
 def test_storage_limit_rounds_max_upload_to_reservation_quantum(

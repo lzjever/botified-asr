@@ -9,7 +9,11 @@ import pytest
 
 from botified_asr import pipeline, speaker_matching, speakers
 from botified_asr.audio import BLOCK_SAMPLES, Cancellation, DecodedBlock, MediaProbe
-from botified_asr.contracts import CanonicalOptions
+from botified_asr.contracts import (
+    DIRECT_MAX_SAMPLES,
+    MAX_AUDIO_SAMPLES,
+    CanonicalOptions,
+)
 from botified_asr.speaker_profiles import SpeakerEmbedding
 from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.speaker_snapshot import SelectedSpeaker, SelectedSpeakerSnapshot
@@ -19,15 +23,23 @@ EMPTY_SELECTED_SNAPSHOT = SelectedSpeakerSnapshot(())
 
 
 class FakeDecoder:
-    def __init__(self, blocks: tuple[DecodedBlock, ...]) -> None:
+    def __init__(
+        self,
+        blocks: tuple[DecodedBlock, ...],
+        *,
+        events: list[str] | None = None,
+    ) -> None:
         self.blocks = blocks
         self.closed = 0
+        self.events = events
 
     def __iter__(self):
         yield from self.blocks
 
     def close(self) -> None:
         self.closed += 1
+        if self.events is not None:
+            self.events.append("decoder_close")
 
 
 class FakeFrontend:
@@ -76,11 +88,14 @@ class FakeAsrAdapter:
 
 
 class RecordingProgress:
-    def __init__(self) -> None:
+    def __init__(self, *, events: list[str] | None = None) -> None:
         self.updates: list[tuple[int, int | None]] = []
+        self.events = events
 
     def update(self, *, processed_samples: int, total_samples: int | None) -> None:
         self.updates.append((processed_samples, total_samples))
+        if self.events is not None:
+            self.events.append(f"progress:{processed_samples}:{total_samples}")
 
 
 class RecordingSink:
@@ -273,6 +288,8 @@ def _process(
     language: str = "auto",
     progress: RecordingProgress | None = None,
     canonical_options: CanonicalOptions | None = None,
+    effective_max_audio_samples: int = MAX_AUDIO_SAMPLES,
+    effective_direct_max_audio_samples: int = DIRECT_MAX_SAMPLES,
 ) -> object:
     return processor.process(
         Path("/internal/input.ready"),
@@ -280,6 +297,8 @@ def _process(
         Cancellation(),
         progress or RecordingProgress(),
         sink,
+        effective_max_audio_samples=effective_max_audio_samples,
+        effective_direct_max_audio_samples=effective_direct_max_audio_samples,
         selected_speaker_snapshot=selected_speaker_snapshot,
     )
 
@@ -317,9 +336,10 @@ def test_empty_auto_succeeds_without_vad_or_asr_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     instances = _install_segmenter(monkeypatch, ())
-    decoder = FakeDecoder(())
+    events: list[str] = []
+    decoder = FakeDecoder((), events=events)
     asr = FakeAsrAdapter()
-    progress = RecordingProgress()
+    progress = RecordingProgress(events=events)
     sink = RecordingSink()
 
     result = _process(
@@ -337,7 +357,8 @@ def test_empty_auto_succeeds_without_vad_or_asr_calls(
     _assert_empty_processor_result(result, sink.ref)
     assert sum(len(instance.calls) for instance in instances) == 0
     assert asr.calls == []
-    assert progress.updates == [(0, None)]
+    assert progress.updates == [(0, None), (0, 0)]
+    assert events[-2:] == ["decoder_close", "progress:0:0"]
     assert decoder.closed == 1
     assert sink.finalized == 1
     assert sink.aborted == 0
@@ -349,9 +370,10 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
     segment = _segment(5_920, 24_000, pcm_start_sample=2_720)
     instances = _install_segmenter(monkeypatch, ((), (), (segment,)))
     blocks = _blocks(3)
-    decoder = FakeDecoder(blocks)
+    events: list[str] = []
+    decoder = FakeDecoder(blocks, events=events)
     asr = FakeAsrAdapter(lambda _pcms: (_result("mapped"),))
-    progress = RecordingProgress()
+    progress = RecordingProgress(events=events)
     sink = RecordingSink()
 
     _process(
@@ -391,7 +413,71 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
         (BLOCK_SAMPLES, None),
         (2 * BLOCK_SAMPLES, None),
         (3 * BLOCK_SAMPLES, None),
+        (3 * BLOCK_SAMPLES, 3 * BLOCK_SAMPLES),
     ]
+    assert events[-2:] == [
+        "decoder_close",
+        f"progress:{3 * BLOCK_SAMPLES}:{3 * BLOCK_SAMPLES}",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overall_cap", "blocks", "expected_processed"),
+    (
+        (
+            BLOCK_SAMPLES - 1,
+            _blocks(1),
+            (),
+        ),
+        (
+            BLOCK_SAMPLES,
+            (
+                *_blocks(1),
+                DecodedBlock(BLOCK_SAMPLES, np.ones(1, dtype=np.int16)),
+            ),
+            ((BLOCK_SAMPLES, None),),
+        ),
+    ),
+    ids=("first_block_exceeds", "first_sample_after_cap"),
+)
+def test_auto_stops_before_processing_audio_beyond_the_effective_overall_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    overall_cap: int,
+    blocks: tuple[DecodedBlock, ...],
+    expected_processed: tuple[tuple[int, int | None], ...],
+) -> None:
+    instances = _install_segmenter(monkeypatch, ((), ()))
+    decoder = FakeDecoder(blocks)
+    asr = FakeAsrAdapter()
+    progress = RecordingProgress()
+    sink = RecordingSink()
+
+    with pytest.raises(pipeline.PipelineError) as caught:
+        _process(
+            pipeline.Processor(
+                FakeFrontend(decoder),
+                asr,
+                vad_adapter=object(),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=progress,
+            effective_max_audio_samples=overall_cap,
+            effective_direct_max_audio_samples=min(
+                overall_cap,
+                DIRECT_MAX_SAMPLES,
+            ),
+        )
+
+    assert caught.value.code == "audio_too_long"
+    assert len(instances) == 1
+    assert len(instances[0].calls) == len(expected_processed)
+    assert progress.updates == list(expected_processed)
+    assert asr.calls == []
+    assert decoder.closed == 1
+    assert sink.finalized == 0
+    assert sink.aborted == 1
 
 
 @pytest.mark.parametrize(

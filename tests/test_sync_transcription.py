@@ -16,6 +16,7 @@ from botified_asr import speaker_profiles, speakers
 from botified_asr.api import Readiness, create_app
 from botified_asr.audio import AudioError
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
 from botified_asr.pipeline import (
     PipelineError,
     PipelineNotReady,
@@ -80,6 +81,7 @@ class SpyProcessor:
         self.allow_finish = threading.Event()
         self.finalized_ref: ArtifactRef | None = None
         self.finished = threading.Event()
+        self.effective_caps: list[tuple[int, int]] = []
 
     def process(
         self,
@@ -90,9 +92,17 @@ class SpyProcessor:
         sink,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ):
         del selected_speaker_snapshot
         self.calls += 1
+        self.effective_caps.append(
+            (
+                effective_max_audio_samples,
+                effective_direct_max_audio_samples,
+            )
+        )
         self.started.set()
         self.cancellation = cancellation
         self.input_bytes = input_path.read_bytes()
@@ -142,6 +152,7 @@ class SpyProcessor:
                 )
             if self.behavior == "invalid_artifact":
                 progress.update(processed_samples=1, total_samples=None)
+                progress.update(processed_samples=1, total_samples=1)
                 sink._writer.write(b"not canonical jsonl\n")
                 ref = sink._writer.seal()
                 return pipeline_module.ProcessorResult(
@@ -160,6 +171,8 @@ class SpyProcessor:
                 )
             )
             progress.update(processed_samples=4, total_samples=None)
+            if self.behavior != "missing_eof":
+                progress.update(processed_samples=4, total_samples=4)
             ref = sink.finalize()
             assert isinstance(ref, ArtifactRef)
             self.finalized_ref = ref
@@ -268,6 +281,9 @@ def test_sync_projection_is_exact_and_cleans_after_normal_consumption(
     assert processor.input_bytes == b"stored-input"
     assert processor.ran_off_event_loop
     assert not processor.cancellation.cancelled
+    assert processor.effective_caps == [
+        (MAX_AUDIO_SAMPLES, DIRECT_MAX_SAMPLES)
+    ]
     _assert_no_resources(storage)
 
 
@@ -282,6 +298,7 @@ def test_sync_projection_is_exact_and_cleans_after_normal_consumption(
         ("audio_probe_timeout", 503, "audio_probe_timeout", None),
         ("audio_decode_timeout", 503, "audio_decode_timeout", None),
         ("invalid_artifact", 500, "invalid_result_artifact", None),
+        ("missing_eof", 500, "internal_error", None),
     ],
 )
 def test_processing_and_prepare_errors_are_stable_redacted_and_clean(

@@ -26,8 +26,14 @@ class SdkProcessor:
         sink,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ):
-        del selected_speaker_snapshot
+        del (
+            selected_speaker_snapshot,
+            effective_max_audio_samples,
+            effective_direct_max_audio_samples,
+        )
         sink.append(
             SegmentRecord(
                 0,
@@ -39,6 +45,7 @@ class SdkProcessor:
             )
         )
         progress.update(processed_samples=1, total_samples=None)
+        progress.update(processed_samples=1, total_samples=1)
         ref = sink.finalize()
         return pipeline_module.ProcessorResult(
             ref,

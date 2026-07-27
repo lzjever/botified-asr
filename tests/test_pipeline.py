@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import wave
 from dataclasses import FrozenInstanceError
+from inspect import Parameter, signature
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,11 @@ from botified_asr.audio import (
     FfmpegAudioFrontend,
     MediaProbe,
 )
-from botified_asr.contracts import CanonicalOptions
+from botified_asr.contracts import (
+    DIRECT_MAX_SAMPLES,
+    MAX_AUDIO_SAMPLES,
+    CanonicalOptions,
+)
 from botified_asr.pipeline import (
     AsrResult,
     CanonicalJsonlSegmentSink,
@@ -40,19 +45,26 @@ class FakeDecoder:
         *,
         fail_close: bool = False,
         iteration_error: Exception | None = None,
+        events: list[str] | None = None,
     ) -> None:
         self.blocks = blocks
         self.closed = 0
+        self.yielded = 0
         self.fail_close = fail_close
         self.iteration_error = iteration_error
+        self.events = events
 
     def __iter__(self):
-        yield from self.blocks
+        for block in self.blocks:
+            self.yielded += 1
+            yield block
         if self.iteration_error is not None:
             raise self.iteration_error
 
     def close(self) -> None:
         self.closed += 1
+        if self.events is not None:
+            self.events.append("decoder_close")
         if self.fail_close:
             raise OSError("decoder close failed")
 
@@ -174,11 +186,22 @@ class FakeFrontend:
 
 
 class RecordingProgress:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_eof: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
         self.updates: list[tuple[int, int | None]] = []
+        self.fail_eof = fail_eof
+        self.events = events
 
     def update(self, *, processed_samples: int, total_samples: int | None) -> None:
         self.updates.append((processed_samples, total_samples))
+        if self.events is not None:
+            self.events.append(f"progress:{processed_samples}:{total_samples}")
+        if self.fail_eof and total_samples is not None:
+            raise OSError("EOF progress failed")
 
 
 def options(
@@ -205,6 +228,8 @@ def run_processor(
     selected_speaker_snapshot: SelectedSpeakerSnapshot,
     canonical_options: CanonicalOptions | None = None,
     progress: RecordingProgress | None = None,
+    effective_max_audio_samples: int = MAX_AUDIO_SAMPLES,
+    effective_direct_max_audio_samples: int = DIRECT_MAX_SAMPLES,
 ) -> object:
     frontend = FakeFrontend(decoder)
     return Processor(
@@ -217,6 +242,8 @@ def run_processor(
         Cancellation(),
         progress or RecordingProgress(),
         sink,
+        effective_max_audio_samples=effective_max_audio_samples,
+        effective_direct_max_audio_samples=effective_direct_max_audio_samples,
         selected_speaker_snapshot=selected_speaker_snapshot,
     )
 
@@ -245,6 +272,76 @@ def test_processor_result_is_frozen_and_requires_both_fields() -> None:
         result_type(artifact_ref)  # type: ignore[call-arg]
 
 
+def test_processor_requires_per_job_effective_sample_caps() -> None:
+    parameters = signature(Processor.process).parameters
+
+    for name in (
+        "effective_max_audio_samples",
+        "effective_direct_max_audio_samples",
+    ):
+        parameter = parameters[name]
+        assert parameter.kind is Parameter.KEYWORD_ONLY
+        assert parameter.default is Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("overall_cap", "direct_cap", "error_type"),
+    (
+        (True, 1, TypeError),
+        (1.0, 1, TypeError),
+        (0, 1, ValueError),
+        (1, True, TypeError),
+        (1, 1.0, TypeError),
+        (1, 0, ValueError),
+        (1, 2, ValueError),
+        (
+            DIRECT_MAX_SAMPLES + 1,
+            DIRECT_MAX_SAMPLES + 1,
+            ValueError,
+        ),
+    ),
+    ids=(
+        "overall_bool",
+        "overall_float",
+        "overall_zero",
+        "direct_bool",
+        "direct_float",
+        "direct_zero",
+        "direct_over_overall",
+        "direct_over_release",
+    ),
+)
+def test_processor_rejects_invalid_effective_caps_before_probe(
+    overall_cap: object,
+    direct_cap: object,
+    error_type: type[Exception],
+) -> None:
+    decoder = FakeDecoder([])
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+
+    with pytest.raises(error_type):
+        Processor(
+            frontend,
+            FakeAdapter(),
+            known_speaker_policy=None,
+        ).process(
+            Path("/internal/input.ready"),
+            options(),
+            Cancellation(),
+            RecordingProgress(),
+            sink,
+            effective_max_audio_samples=overall_cap,  # type: ignore[arg-type]
+            effective_direct_max_audio_samples=direct_cap,  # type: ignore[arg-type]
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        )
+
+    assert frontend.probe_calls == []
+    assert frontend.decode_calls == []
+    assert decoder.closed == 0
+    assert sink.finalized == 0
+
+
 @pytest.mark.parametrize("sample_count", [0, 1, 480_000])
 def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
     sample_count: int,
@@ -256,8 +353,9 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
         DecodedBlock(start, samples[start : start + 9_600])
         for start in range(0, sample_count, 9_600)
     ]
-    decoder = FakeDecoder(blocks)
-    progress = RecordingProgress()
+    events: list[str] = []
+    decoder = FakeDecoder(blocks, events=events)
+    progress = RecordingProgress(events=events)
 
     result = run_processor(
         decoder,
@@ -271,7 +369,12 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
     assert sink.finalized == 1
     assert sink.aborted == 0
     assert decoder.closed == 1
-    assert progress.updates[-1][0] == sample_count
+    assert progress.updates[-1] == (sample_count, sample_count)
+    assert all(total is None for _processed, total in progress.updates[:-1])
+    assert events[-2:] == [
+        "decoder_close",
+        f"progress:{sample_count}:{sample_count}",
+    ]
     assert len(adapter.calls) == (0 if sample_count == 0 else 1)
     assert len(sink.records) == (0 if sample_count == 0 else 1)
     if sample_count:
@@ -290,6 +393,38 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
             pcms[0],
             samples,
         )
+
+
+def test_direct_uses_the_smaller_effective_cap_immediately() -> None:
+    direct_cap = 100
+    decoder = FakeDecoder(
+        [
+            DecodedBlock(0, np.zeros(direct_cap + 1, dtype=np.int16)),
+            DecodedBlock(direct_cap + 1, np.zeros(1, dtype=np.int16)),
+        ]
+    )
+    adapter = FakeAdapter()
+    sink = RecordingSink()
+    progress = RecordingProgress()
+
+    with pytest.raises(PipelineError) as caught:
+        run_processor(
+            decoder,
+            adapter,
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=progress,
+            effective_max_audio_samples=1_000,
+            effective_direct_max_audio_samples=direct_cap,
+        )
+
+    assert caught.value.code == "long_audio_requires_vad"
+    assert decoder.yielded == 1
+    assert decoder.closed == 1
+    assert progress.updates == []
+    assert adapter.calls == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
 
 
 def test_normalizing_asr_adapter_has_typed_batch_convenience() -> None:
@@ -405,7 +540,10 @@ def test_direct_processor_skips_empty_model_text_and_finalizes_successfully() ->
     _assert_empty_processor_result(result, sink.ref)
     assert len(adapter.calls) == 1
     assert adapter.calls[0][1] == "zh"
-    assert progress.updates[-1] == (len(samples), None)
+    assert progress.updates[-2:] == [
+        (len(samples), None),
+        (len(samples), len(samples)),
+    ]
     assert sink.records == []
     assert sink.finalized == 1
     assert sink.aborted == 0
@@ -459,6 +597,8 @@ def test_unimplemented_branches_are_typed_not_ready_and_never_run_direct() -> No
                 Cancellation(),
                 RecordingProgress(),
                 sink,
+                effective_max_audio_samples=MAX_AUDIO_SAMPLES,
+                effective_direct_max_audio_samples=DIRECT_MAX_SAMPLES,
                 selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
             )
 
@@ -623,31 +763,53 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
     assert short_nonfinal_sink.aborted == 1
 
     close_fault_sink = RecordingSink()
+    close_fault_progress = RecordingProgress()
     with pytest.raises(OSError, match="decoder close failed"):
         run_processor(
             FakeDecoder([], fail_close=True),
             FakeAdapter(),
             close_fault_sink,
             selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=close_fault_progress,
         )
+    assert close_fault_progress.updates == [(0, None)]
     assert close_fault_sink.finalized == 0
     assert close_fault_sink.aborted == 1
 
     iteration_fault_sink = RecordingSink()
     iteration_fault_decoder = FakeDecoder(
-        [],
+        [DecodedBlock(0, np.ones(1, dtype=np.int16))],
         iteration_error=OSError("decode iteration failed"),
     )
+    iteration_fault_progress = RecordingProgress()
     with pytest.raises(OSError, match="decode iteration failed"):
         run_processor(
             iteration_fault_decoder,
             FakeAdapter(),
             iteration_fault_sink,
             selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=iteration_fault_progress,
         )
     assert iteration_fault_decoder.closed == 1
+    assert iteration_fault_progress.updates == [(1, None)]
     assert iteration_fault_sink.aborted == 1
     assert iteration_fault_sink.finalized == 0
+
+    eof_fault_sink = RecordingSink()
+    eof_fault_decoder = FakeDecoder([])
+    eof_fault_progress = RecordingProgress(fail_eof=True)
+    with pytest.raises(OSError, match="EOF progress failed"):
+        run_processor(
+            eof_fault_decoder,
+            FakeAdapter(),
+            eof_fault_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=eof_fault_progress,
+        )
+    assert eof_fault_decoder.closed == 1
+    assert eof_fault_progress.updates == [(0, None), (0, 0)]
+    assert eof_fault_sink.finalized == 0
+    assert eof_fault_sink.aborted == 1
 
 
 def test_canonical_join_golden_and_partition_invariant() -> None:
@@ -715,12 +877,14 @@ def test_runtime_generated_wav_runs_through_public_processor(
         Cancellation(),
         progress,
         sink,
+        effective_max_audio_samples=MAX_AUDIO_SAMPLES,
+        effective_direct_max_audio_samples=DIRECT_MAX_SAMPLES,
         selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
     )
 
     _assert_empty_processor_result(result, sink.ref)
     assert sink.records[0].end_sample == len(expected)
-    assert progress.updates[-1][0] == len(expected)
+    assert progress.updates[-1] == (len(expected), len(expected))
     np.testing.assert_array_equal(
         model.inputs[0],
         expected.astype(np.float32) / np.float32(32768.0),

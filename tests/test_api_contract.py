@@ -60,8 +60,14 @@ class FakeProcessor:
         sink,
         *,
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
     ):
-        del selected_speaker_snapshot
+        del (
+            selected_speaker_snapshot,
+            effective_max_audio_samples,
+            effective_direct_max_audio_samples,
+        )
         text = self.callback(input_path, options)
         processed_samples = 1 if text else 0
         if text:
@@ -78,6 +84,10 @@ class FakeProcessor:
         progress.update(
             processed_samples=processed_samples,
             total_samples=None,
+        )
+        progress.update(
+            processed_samples=processed_samples,
+            total_samples=processed_samples,
         )
         ref = sink.finalize()
         return pipeline_module.ProcessorResult(

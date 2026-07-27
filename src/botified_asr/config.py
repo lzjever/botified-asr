@@ -98,7 +98,9 @@ class LimitsConfig:
                 raise ConfigError(f"limits.{field.name} must be a positive integer")
 
         if not (
-            self.direct_max_audio_duration_secs
+            self.direct_max_audio_duration_secs <= 30
+            and self.sync_max_audio_duration_secs <= 3600
+            and self.direct_max_audio_duration_secs
             <= self.sync_max_audio_duration_secs
             <= self.max_audio_duration_secs
             <= MAX_AUDIO_DURATION_SECS
