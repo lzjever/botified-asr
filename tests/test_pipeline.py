@@ -52,23 +52,39 @@ class FakeDecoder:
 
 
 class FakeAdapter:
-    def __init__(self) -> None:
-        self.inputs: list[np.ndarray] = []
+    def __init__(
+        self,
+        batch_result: object = (
+            AsrResult(
+                text="  hello  ",
+                language="en",
+                annotations=RichAnnotations(
+                    emotion="happy",
+                    audio_event=None,
+                ),
+            ),
+        ),
+    ) -> None:
+        self.batch_result = batch_result
+        self.calls: list[tuple[tuple[np.ndarray, ...], str]] = []
 
-    def transcribe(self, pcm: np.ndarray) -> AsrResult:
+    def transcribe(self, _pcm: np.ndarray) -> AsrResult:
+        raise AssertionError("Processor must use the typed batch adapter contract")
+
+    def transcribe_batch(
+        self,
+        pcms: tuple[np.ndarray, ...],
+        *,
+        language: str,
+    ) -> object:
+        assert len(pcms) == 1
+        pcm = pcms[0]
         assert pcm.dtype == np.int16
         assert pcm.ndim == 1
         assert pcm.flags.c_contiguous
         assert len(pcm) <= 480_000
-        self.inputs.append(pcm)
-        return AsrResult(
-            text="  hello  ",
-            language="en",
-            annotations=RichAnnotations(
-                emotion="happy",
-                audio_event=None,
-            ),
-        )
+        self.calls.append((pcms, language))
+        return self.batch_result
 
 
 class RecordingSink:
@@ -162,11 +178,12 @@ class RecordingProgress:
 def options(
     *,
     model: str = "sensevoice",
+    language: str = "auto",
     chunking_strategy: str | None = None,
 ) -> CanonicalOptions:
     return CanonicalOptions(
         model=model,
-        language="auto",
+        language=language,
         response_format="json",
         chunking_strategy=chunking_strategy,
         include=(),
@@ -218,9 +235,12 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
     assert sink.aborted == 0
     assert decoder.closed == 1
     assert progress.updates[-1][0] == sample_count
-    assert len(adapter.inputs) == (0 if sample_count == 0 else 1)
+    assert len(adapter.calls) == (0 if sample_count == 0 else 1)
     assert len(sink.records) == (0 if sample_count == 0 else 1)
     if sample_count:
+        pcms, language = adapter.calls[0]
+        assert language == "auto"
+        assert len(pcms) == 1
         assert sink.records[0] == SegmentRecord(
             index=0,
             start_sample=0,
@@ -230,17 +250,121 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
             annotations=RichAnnotations("happy", None),
         )
         np.testing.assert_array_equal(
-            adapter.inputs[0],
+            pcms[0],
             samples,
         )
-    if sample_count == 1:
-        model = FloatModel()
-        result = NormalizingAsrAdapter(model).transcribe(samples)
-        assert result.text == "ok"
-        np.testing.assert_array_equal(
-            model.inputs[0],
-            samples.astype(np.float32) / np.float32(32768.0),
-        )
+
+
+def test_normalizing_asr_adapter_has_typed_batch_convenience() -> None:
+    samples = np.array([-32_768, -1, 0, 1, 32_767], dtype=np.int16)
+    model = FloatModel()
+
+    results = NormalizingAsrAdapter(model).transcribe_batch(
+        (samples,),
+        language="auto",
+    )
+
+    assert len(results) == 1
+    assert results[0].text == "ok"
+    np.testing.assert_array_equal(
+        model.inputs[0],
+        samples.astype(np.float32) / np.float32(32768.0),
+    )
+
+
+@pytest.mark.parametrize("language", ("zh", "en", "ko"))
+def test_direct_processor_passes_explicit_language_to_one_item_batch(
+    language: str,
+) -> None:
+    samples = np.arange(12_345, dtype=np.int32).astype(np.int16)
+    adapter = FakeAdapter()
+    sink = RecordingSink()
+
+    artifact_ref = run_processor(
+        FakeDecoder(
+            [
+                DecodedBlock(start, samples[start : start + 9_600])
+                for start in range(0, len(samples), 9_600)
+            ]
+        ),
+        adapter,
+        sink,
+        canonical_options=options(language=language),
+    )
+
+    assert artifact_ref is sink.ref
+    assert len(adapter.calls) == 1
+    pcms, requested_language = adapter.calls[0]
+    assert requested_language == language
+    assert len(pcms) == 1
+    np.testing.assert_array_equal(pcms[0], samples)
+
+
+@pytest.mark.parametrize(
+    "batch_result",
+    (
+        (),
+        (
+            AsrResult("first", "en", RichAnnotations()),
+            AsrResult("second", "en", RichAnnotations()),
+        ),
+        (object(),),
+        [AsrResult("list", "en", RichAnnotations())],
+    ),
+    ids=("empty", "multiple", "non_asr_result", "non_tuple"),
+)
+def test_direct_processor_rejects_invalid_typed_batch_results_atomically(
+    batch_result: object,
+) -> None:
+    adapter = FakeAdapter(batch_result)
+    sink = RecordingSink()
+    decoder = FakeDecoder([DecodedBlock(0, np.ones(4, dtype=np.int16))])
+
+    with pytest.raises(PipelineError) as caught:
+        run_processor(decoder, adapter, sink)
+
+    assert caught.value.code == "invalid_model_output"
+    assert len(adapter.calls) == 1
+    assert decoder.closed == 1
+    assert sink.records == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_direct_processor_skips_empty_model_text_and_finalizes_successfully() -> None:
+    result = AsrResult(
+        text="",
+        language="zh",
+        annotations=RichAnnotations(
+            emotion="unknown:sensevoice:emotion:EMO_UNKNOWN",
+            audio_event="unknown:sensevoice:audio_event:Event_UNK",
+        ),
+    )
+    adapter = FakeAdapter((result,))
+    sink = RecordingSink()
+    progress = RecordingProgress()
+    samples = np.arange(12_345, dtype=np.int32).astype(np.int16)
+
+    artifact_ref = run_processor(
+        FakeDecoder(
+            [
+                DecodedBlock(start, samples[start : start + 9_600])
+                for start in range(0, len(samples), 9_600)
+            ]
+        ),
+        adapter,
+        sink,
+        canonical_options=options(language="zh"),
+        progress=progress,
+    )
+
+    assert artifact_ref is sink.ref
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][1] == "zh"
+    assert progress.updates[-1] == (len(samples), None)
+    assert sink.records == []
+    assert sink.finalized == 1
+    assert sink.aborted == 0
 
 
 def test_direct_480001_closes_decoder_and_aborts_without_success() -> None:
@@ -259,7 +383,7 @@ def test_direct_480001_closes_decoder_and_aborts_without_success() -> None:
 
     assert getattr(caught.value, "code", None) == "long_audio_requires_vad"
     assert decoder.closed == 1
-    assert adapter.inputs == []
+    assert adapter.calls == []
     assert sink.records == []
     assert sink.finalized == 0
     assert sink.aborted == 1
@@ -285,7 +409,7 @@ def test_unimplemented_branches_are_typed_not_ready_and_never_run_direct() -> No
             )
 
         assert caught.value.code == "pipeline_not_ready"
-        assert adapter.inputs == []
+        assert adapter.calls == []
         assert sink.records == []
         assert sink.finalized == 0
         assert sink.aborted == 1

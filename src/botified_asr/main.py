@@ -4,12 +4,13 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import uvicorn
 
 from botified_asr.api import Readiness, create_app
 from botified_asr.audio import FfmpegAudioFrontend
 from botified_asr.config import load_api_key, load_config
-from botified_asr.pipeline import PipelineNotReady, Processor
+from botified_asr.pipeline import AsrResult, PipelineNotReady, Processor
 from botified_asr.storage import Storage
 
 
@@ -41,5 +42,14 @@ def _default_config_path() -> Path:
 
 
 class _ModelsNotLoadedAdapter:
-    def transcribe(self, _pcm):
+    def transcribe(self, _pcm: np.ndarray) -> AsrResult:
+        raise PipelineNotReady()
+
+    def transcribe_batch(
+        self,
+        _pcms: tuple[np.ndarray, ...],
+        *,
+        language: str,
+    ) -> tuple[AsrResult, ...]:
+        del language
         raise PipelineNotReady()

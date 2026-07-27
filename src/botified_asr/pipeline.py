@@ -420,6 +420,13 @@ class BoundedSpeechPcmBuffer:
 class AsrAdapter(Protocol):
     def transcribe(self, pcm: np.ndarray) -> AsrResult: ...
 
+    def transcribe_batch(
+        self,
+        pcms: tuple[np.ndarray, ...],
+        *,
+        language: str,
+    ) -> tuple[AsrResult, ...]: ...
+
 
 @runtime_checkable
 class StreamingVadAdapter(Protocol):
@@ -454,6 +461,15 @@ class NormalizingAsrAdapter:
         if not np.isfinite(normalized).all():
             raise PipelineError("invalid_audio", "ASR input segment is invalid")
         return self._model.infer(normalized)
+
+    def transcribe_batch(
+        self,
+        pcms: tuple[np.ndarray, ...],
+        *,
+        language: str,
+    ) -> tuple[AsrResult, ...]:
+        del language
+        return tuple(self.transcribe(pcm) for pcm in pcms)
 
 
 class StreamingVadSession:
@@ -730,6 +746,7 @@ class Processor:
                 cancellation,
                 progress_sink,
                 segment_sink,
+                language=canonical_options.language,
             )
             close_decoder()
             artifact_ref = segment_sink.finalize()
@@ -748,6 +765,8 @@ class Processor:
         cancellation: Cancellation,
         progress_sink: ProgressSink,
         segment_sink: SegmentSink,
+        *,
+        language: str,
     ) -> None:
         chunks: list[np.ndarray] = []
         sample_count = 0
@@ -793,12 +812,22 @@ class Processor:
             or len(int16_pcm) > DIRECT_MAX_SAMPLES
         ):
             raise PipelineError("invalid_audio", "Decoded audio is invalid")
-        result = self._adapter.transcribe(int16_pcm)
-        if not isinstance(result, AsrResult):
+        batch_result = self._adapter.transcribe_batch(
+            (int16_pcm,),
+            language=language,
+        )
+        if (
+            type(batch_result) is not tuple
+            or len(batch_result) != 1
+            or not isinstance(batch_result[0], AsrResult)
+        ):
             raise PipelineError(
                 "invalid_model_output",
                 "ASR model returned an invalid result",
             )
+        result = batch_result[0]
+        if result.text == "":
+            return
         segment_sink.append(
             SegmentRecord(
                 index=0,
