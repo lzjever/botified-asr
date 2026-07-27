@@ -120,14 +120,26 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 
 ### 4.3 版本固定
 
-- Python、FunASR、PyTorch、torchaudio、CUDA runtime 和模型必须在 release 构建前精确固定。
+- Python 固定为 `3.11.13`，FunASR 固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`。
+- CPU release 的 `torch` 和 `torchaudio` 均固定为 `2.11.0+cpu`，只从 PyTorch 官方 CPU index `https://download.pytorch.org/whl/cpu` 解析和安装；不得让通用 PyPI 或其他额外 index 覆盖这两个 artifact。
+- CUDA runtime、对应的 PyTorch artifact 和模型必须在各自 release 构建前精确固定；CPU pin 不自动成为 CUDA pin。
 - 发布镜像不得在启动时执行 `pip install -U`。
-- SenseVoice、FSMN-VAD、CAM++ 分别固定来源、immutable commit/tree hash 和预期 artifact hash；禁止解析 alias/master 后再记录“实际 revision”。
+- SenseVoice、FSMN-VAD、CAM++ 固定如下；禁止解析 alias/master 后再记录“实际 revision”：
+
+| 模型 | immutable revision | artifact | 预期 SHA-256 | 校验状态 |
+|---|---|---|---|---|
+| SenseVoiceSmall | `FunAudioLLM/SenseVoiceSmall@3847d57b6bdf2dd8875cb1508d2af43d80a16bf7` | `model.pt` | `833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea` | 当前来自 Hub 元数据；release 前必须本地隔离下载复算 |
+| FSMN-VAD | `funasr/fsmn-vad@df20e6b30c653645fa4ff125cacfcabd1020a669` | `model.pt` | `b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5` | 已本地复算 |
+| CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` | 已本地复算 |
+
 - 模型首次下载只进入按 revision 隔离的 cache，ready 前校验 hash、加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
 - SenseVoice、FSMN-VAD、CAM++ 各加载一个单例 adapter；所有 model call 共用唯一串行 inference lane。
 - 仓库代码采用 MIT license；每个 release 提供 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
 - SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由 installer 按固定来源/hash下载，不以技术便利替代许可判断。
+- SenseVoice 的预期 artifact hash 在 release 前必须由本地隔离下载重新计算并与 manifest 比较，不能只抄远端元数据。
+- aarch64 CPU artifact 必须通过原生 aarch64 runner 的 fresh-install、模型加载和固定 smoke gate；x86_64 上的交叉构建不能替代该 gate。
+- CUDA artifact 使用独立依赖锁、image digest 和真实 NVIDIA/CUDA runner gate；未经该审查不得沿用 CPU 结论或标记 CUDA 受支持。
 
 ### 4.4 可复现 fingerprint
 
@@ -322,6 +334,13 @@ Content-Type: text/plain; charset=utf-8
 
 禁止按字符数伪造时间戳。上游无法提供可靠时间信息时，省略对应 granular detail，而不是制造近似值。
 
+解码后为 0 个 PCM sample 的输入是成功空结果，不调用 SenseVoice，也不生成 segment：
+
+- `json` 返回 `{"text":""}`；
+- `text` 返回 0-byte 正文，仍使用 `text/plain; charset=utf-8`；
+- `verbose_json` 返回 `duration: 0`、`text: ""` 和 `segments: []`；显式请求语言时 `language` 回显该请求值，`language=auto` 时返回诚实的 `unknown`，不得为了填充语言而调用模型；
+- 请求了 rich include 时只返回所请求的顶层 `funasr` 数组，数组为空。
+
 ### 6.6 Diarized response
 
 遵循 OpenAI `diarized_json` 的基础形状：
@@ -418,7 +437,7 @@ Content-Type: text/plain; charset=utf-8
 | 409 | speaker name 冲突或资源状态冲突 |
 | 413 | 超过部署最大上传或实际音频时长 |
 | 422 | 可接受但需要异步/VAD 的请求模式 |
-| 429 | job 或推理 admission 饱和 |
+| 429 | storage、job 或推理 admission 饱和 |
 | 500 | 未分类内部错误 |
 | 503 | 模型未 ready 或运行时不可用 |
 
@@ -675,7 +694,7 @@ process(
 ) -> result_artifact
 ```
 
-processor 不知道 HTTP、job ID 或 SQLite 状态。sync 使用临时 artifact/内存 progress sink，async 使用 durable attempt artifact/SQLite sink；direct/VAD 只是 processor 内的 segmentation policy，crash recovery 从头调用同一函数。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
+processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只向注入的 `SegmentSink` 追加 sample-based canonical records，并接收 sink 完成后返回的 opaque artifact ref。API composition 在调用 processor 前从 storage 获取带 reservation 的 byte writer，再将其包装为 canonical JSONL `SegmentSink`；pipeline 不依赖 storage。sync 使用 request-owned artifact/progress sink，async 使用 durable attempt artifact/SQLite sink；direct/VAD 只是 processor 内的 segmentation policy，crash recovery 从头调用同一函数。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
 
 ### 8.2 Decoder
 
@@ -683,8 +702,11 @@ processor 不知道 HTTP、job ID 或 SQLite 状态。sync 使用临时 artifact
 - 输入是服务生成的内部路径。
 - 固定 `-nostdin`、只选 `0:a:0`，禁用 video/subtitle/data 输出；probe 和 decode 都有 wall timeout、bounded stdout/stderr。
 - protocol 只允许本地 `file,pipe`，container 禁止网络；format 必须落在受支持音频/媒体 demuxer allowlist，playlist/concat-like 输入 fail closed。
-- 输出固定为 mono PCM16 16 kHz。
-- direct path 同样按输出 PCM 帧计数；一旦超过 30 秒就终止 decoder、丢弃部分结果并返回 `422 long_audio_requires_vad`，禁止把前 30 秒作为成功响应。
+- 输出固定为 little-endian signed PCM16（`s16le`）、mono、16 kHz。decoder 以 `DecodedBlock(start_sample, pcm)` 交付一维 C-contiguous `np.int16`，非末块固定为 9,600 samples，末块为 1–9,600 samples，`start_sample` 从 0 起严格连续。
+- pipe read 可跨 read 保留至多 1 byte carry；EOF 仍剩 1 byte 是 malformed decoder output，必须失败，不能丢弃或补零。
+- processor 边界始终使用 `np.int16`；模型 adapter 只在当前有界 segment 内执行 `pcm.astype(np.float32) / 32768.0`，校验一维、finite 和长度后调用模型，不在 processor 额外保留一份 float32 全量副本。
+- direct path 同样按输出 PCM sample 计数。1–480,000 samples 只产生一个 half-open segment `[0,n)`；第 480,001 个 sample 立即终止 decoder并返回 `422 long_audio_requires_vad`，不得调用模型、追加/完成成功 segment sink 或留下 partial artifact/reservation，也禁止把前 30 秒作为成功响应。
+- direct path 解码为 0 samples 时按 §6.5 返回成功空结果，模型调用数为 0。
 - VAD path 按实际 PCM sample 数再次执行部署时长上限；超过部署值或 12 小时发布硬上限即停止并返回 `413 audio_too_long`，`ffprobe` 只做前置拒绝。
 - stderr 有界捕获，错误不回传原始命令或宿主路径。
 - 子进程跟随 request/job cancellation。
@@ -708,10 +730,11 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 ### 8.4 Incremental result
 
-- 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相。
+- 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相；canonical line 保存整数 `start_sample`/`end_sample`，公开响应只在 projection 时统一换算为秒。
 - 内存只保留当前 batch 和有界 speaker state。
 - 最终 `text` 由 canonical segment 顺序拼接。
-- 中英文间距规则集中在一个 text join helper。
+- 所有输出格式共用一个 canonical text join helper。每个 segment text 只移除首尾 Unicode whitespace，不执行 NFC/NFKC 或其他正文 normalization；trim 后为空的 segment 跳过。连接相邻非空文本时，若左侧末字符 Unicode category 为 `Ps`/`Pi`、右侧首字符 category 为 `Pe`/`Pf`/`Po`，或任一边界字符属于 Han、Hiragana、Katakana，则不插入字符；其他情况恰好插入一个 U+0020。Hangul 按普通 letter 处理，因此默认插入 U+0020，segment 内已有空格不改写。
+- join golden 至少固定：`你` + `好` = `你好`，`hello` + `world` = `hello world`，`Hello.` + `Next` = `Hello. Next`，`hello` + `,` = `hello,`，`中` + `English` = `中English`，`English` + `中` = `English中`，`(` + `hello` = `(hello`，`hello` + `)` = `hello)`，`안녕` + `하세요` = `안녕 하세요`；outer whitespace 被 trim、empty 被跳过，emoji 作为普通非 CJK 边界默认以 U+0020 分隔。
 - job progress 由已完成的绝对音频位置计算。
 - finalize 顺序扫描 JSONL，依次流式写 escaped canonical text、segments 和顶层 rich arrays并完成 `.complete`；允许为不同顶层数组 rewind 重读，不允许载入完整结果。恢复时用 streaming parser 校验 JSON 完整结束和 manifest fingerprint。
 - succeeded GET 跳过私有 manifest line，写 job envelope prefix，将 canonical body 流式嵌入 `result` 后写 suffix；不得为返回 12 小时结果重新构造完整 dict/string。
@@ -782,7 +805,7 @@ samples[]=voice-2.wav
 - 一致性只比较 sample centroid pair；任一 pair 低于随 policy 发布的 enrollment threshold 时拒绝 `speaker_samples_inconsistent`。这只拦截明显混杂，不宣称证明同一身份。
 - 全部样本成功才创建 profile。
 - 创建完成立即删除原始和解码样本。
-- POST/PUT 复用 §11.3 upload lease、reservation、受控 staging 和启动对账；进程崩溃遗留样本按 receiving cleanup 删除，不建立第二套清理器。
+- POST/PUT 复用 §11.3 generic storage ledger、typed upload lease、reservation、受控 staging 和启动对账；进程崩溃遗留样本按 writing lease cleanup 删除，不建立第二套清理器。
 - PUT 只有新 embedding 完成并在单个 SQLite transaction 替换成功后才切换 profile；任一失败或崩溃保留旧 profile 并清理新样本。
 - 不向客户端返回 embedding。
 
@@ -1004,11 +1027,36 @@ GET /health/ready
 - failed/cancelled job 删除输入和中间文件。
 - 定时清理只处理 SQLite 中已过期 terminal job。
 - 磁盘达到 admission 上限时拒绝新 job，不删除尚未过期的用户结果来腾空间。
-- transcription sync/async 与 speaker enrollment upload 都在首字节前获得同一种 SQLite upload lease；并发数由 `max_active_uploads` 限制。
+- transcription sync/async 与 speaker enrollment upload 都在首字节前获得 SQLite storage lease；并发接收数由 `max_active_uploads` 限制。
 - multipart file 从首块开始直接 spool 到受控文件，内存阈值固定为 8 MiB；不得由框架先聚合完整 body。
 - storage accounting 包含 partial/ready 输入、sync 临时文件、running intermediate、attempt result 和 terminal result。
 - 每个 lease 先预留 8 MiB，后续在写盘前按 8 MiB 增量原子扩展；实际完成时结算，所有拒绝、断连和取消路径释放。
 - admission 同时检查 SQLite 总 reservation 与 `min_filesystem_free_bytes`；多个请求不能以“各自先检查”突破总配额。
+
+所有 upload 和 artifact 使用同一张 generic ledger：
+
+```text
+storage_leases(
+  id,
+  owner_kind,
+  owner_id,
+  resource_kind,
+  lease_type,       # upload | artifact
+  phase,            # writing | sealed
+  controlled_path,
+  reserved_bytes,
+  actual_bytes,
+  content_sha256,
+  created_at
+)
+```
+
+- `owner_kind`、`owner_id` 和 `resource_kind` 是恢复与计费归属，不引入新的 owner service；`resource_kind` 由应用层 typed constructor 校验，不做每增加一种 artifact 都要迁移的封闭数据库枚举。
+- backing ledger 共用不等于暴露万能 handle：writing upload、sealed input、writing artifact writer 和 sealed result artifact ref 使用不同的 typed handles，禁止跨 type/phase 调用 append、complete、resolve 或 release。
+- `max_active_uploads` 只统计 `lease_type=upload AND phase=writing`。`complete_upload` 原子转为 `sealed` 后立即释放上传并发槽，但输入的实际字节 reservation 保留；artifact 不占上传并发槽，但 writing/sealed 都计入总 storage reservation。
+- v1 `upload_leases` 到 generic ledger 的 v2 migration 在单一 SQLite transaction 中显式完成并更新 schema version；遇到未知更高 schema version fail closed，不静默删库或重建。
+- reservation 和 free-space admission 在 begin 和每次扩展写盘前执行。容量上限或 `min_filesystem_free_bytes` floor 拒绝统一使用公开 `storage_capacity_exceeded`、HTTP `429`；实际 filesystem I/O、fsync 或 SQLite 故障保持内部 server error，不伪装为容量 admission。
+- 只有受控文件已经 unlink（或确认不存在）且父目录 `fsync` 后才删除 ledger row 并释放字节 reservation；sealed 只改变可见生命周期，不释放字节。
 
 ## 12. 进程和并发模型
 
@@ -1275,7 +1323,7 @@ speaker-delete
 - `/health/live`、`/health/ready`；
 - OpenAI error envelope；
 - bounded multipart upload；
-- transcription sync/async 与 speaker enrollment 共用的 SQLite upload lease、原子 storage reservation、受控 staging 和 receiving cleanup 最小底座；
+- transcription sync/async 与 speaker enrollment 共用的 SQLite storage lease、原子 storage reservation、受控 staging 和 writing lease cleanup 最小底座；
 - `/v1/models`。
 
 完成条件：
@@ -1287,21 +1335,31 @@ speaker-delete
 
 ### Phase 2：Canonical 音频 pipeline
 
-交付：
+首批交付：
 
-- ffprobe/ffmpeg wrapper；
-- streaming PCM decode；
-- streaming FSMN-VAD；
-- SenseVoice batching；
-- clean text、语言、真实 timestamp；
-- emotion/event 结构化 parser；
-- `json`、`text`、`verbose_json`。
+- single generic storage ledger、typed lease/artifact handles 和带 reservation 的 byte writer；
+- ffprobe/ffmpeg wrapper 与 §8.2 的 9,600-sample streaming PCM decode contract；
+- direct path 的 0/480,000/480,001 sample 边界；
+- 注入 fake structured SenseVoice adapter 的唯一 processor、sample-based canonical JSONL `SegmentSink` 和 opaque artifact ref；
+- 共用 canonical text join helper；
+- 一个 runtime-generated representative WAV ffmpeg direct fixture 的 `json`、`text`、`verbose_json` projection。
 
-完成条件：
+首批完成条件：
+
+- 0 sample 成功空结果且模型零调用，480,001 sample 失败且 model/sink 无成功记录或残留 reservation；
+- decoder block 的 dtype、shape、sample offset、odd-byte/cancellation/ffmpeg failure 行为有边界测试；
+- artifact begin/expand、sealed/release、fault 和启动 orphan cleanup 不突破总 reservation，artifact 不占 `max_active_uploads`；
+- sync API 只装配并调用该 processor，没有第二套 transcriber；
+- JSONL escaping、截断 fail-closed、sample-to-second projection 和 §8.4 join golden 由同一组 helper tests 拥有。
+
+下一批在不改写上述 processor、adapter、SegmentSink 或 artifact 接口的前提下增加 streaming FSMN-VAD、SenseVoice batching、真实模型 smoke、clean text、语言/timestamp 聚合和 emotion/event raw parser。30 秒强切阈值固定；首批只暂缓尚未通过真实 spike 的强切后 padding、continuation 和 cache-reset 细节，不预先冻结 rich control-token 细节。
+
+Phase 2 整体完成条件：
 
 - 短音频和长音频 VAD 复用同一路径；
 - 进程 RSS 不随 decoded duration 线性增长；
-- 控制 token 不泄漏到正文。
+- 控制 token 不泄漏到正文；
+- 真实模型兼容性由 Phase 2 的固定 real-model smoke 唯一拥有，clean/rich 行为由本 Phase 的 parser tests 唯一拥有；后续阶段只引用同一结果，不复制测试套件或另建 gate report。
 
 ### Phase 3：Diarization 和人物注册
 
