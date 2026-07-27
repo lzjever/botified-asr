@@ -25,6 +25,28 @@ _UNKNOWN_LABEL_NAME = re.compile(
 _LITTLE_ENDIAN_FLOAT32 = np.dtype("<f4")
 
 
+def validate_speaker_profile_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("speaker profile ID must be a string")
+    if _SPEAKER_ID.fullmatch(value) is None:
+        raise ValueError("speaker profile ID is invalid")
+    return value
+
+
+def canonicalize_speaker_profile_name(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("speaker profile name must be a string")
+    name = value.strip()
+    if not 1 <= len(name) <= 80:
+        raise ValueError("speaker profile name must contain 1 to 80 characters")
+    if (
+        _ANONYMOUS_LABEL_NAME.fullmatch(name) is not None
+        or _UNKNOWN_LABEL_NAME.fullmatch(name) is not None
+    ):
+        raise ValueError("speaker profile name is reserved")
+    return name
+
+
 @dataclass(frozen=True, slots=True)
 class SpeakerEmbedding:
     dimension: int
@@ -93,21 +115,8 @@ class SpeakerProfile:
     updated_at: datetime
 
     def __post_init__(self) -> None:
-        if not isinstance(self.id, str):
-            raise TypeError("speaker profile ID must be a string")
-        if _SPEAKER_ID.fullmatch(self.id) is None:
-            raise ValueError("speaker profile ID is invalid")
-
-        if not isinstance(self.name, str):
-            raise TypeError("speaker profile name must be a string")
-        name = self.name.strip()
-        if not 1 <= len(name) <= 80:
-            raise ValueError("speaker profile name must contain 1 to 80 characters")
-        if (
-            _ANONYMOUS_LABEL_NAME.fullmatch(name) is not None
-            or _UNKNOWN_LABEL_NAME.fullmatch(name) is not None
-        ):
-            raise ValueError("speaker profile name is reserved")
+        validate_speaker_profile_id(self.id)
+        name = canonicalize_speaker_profile_name(self.name)
 
         description = self.description
         if description is not None and not isinstance(description, str):

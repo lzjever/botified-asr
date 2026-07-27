@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +19,19 @@ from botified_asr.pipeline import (
     iter_canonical_join,
     serialize_canonical_record,
 )
-from botified_asr.speaker_matching import SpeakerLabelMapping
-from botified_asr.speakers import is_anonymous_speaker_label
+from botified_asr.speaker_matching import (
+    KnownSpeakerMatch,
+    SpeakerLabelMapping,
+    SpeakerLabelResolution,
+)
+from botified_asr.speaker_profiles import (
+    canonicalize_speaker_profile_name,
+    validate_speaker_profile_id,
+)
+from botified_asr.speakers import (
+    ANONYMOUS_SPEAKER_LABELS,
+    is_anonymous_speaker_label,
+)
 
 _TOP_LEVEL_KEYS = {
     "annotations",
@@ -51,6 +63,7 @@ class CanonicalSummary:
     labeled_record_count: int
     last_end_sample: int
     first_nonempty_language: str | None
+    visible_speaker_labels: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -130,6 +143,8 @@ class CanonicalJsonlReader:
         labeled_record_count = 0
         last_end_sample = 0
         first_nonempty_language: str | None = None
+        visible_speaker_labels: list[str] = []
+        seen_visible_speaker_labels: set[str] = set()
         saw_nonempty = False
         for record in self.iter_records():
             record_count += 1
@@ -141,12 +156,19 @@ class CanonicalJsonlReader:
                 if not saw_nonempty:
                     saw_nonempty = True
                     first_nonempty_language = record.language
+                if (
+                    record.anonymous_speaker is not None
+                    and record.anonymous_speaker not in seen_visible_speaker_labels
+                ):
+                    seen_visible_speaker_labels.add(record.anonymous_speaker)
+                    visible_speaker_labels.append(record.anonymous_speaker)
         return CanonicalSummary(
             record_count=record_count,
             nonempty_record_count=nonempty_record_count,
             labeled_record_count=labeled_record_count,
             last_end_sample=last_end_sample,
             first_nonempty_language=first_nonempty_language,
+            visible_speaker_labels=tuple(visible_speaker_labels),
         )
 
 
@@ -239,12 +261,10 @@ class ResultProjector:
         *,
         speaker_mapping: SpeakerLabelMapping,
     ) -> Projection:
-        if (
-            type(speaker_mapping) is not SpeakerLabelMapping
-            or type(speaker_mapping.resolutions) is not tuple
-            or speaker_mapping.resolutions != ()
-        ):
-            raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+        speaker_lookup = _validated_speaker_lookup(
+            options,
+            speaker_mapping,
+        )
         summary = reader.scan()
         if (
             type(total_samples) is not int
@@ -265,6 +285,12 @@ class ResultProjector:
             if summary.labeled_record_count != summary.record_count:
                 raise CanonicalArtifactError(
                     "diarized result artifact contains an unlabeled record"
+                )
+            if speaker_lookup is not None and not set(
+                summary.visible_speaker_labels
+            ).issubset(speaker_lookup):
+                raise CanonicalArtifactError(
+                    "result artifact speaker mapping is incomplete"
                 )
         elif summary.labeled_record_count != 0:
             raise CanonicalArtifactError(
@@ -290,6 +316,7 @@ class ResultProjector:
                     reader,
                     rich_fields,
                     total_samples=total_samples,
+                    speaker_lookup=speaker_lookup,
                 ),
             )
         language = (
@@ -306,6 +333,82 @@ class ResultProjector:
                 total_samples=total_samples,
             ),
         )
+
+
+def _validated_speaker_lookup(
+    options: CanonicalOptions,
+    speaker_mapping: object,
+) -> dict[str, SpeakerLabelResolution] | None:
+    if (
+        type(speaker_mapping) is not SpeakerLabelMapping
+        or type(speaker_mapping.resolutions) is not tuple
+    ):
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    resolutions = speaker_mapping.resolutions
+    known_speaker_ids = options.known_speaker_ids
+    if not known_speaker_ids:
+        if resolutions:
+            raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+        return None
+    if options.response_format != "diarized_json" and resolutions:
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    if any(
+        type(resolution) is not SpeakerLabelResolution for resolution in resolutions
+    ):
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    if any(
+        not is_anonymous_speaker_label(resolution.anonymous_speaker)
+        for resolution in resolutions
+    ):
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    if (
+        len(resolutions) > len(ANONYMOUS_SPEAKER_LABELS)
+        or tuple(resolution.anonymous_speaker for resolution in resolutions)
+        != ANONYMOUS_SPEAKER_LABELS[: len(resolutions)]
+    ):
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+
+    names_by_id: dict[str, str] = {}
+    lookup: dict[str, SpeakerLabelResolution] = {}
+    for resolution in resolutions:
+        match = resolution.match
+        if match is not None:
+            _validate_known_speaker_match(
+                match,
+                known_speaker_ids=known_speaker_ids,
+                names_by_id=names_by_id,
+            )
+        lookup[resolution.anonymous_speaker] = resolution
+    return lookup
+
+
+def _validate_known_speaker_match(
+    match: object,
+    *,
+    known_speaker_ids: tuple[str, ...],
+    names_by_id: dict[str, str],
+) -> None:
+    if type(match) is not KnownSpeakerMatch:
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    try:
+        speaker_id = validate_speaker_profile_id(match.speaker_id)
+        speaker_name = canonicalize_speaker_profile_name(match.speaker_name)
+        _json_scalar(match.speaker_name)
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise CanonicalArtifactError(
+            "result artifact speaker mapping is invalid"
+        ) from exc
+    if (
+        speaker_id not in known_speaker_ids
+        or speaker_name != match.speaker_name
+        or type(match.similarity) is not float
+        or not math.isfinite(match.similarity)
+        or not -1.0 <= match.similarity <= 1.0
+    ):
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
+    existing_name = names_by_id.setdefault(speaker_id, speaker_name)
+    if existing_name != speaker_name:
+        raise CanonicalArtifactError("result artifact speaker mapping is invalid")
 
 
 def _rich_fields(
@@ -398,6 +501,7 @@ def _iter_diarized_body(
     rich_fields: tuple[tuple[str, str], ...],
     *,
     total_samples: int,
+    speaker_lookup: dict[str, SpeakerLabelResolution] | None,
 ) -> Iterator[bytes]:
     duration: int | float = 0 if total_samples == 0 else total_samples / SAMPLE_RATE
     yield b'{"task":"transcribe","duration":'
@@ -418,16 +522,40 @@ def _iter_diarized_body(
         if not first:
             yield b","
         first = False
-        yield _json_scalar(
-            {
-                "id": str(record.index),
-                "type": "transcript.text.segment",
-                "start": record.start_sample / SAMPLE_RATE,
-                "end": record.end_sample / SAMPLE_RATE,
-                "speaker": record.anonymous_speaker,
-                "text": text,
-            }
+        resolution = (
+            None
+            if speaker_lookup is None
+            else speaker_lookup.get(record.anonymous_speaker)
         )
+        if speaker_lookup is not None and resolution is None:
+            raise CanonicalArtifactError(
+                "result artifact speaker mapping is incomplete"
+            )
+        match = None if resolution is None else resolution.match
+        speaker = (
+            record.anonymous_speaker
+            if speaker_lookup is None
+            else (
+                f"Unknown {record.anonymous_speaker}"
+                if match is None
+                else match.speaker_name
+            )
+        )
+        segment: dict[str, object] = {
+            "id": str(record.index),
+            "type": "transcript.text.segment",
+            "start": record.start_sample / SAMPLE_RATE,
+            "end": record.end_sample / SAMPLE_RATE,
+            "speaker": speaker,
+            "text": text,
+        }
+        if match is not None:
+            segment["funasr"] = {
+                "speaker_id": match.speaker_id,
+                "anonymous_speaker": record.anonymous_speaker,
+                "similarity": match.similarity,
+            }
+        yield _json_scalar(segment)
     yield b"]"
     if rich_fields:
         yield b',"funasr":'

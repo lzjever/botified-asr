@@ -6,6 +6,7 @@ from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from botified_asr.contracts import CanonicalOptions
@@ -15,12 +16,48 @@ from botified_asr.pipeline import (
     SegmentRecord,
 )
 from botified_asr.speaker_matching import (
+    KnownSpeakerMatch,
     SpeakerLabelMapping,
     SpeakerLabelResolution,
 )
 
 
 EMPTY_SPEAKER_MAPPING = SpeakerLabelMapping(())
+KNOWN_SPEAKER_ID = "4X7K2M9Q"
+UNREQUESTED_SPEAKER_ID = "7N4K2M9Q"
+
+
+class NonExactKnownSpeakerMatch(KnownSpeakerMatch):
+    __slots__ = ()
+
+
+class NonExactSpeakerLabelResolution(SpeakerLabelResolution):
+    __slots__ = ()
+
+
+class NonExactSpeakerLabelMapping(SpeakerLabelMapping):
+    __slots__ = ()
+
+
+def _matched_mapping(
+    *,
+    label: str = "A",
+    speaker_id: str = KNOWN_SPEAKER_ID,
+    speaker_name: str = "Percy",
+    similarity: object = 0.78,
+) -> SpeakerLabelMapping:
+    return SpeakerLabelMapping(
+        (
+            SpeakerLabelResolution(
+                label,
+                KnownSpeakerMatch(
+                    speaker_id,
+                    speaker_name,
+                    similarity,  # type: ignore[arg-type]
+                ),
+            ),
+        )
+    )
 
 
 class SpyStream(io.BytesIO):
@@ -67,6 +104,7 @@ def _options(
     *,
     language: str = "auto",
     include: tuple[str, ...] = (),
+    known_speaker_ids: tuple[str, ...] = (),
 ) -> CanonicalOptions:
     diarized = response_format == "diarized_json"
     return CanonicalOptions(
@@ -75,7 +113,7 @@ def _options(
         response_format=response_format,
         chunking_strategy="auto" if diarized else None,
         include=include,
-        known_speaker_ids=(),
+        known_speaker_ids=known_speaker_ids,
     )
 
 
@@ -516,7 +554,190 @@ def test_result_projector_requires_keyword_only_speaker_mapping(
         )
 
 
-def test_transport_projector_only_accepts_exact_empty_mapping_before_scan(
+@pytest.mark.parametrize(
+    ("known_speaker_ids", "mapping"),
+    (
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            object(),
+            id="outer_object",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            NonExactSpeakerLabelMapping(()),
+            id="outer_subclass",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping([]),  # type: ignore[arg-type]
+            id="resolutions_list",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping((object(),)),  # type: ignore[arg-type]
+            id="resolution_object",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping((NonExactSpeakerLabelResolution("A", None),)),
+            id="resolution_subclass",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution(
+                        np.array([1, 2]),
+                        None,
+                    ),
+                )
+            ),
+            id="anonymous_label_array",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution(
+                        "A",
+                        object(),  # type: ignore[arg-type]
+                    ),
+                )
+            ),
+            id="match_object",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution(
+                        "A",
+                        NonExactKnownSpeakerMatch(
+                            KNOWN_SPEAKER_ID,
+                            "Percy",
+                            0.78,
+                        ),
+                    ),
+                )
+            ),
+            id="match_subclass",
+        ),
+        pytest.param(
+            (),
+            SpeakerLabelMapping((SpeakerLabelResolution("A", None),)),
+            id="anonymous_nonempty",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping((SpeakerLabelResolution("B", None),)),
+            id="label_gap",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution("A", None),
+                    SpeakerLabelResolution("A", None),
+                )
+            ),
+            id="duplicate_label",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(speaker_id=UNREQUESTED_SPEAKER_ID),
+            id="unrequested_id",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution(
+                        "A",
+                        KnownSpeakerMatch(
+                            KNOWN_SPEAKER_ID,
+                            "Percy",
+                            0.78,
+                        ),
+                    ),
+                    SpeakerLabelResolution(
+                        "B",
+                        KnownSpeakerMatch(
+                            KNOWN_SPEAKER_ID,
+                            "Alice",
+                            0.78,
+                        ),
+                    ),
+                )
+            ),
+            id="same_id_different_name",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(speaker_name=" Percy "),
+            id="trimmed_name",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(speaker_name="A"),
+            id="reserved_name",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(similarity=float("nan")),
+            id="similarity_nan",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(similarity=-1.0001),
+            id="similarity_low",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(similarity=1.0001),
+            id="similarity_high",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(similarity=0),
+            id="similarity_int",
+        ),
+        pytest.param(
+            (KNOWN_SPEAKER_ID,),
+            _matched_mapping(similarity=True),
+            id="similarity_bool",
+        ),
+    ),
+)
+def test_prepare_rejects_invalid_known_mapping_before_scan(
+    tmp_path: Path,
+    known_speaker_ids: tuple[str, ...],
+    mapping: object,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalArtifactError,
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    opener = FreshOpener(b"")
+    reader = CanonicalJsonlReader(tmp_path / "empty.jsonl", opener=opener)
+
+    with pytest.raises(CanonicalArtifactError) as caught:
+        ResultProjector().prepare(
+            reader,
+            _options(
+                "diarized_json",
+                known_speaker_ids=known_speaker_ids,
+            ),
+            total_samples=0,
+            speaker_mapping=mapping,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "invalid_result_artifact"
+    assert opener.streams == []
+
+
+def test_prepare_rejects_missing_visible_resolution_after_single_scan(
     tmp_path: Path,
 ) -> None:
     from botified_asr.result_artifact import (
@@ -525,32 +746,31 @@ def test_transport_projector_only_accepts_exact_empty_mapping_before_scan(
         ResultProjector,
     )
 
-    mapping_type = type(
-        "NonExactSpeakerLabelMapping",
-        (SpeakerLabelMapping,),
-        {"__slots__": ()},
-    )
-    invalid_mappings = (
-        SpeakerLabelMapping((SpeakerLabelResolution("A", None),)),
-        mapping_type(()),
-        SpeakerLabelMapping([]),  # type: ignore[arg-type]
-        object(),
-    )
-
-    for mapping in invalid_mappings:
-        opener = FreshOpener(b"")
-        reader = CanonicalJsonlReader(tmp_path / "empty.jsonl", opener=opener)
-
-        with pytest.raises(CanonicalArtifactError) as caught:
-            ResultProjector().prepare(
-                reader,
-                _options("json"),
-                total_samples=0,
-                speaker_mapping=mapping,  # type: ignore[arg-type]
+    opener = FreshOpener(
+        _jsonl(
+            _mapping(
+                text="visible B",
+                anonymous_speaker="B",
             )
+        )
+    )
+    reader = CanonicalJsonlReader(tmp_path / "missing.jsonl", opener=opener)
+    mapping = SpeakerLabelMapping((SpeakerLabelResolution("A", None),))
 
-        assert caught.value.code == "invalid_result_artifact"
-        assert opener.streams == []
+    with pytest.raises(CanonicalArtifactError) as caught:
+        ResultProjector().prepare(
+            reader,
+            _options(
+                "diarized_json",
+                known_speaker_ids=(KNOWN_SPEAKER_ID,),
+            ),
+            total_samples=1,
+            speaker_mapping=mapping,
+        )
+
+    assert caught.value.code == "invalid_result_artifact"
+    assert len(opener.streams) == 1
+    assert len(opener.streams[0].readline_sizes) >= 2
 
 
 def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(
@@ -614,6 +834,187 @@ def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(
     assert all("funasr" not in segment for segment in decoded["segments"])
 
 
+def test_known_diarized_projection_has_exact_match_unknown_and_rich_wire(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    reader = CanonicalJsonlReader(
+        tmp_path / "known.jsonl",
+        opener=FreshOpener(
+            _jsonl(
+                _mapping(
+                    index=0,
+                    start_sample=0,
+                    end_sample=8_000,
+                    text=" 你 ",
+                    language="zh",
+                    emotion="happy",
+                    anonymous_speaker="A",
+                ),
+                _mapping(
+                    index=1,
+                    start_sample=16_000,
+                    end_sample=32_000,
+                    text="hello",
+                    language="en",
+                    audio_event="speech",
+                    anonymous_speaker="B",
+                ),
+            )
+        ),
+    )
+    mapping = SpeakerLabelMapping(
+        (
+            SpeakerLabelResolution(
+                "A",
+                KnownSpeakerMatch(
+                    KNOWN_SPEAKER_ID,
+                    "Percy",
+                    0.78,
+                ),
+            ),
+            SpeakerLabelResolution("B", None),
+        )
+    )
+
+    projection = ResultProjector().prepare(
+        reader,
+        _options(
+            "diarized_json",
+            include=("funasr.emotion", "funasr.audio_events"),
+            known_speaker_ids=(KNOWN_SPEAKER_ID,),
+        ),
+        total_samples=48_000,
+        speaker_mapping=mapping,
+    )
+    _, body = _body(projection)
+
+    assert body == (
+        b'{"task":"transcribe","duration":3.0,"text":"\xe4\xbd\xa0hello",'
+        b'"segments":[{"id":"0","type":"transcript.text.segment",'
+        b'"start":0.0,"end":0.5,"speaker":"Percy","text":"\xe4\xbd\xa0",'
+        b'"funasr":{"speaker_id":"4X7K2M9Q","anonymous_speaker":"A",'
+        b'"similarity":0.78}},{"id":"1","type":"transcript.text.segment",'
+        b'"start":1.0,"end":2.0,"speaker":"Unknown B","text":"hello"}],'
+        b'"funasr":{"emotion":[{"label":"happy","start":0.0,"end":0.5}],'
+        b'"audio_events":[{"label":"speech","start":1.0,"end":2.0}]}}'
+    )
+    decoded = json.loads(body)
+    assert decoded["segments"][0]["funasr"] == {
+        "speaker_id": KNOWN_SPEAKER_ID,
+        "anonymous_speaker": "A",
+        "similarity": 0.78,
+    }
+    assert "funasr" not in decoded["segments"][1]
+    assert all(
+        "embedding" not in segment and "description" not in segment
+        for segment in decoded["segments"]
+    )
+
+
+def test_known_projection_allows_visible_labels_to_be_mapping_subset(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    reader = CanonicalJsonlReader(
+        tmp_path / "visible-subset.jsonl",
+        opener=FreshOpener(
+            _jsonl(
+                _mapping(
+                    index=0,
+                    start_sample=0,
+                    end_sample=8_000,
+                    text="visible B",
+                    anonymous_speaker="B",
+                )
+            )
+        ),
+    )
+    mapping = SpeakerLabelMapping(
+        (
+            SpeakerLabelResolution(
+                "A",
+                KnownSpeakerMatch(
+                    KNOWN_SPEAKER_ID,
+                    "Percy",
+                    1.0,
+                ),
+            ),
+            SpeakerLabelResolution(
+                "B",
+                KnownSpeakerMatch(
+                    KNOWN_SPEAKER_ID,
+                    "Percy",
+                    -1.0,
+                ),
+            ),
+        )
+    )
+
+    projection = ResultProjector().prepare(
+        reader,
+        _options(
+            "diarized_json",
+            known_speaker_ids=(KNOWN_SPEAKER_ID,),
+        ),
+        total_samples=16_000,
+        speaker_mapping=mapping,
+    )
+    _, body = _body(projection)
+
+    assert body == (
+        b'{"task":"transcribe","duration":1.0,"text":"visible B",'
+        b'"segments":[{"id":"0","type":"transcript.text.segment",'
+        b'"start":0.0,"end":0.5,"speaker":"Percy","text":"visible B",'
+        b'"funasr":{"speaker_id":"4X7K2M9Q","anonymous_speaker":"B",'
+        b'"similarity":-1.0}}]}'
+    )
+
+
+def test_known_projection_ignores_whitespace_only_labels_for_mapping_coverage(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    reader = CanonicalJsonlReader(
+        tmp_path / "whitespace-only.jsonl",
+        opener=FreshOpener(
+            _jsonl(
+                _mapping(
+                    start_sample=0,
+                    end_sample=16_000,
+                    text=" \t ",
+                    anonymous_speaker="A",
+                )
+            )
+        ),
+    )
+
+    projection = ResultProjector().prepare(
+        reader,
+        _options(
+            "diarized_json",
+            known_speaker_ids=(KNOWN_SPEAKER_ID,),
+        ),
+        total_samples=16_000,
+        speaker_mapping=EMPTY_SPEAKER_MAPPING,
+    )
+    _, body = _body(projection)
+
+    assert body == (b'{"task":"transcribe","duration":1.0,"text":"","segments":[]}')
+
+
 def test_empty_projection_language_duration_and_requested_rich_shape(
     tmp_path: Path,
 ) -> None:
@@ -670,6 +1071,18 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
     assert (
         diarized_empty == b'{"task":"transcribe","duration":0,"text":"","segments":[]}'
     )
+    _, known_diarized_empty = _body(
+        projector.prepare(
+            reader,
+            _options(
+                "diarized_json",
+                known_speaker_ids=(KNOWN_SPEAKER_ID,),
+            ),
+            total_samples=0,
+            speaker_mapping=EMPTY_SPEAKER_MAPPING,
+        )
+    )
+    assert known_diarized_empty == diarized_empty
     _, verbose_explicit = _body(
         projector.prepare(
             reader,
