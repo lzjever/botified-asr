@@ -187,6 +187,13 @@ def test_job_result_writer_commits_exact_success_state(
         )
 
         result_ref = seal_result(storage, running)
+        result_payload = result_ref.path.read_bytes()
+        result_lease = tuple(
+            storage._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (result_ref.id,),
+            ).fetchone()
+        )
 
         assert (
             storage.commit_job_success(
@@ -203,14 +210,22 @@ def test_job_result_writer_commits_exact_success_state(
         assert succeeded.attempt_token is None
         assert succeeded.owner_generation is None
         assert succeeded.result_lease_id == result_ref.id
-        assert succeeded.input_lease_id == running.input_lease_id
-        assert succeeded.input_cleanup_pending
+        assert succeeded.input_lease_id is None
+        assert not succeeded.input_cleanup_pending
         assert succeeded.finished_at == FINISHED_AT
         assert storage.resolve_artifact(result_ref).is_file()
-        assert (storage.staging_dir / f"{running.id}.ready").is_file()
-        assert storage.total_reserved_bytes() == (
-            running.input_size_bytes + result_ref.actual_bytes
+        assert result_ref.path.read_bytes() == result_payload
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (result_ref.id,),
+                ).fetchone()
+            )
+            == result_lease
         )
+        assert not (storage.staging_dir / f"{running.id}.ready").exists()
+        assert storage.total_reserved_bytes() == result_ref.actual_bytes
         assert (
             storage.commit_job_success(
                 running.id,
@@ -220,6 +235,160 @@ def test_job_result_writer_commits_exact_success_state(
             is jobs.JobSuccessOutcome.COMMITTED
         )
         assert storage.resolve_artifact(result_ref).is_file()
+        assert result_ref.path.read_bytes() == result_payload
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (result_ref.id,),
+                ).fetchone()
+            )
+            == result_lease
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("fault_stage", ("unlink", "fsync", "database"))
+def test_success_commit_retries_failed_input_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        running = queue_and_claim(storage)
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        result_payload = result_ref.path.read_bytes()
+        input_path = storage.staging_dir / f"{running.id}.ready"
+        input_lease = tuple(
+            storage._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (running.id,),
+            ).fetchone()
+        )
+        result_lease = tuple(
+            storage._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (result_ref.id,),
+            ).fetchone()
+        )
+        reservation = storage.total_reserved_bytes()
+        assert running.attempt_token is not None
+
+        if fault_stage == "database":
+            storage._connection.execute(
+                f"""
+                CREATE TRIGGER reject_succeeded_input_clear
+                BEFORE UPDATE OF input_lease_id ON transcription_jobs
+                WHEN OLD.id = '{running.id}'
+                  AND NEW.input_lease_id IS NULL
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'injected input cleanup database failure'
+                    );
+                END
+                """
+            )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="injected input cleanup database failure",
+            ):
+                storage.commit_job_success(
+                    running.id,
+                    running.attempt_token,
+                    result_ref,
+                )
+            storage._connection.execute(
+                "DROP TRIGGER reject_succeeded_input_clear"
+            )
+        else:
+            original_unlink = Path.unlink
+            original_fsync = storage_module._fsync_directory
+
+            def fail_input_unlink(path: Path) -> None:
+                if path == input_path:
+                    raise OSError("injected input cleanup unlink failure")
+                original_unlink(path)
+
+            def fail_staging_fsync(directory: Path) -> None:
+                if directory == storage.staging_dir:
+                    raise OSError("injected input cleanup fsync failure")
+                original_fsync(directory)
+
+            with monkeypatch.context() as fault:
+                if fault_stage == "unlink":
+                    fault.setattr(Path, "unlink", fail_input_unlink)
+                else:
+                    fault.setattr(
+                        storage_module,
+                        "_fsync_directory",
+                        fail_staging_fsync,
+                    )
+                with pytest.raises(
+                    OSError,
+                    match=f"injected input cleanup {fault_stage} failure",
+                ):
+                    storage.commit_job_success(
+                        running.id,
+                        running.attempt_token,
+                        result_ref,
+                    )
+
+        succeeded = storage.get_visible_job(running.id)
+        assert succeeded is not None
+        assert succeeded.status is jobs.JobStatus.SUCCEEDED
+        assert succeeded.input_lease_id == running.id
+        assert succeeded.input_cleanup_pending
+        assert input_path.exists() == (fault_stage == "unlink")
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (running.id,),
+                ).fetchone()
+            )
+            == input_lease
+        )
+        assert storage.total_reserved_bytes() == reservation
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (result_ref.id,),
+                ).fetchone()
+            )
+            == result_lease
+        )
+        assert result_ref.path.read_bytes() == result_payload
+
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        cleaned = storage.get_visible_job(running.id)
+        assert cleaned is not None
+        assert cleaned.input_lease_id is None
+        assert not cleaned.input_cleanup_pending
+        assert not input_path.exists()
+        assert storage.total_reserved_bytes() == result_ref.actual_bytes
+        assert result_ref.path.read_bytes() == result_payload
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (result_ref.id,),
+                ).fetchone()
+            )
+            == result_lease
+        )
     finally:
         storage.close()
 

@@ -2127,8 +2127,14 @@ class Storage:
                 """,
                 (job_id,),
             ).fetchone()
-            if self._job_result_is_committed(row, job_id, result_ref):
-                return JobSuccessOutcome.COMMITTED
+            already_committed = self._job_result_is_committed(
+                row,
+                job_id,
+                result_ref,
+            )
+        if already_committed:
+            self._cleanup_succeeded_job_input(job_id)
+            return JobSuccessOutcome.COMMITTED
         if (
             row is None
             or row["phase"] != "visible"
@@ -2160,6 +2166,9 @@ class Storage:
             content_sha256=result_ref.content_sha256,
         )
 
+        committed = False
+        cancelled = False
+        bound = False
         with self._transaction():
             changed = self._connection.execute(
                 f"""
@@ -2194,38 +2203,176 @@ class Storage:
                 ),
             ).rowcount
             if changed == 1:
-                return JobSuccessOutcome.COMMITTED
-            current = self._connection.execute(
-                """
-                SELECT status, attempt_token, cancel_requested,
-                       result_lease_id
-                FROM transcription_jobs
-                WHERE id = ? AND phase = 'visible'
-                """,
-                (job_id,),
-            ).fetchone()
-            if self._job_result_is_committed(
-                current,
-                job_id,
-                result_ref,
-            ):
-                return JobSuccessOutcome.COMMITTED
-            cancelled = (
-                current is not None
-                and current["status"] == "running"
-                and current["attempt_token"] == attempt_token
-                and current["cancel_requested"] == 1
-            )
-            bound = (
-                current is not None
-                and current["status"] == "succeeded"
-                and current["result_lease_id"] == result_ref.id
-            )
+                committed = True
+            else:
+                current = self._connection.execute(
+                    """
+                    SELECT status, attempt_token, cancel_requested,
+                           result_lease_id
+                    FROM transcription_jobs
+                    WHERE id = ? AND phase = 'visible'
+                    """,
+                    (job_id,),
+                ).fetchone()
+                committed = self._job_result_is_committed(
+                    current,
+                    job_id,
+                    result_ref,
+                )
+                if not committed:
+                    cancelled = (
+                        current is not None
+                        and current["status"] == "running"
+                        and current["attempt_token"] == attempt_token
+                        and current["cancel_requested"] == 1
+                    )
+                    bound = (
+                        current is not None
+                        and current["status"] == "succeeded"
+                        and current["result_lease_id"] == result_ref.id
+                    )
+        if committed:
+            self._cleanup_succeeded_job_input(job_id)
+            return JobSuccessOutcome.COMMITTED
         if not bound:
             self.release_artifact(result_ref)
         if cancelled:
             return JobSuccessOutcome.CANCEL_REQUESTED
         return JobSuccessOutcome.STALE
+
+    def _cleanup_succeeded_job_input(self, job_id: str) -> None:
+        input_path = self.staging_dir / f"{job_id}.ready"
+        with self._transaction():
+            job_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if (
+                job_row is not None
+                and job_row["phase"] == "visible"
+                and job_row["status"] == "succeeded"
+                and job_row["input_lease_id"] is None
+                and job_row["input_cleanup_pending"] == 0
+            ):
+                return
+            lease_row = self._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                job_row is None
+                or job_row["phase"] != "visible"
+                or job_row["status"] != "succeeded"
+                or job_row["input_lease_id"] != job_id
+                or job_row["input_cleanup_pending"] != 1
+                or lease_row is None
+                or lease_row["id"] != job_id
+                or lease_row["lease_type"] != "upload"
+                or lease_row["resource_kind"] != "transcription"
+                or lease_row["owner_kind"] != "job"
+                or lease_row["owner_id"] != job_id
+                or lease_row["phase"] != "sealed"
+                or lease_row["controlled_path"] != str(input_path)
+                or lease_row["reserved_bytes"]
+                != lease_row["actual_bytes"]
+                or lease_row["actual_bytes"]
+                != job_row["input_size_bytes"]
+            ):
+                raise StorageSchemaError(
+                    "succeeded job input cleanup state is corrupt"
+                )
+            if not _is_absent_or_regular_file_with_size(
+                input_path,
+                lease_row["actual_bytes"],
+            ):
+                raise StorageSchemaError(
+                    "succeeded job input file is corrupt"
+                )
+
+        self._unlink_if_present(input_path)
+        _fsync_directory(self.staging_dir)
+
+        with self._transaction():
+            current_job = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if (
+                current_job is not None
+                and current_job["phase"] == "visible"
+                and current_job["status"] == "succeeded"
+                and current_job["input_lease_id"] is None
+                and current_job["input_cleanup_pending"] == 0
+            ):
+                return
+            current_lease = self._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                current_job is None
+                or tuple(current_job) != tuple(job_row)
+                or current_lease is None
+                or tuple(current_lease) != tuple(lease_row)
+            ):
+                raise RuntimeError(
+                    "succeeded job input cleanup state changed"
+                )
+            lease_deleted = self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE id = ? AND lease_type = 'upload'
+                  AND resource_kind = 'transcription'
+                  AND owner_kind = 'job' AND owner_id = ?
+                  AND phase = 'sealed' AND controlled_path = ?
+                  AND reserved_bytes = ? AND actual_bytes = ?
+                  AND content_sha256 IS ?
+                  AND created_at = ?
+                """,
+                (
+                    job_id,
+                    job_id,
+                    str(input_path),
+                    lease_row["reserved_bytes"],
+                    lease_row["actual_bytes"],
+                    lease_row["content_sha256"],
+                    lease_row["created_at"],
+                ),
+            ).rowcount
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET
+                    input_lease_id = NULL,
+                    input_cleanup_pending = 0
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'succeeded'
+                  AND input_lease_id = ?
+                  AND input_cleanup_pending = 1
+                """,
+                (job_id, job_id),
+            ).rowcount
+            if lease_deleted != 1 or changed != 1:
+                raise RuntimeError(
+                    "succeeded job changed during input cleanup"
+                )
+            cleaned_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if cleaned_row is None:
+                raise StorageSchemaError(
+                    "succeeded job disappeared during input cleanup"
+                )
+            _decode_transcription_job(cleaned_row)
 
     def _job_result_is_committed(
         self,
