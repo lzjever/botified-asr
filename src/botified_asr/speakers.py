@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from numbers import Real
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -27,6 +28,14 @@ class SpeakerEmbeddingWindow:
     start_sample: int
     end_sample: int
     embedding: np.ndarray
+
+
+@runtime_checkable
+class SpeakerEmbeddingAdapter(Protocol):
+    def embed_windows(
+        self,
+        pcm: np.ndarray,
+    ) -> tuple[SpeakerEmbeddingWindow, ...]: ...
 
 
 @dataclass(frozen=True)

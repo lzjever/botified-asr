@@ -22,7 +22,12 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError, PipelineNotReady
-from botified_asr.speakers import is_anonymous_speaker_label
+from botified_asr.speakers import (
+    AnonymousSpeakerPolicy,
+    AnonymousSpeakerState,
+    SpeakerEmbeddingAdapter,
+    is_anonymous_speaker_label,
+)
 
 DIRECT_MAX_SAMPLES = 480_000
 ASR_BATCH_MAX_SEGMENTS = 32
@@ -757,10 +762,18 @@ class Processor:
         adapter: AsrAdapter,
         *,
         vad_adapter: StreamingVadAdapter | None = None,
+        speaker_adapter: SpeakerEmbeddingAdapter | None = None,
+        speaker_policy: AnonymousSpeakerPolicy | None = None,
     ) -> None:
+        if (speaker_adapter is None) != (speaker_policy is None):
+            raise ValueError(
+                "speaker adapter and speaker policy must be configured together"
+            )
         self._frontend = frontend
         self._adapter = adapter
         self._vad_adapter = vad_adapter
+        self._speaker_adapter = speaker_adapter
+        self._speaker_policy = speaker_policy
 
     def process(
         self,
@@ -782,17 +795,26 @@ class Processor:
             blocks.close()
 
         try:
-            if canonical_options.model == "sensevoice-diarize":
-                raise PipelineNotReady()
             is_direct = (
                 canonical_options.model == "sensevoice"
                 and canonical_options.chunking_strategy is None
             )
             is_vad = (
-                canonical_options.model == "sensevoice"
+                canonical_options.model in {"sensevoice", "sensevoice-diarize"}
                 and canonical_options.chunking_strategy == "auto"
             )
-            if is_vad and self._vad_adapter is None:
+            is_diarize = (
+                canonical_options.model == "sensevoice-diarize"
+                and canonical_options.chunking_strategy == "auto"
+            )
+            if is_diarize and (
+                canonical_options.known_speaker_ids
+                or self._vad_adapter is None
+                or self._speaker_adapter is None
+                or self._speaker_policy is None
+            ):
+                raise PipelineNotReady()
+            if is_vad and not is_diarize and self._vad_adapter is None:
                 raise PipelineNotReady()
             if not (is_direct or is_vad):
                 raise PipelineError(
@@ -807,6 +829,12 @@ class Processor:
                 vad_adapter = self._vad_adapter
                 if vad_adapter is None:
                     raise PipelineNotReady()
+                speaker_adapter = self._speaker_adapter if is_diarize else None
+                speaker_state = (
+                    AnonymousSpeakerState(self._speaker_policy)
+                    if is_diarize and self._speaker_policy is not None
+                    else None
+                )
                 self._process_vad(
                     blocks,
                     cancellation,
@@ -814,6 +842,8 @@ class Processor:
                     segment_sink,
                     vad_adapter=vad_adapter,
                     language=canonical_options.language,
+                    speaker_adapter=speaker_adapter,
+                    speaker_state=speaker_state,
                 )
             else:
                 self._process_direct(
@@ -843,6 +873,8 @@ class Processor:
         *,
         vad_adapter: StreamingVadAdapter,
         language: str,
+        speaker_adapter: SpeakerEmbeddingAdapter | None = None,
+        speaker_state: AnonymousSpeakerState | None = None,
     ) -> None:
         segmenter = StreamingSpeechSegmenter(vad_adapter)
         pending: list[BufferedSpeechSegment] = []
@@ -875,7 +907,39 @@ class Processor:
                     "invalid_model_output",
                     "ASR model returned an invalid batch result",
                 )
-            for segment, result in zip(segments, batch_result, strict=True):
+            anonymous_speakers: list[str | None] = []
+            for segment in segments:
+                if speaker_adapter is None or speaker_state is None:
+                    anonymous_speakers.append(None)
+                    continue
+                check_cancellation()
+                canonical_start = segment.span.start_sample - segment.pcm_start_sample
+                canonical_end = segment.span.end_sample - segment.pcm_start_sample
+                canonical_pcm = np.ascontiguousarray(
+                    segment.pcm[canonical_start:canonical_end],
+                    dtype=np.int16,
+                )
+                if (
+                    canonical_pcm.ndim != 1
+                    or not canonical_pcm.flags.c_contiguous
+                    or len(canonical_pcm)
+                    != segment.span.end_sample - segment.span.start_sample
+                    or not len(canonical_pcm)
+                ):
+                    raise PipelineError(
+                        "invalid_model_output",
+                        "Speech segmenter returned an invalid segment",
+                    )
+                windows = speaker_adapter.embed_windows(canonical_pcm)
+                check_cancellation()
+                anonymous_speakers.append(speaker_state.assign_segment(windows))
+
+            for segment, result, anonymous_speaker in zip(
+                segments,
+                batch_result,
+                anonymous_speakers,
+                strict=True,
+            ):
                 if result.text == "":
                     continue
                 segment_sink.append(
@@ -886,6 +950,7 @@ class Processor:
                         text=result.text,
                         language=result.language,
                         annotations=result.annotations,
+                        anonymous_speaker=anonymous_speaker,
                     )
                 )
                 next_record_index += 1
