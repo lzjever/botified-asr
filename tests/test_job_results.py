@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import io
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,7 +20,7 @@ from botified_asr.result_artifact import (
     finalize_result_envelope,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
-from botified_asr.storage import Storage
+from botified_asr.storage import Storage, StorageSchemaError
 
 
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
@@ -122,6 +124,50 @@ def seal_result(
     )
 
 
+def recovery_snapshot(data_dir: Path) -> tuple[object, ...]:
+    connection = sqlite3.connect(data_dir / "botified-asr.sqlite3")
+    try:
+        database = tuple(
+            tuple(
+                connection.execute(
+                    f"SELECT * FROM {table} ORDER BY 1"
+                ).fetchall()
+            )
+            for table in (
+                "transcription_jobs",
+                "storage_leases",
+                "shutdown_marker",
+            )
+        )
+    finally:
+        connection.close()
+    files = []
+    for directory_name in ("staging", "artifacts"):
+        directory = data_dir / directory_name
+        for path in sorted(directory.iterdir()):
+            kind = "file" if path.is_file() else "directory"
+            files.append(
+                (
+                    f"{directory_name}/{path.name}",
+                    kind,
+                    path.read_bytes() if kind == "file" else None,
+                )
+            )
+    return (*database, tuple(files))
+
+
+def finish_progress(storage: Storage, running: jobs.DurableJob) -> None:
+    assert running.attempt_token is not None
+    assert (
+        storage.update_job_progress(
+            running.id,
+            running.attempt_token,
+            running.total_samples,
+        )
+        is jobs.JobProgressOutcome.UPDATED
+    )
+
+
 def test_job_result_writer_commits_exact_success_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -165,6 +211,354 @@ def test_job_result_writer_commits_exact_success_state(
         assert storage.total_reserved_bytes() == (
             running.input_size_bytes + result_ref.actual_bytes
         )
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        assert storage.resolve_artifact(result_ref).is_file()
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    "restart_state",
+    ("running-after-crash", "running-at-shutdown", "committed"),
+)
+def test_startup_recovers_or_retains_valid_job_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restart_state: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    running = queue_and_claim(storage)
+    finish_progress(storage, running)
+    result_ref = seal_result(storage, running)
+    if restart_state == "committed":
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+    elif restart_state == "running-at-shutdown":
+        storage.write_shutdown_marker("generation-1", FINISHED_AT)
+    storage.close()
+
+    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        succeeded = reopened.get_visible_job(running.id)
+        assert succeeded is not None
+        assert succeeded.status is jobs.JobStatus.SUCCEEDED
+        assert succeeded.processed_samples == succeeded.total_samples
+        assert succeeded.attempt_token is None
+        assert succeeded.owner_generation is None
+        assert succeeded.crash_recoveries == running.crash_recoveries
+        assert succeeded.result_lease_id == result_ref.id
+        assert succeeded.input_lease_id is None
+        assert not succeeded.input_cleanup_pending
+        assert succeeded.finished_at == FINISHED_AT
+        assert reopened.resolve_artifact(result_ref).is_file()
+        assert reopened.total_reserved_bytes() == result_ref.actual_bytes
+    finally:
+        reopened.close()
+
+    clean_restart = Storage(
+        tmp_path,
+        limits(),
+        free_bytes=lambda _: 1 << 40,
+    )
+    try:
+        assert (
+            clean_restart.get_visible_job(running.id).result_lease_id
+            == result_ref.id
+        )
+        assert clean_restart.resolve_artifact(result_ref).is_file()
+    finally:
+        clean_restart.close()
+
+
+def test_startup_cancel_wins_over_valid_job_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    running = queue_and_claim(storage)
+    finish_progress(storage, running)
+    result_ref = seal_result(storage, running)
+    storage._connection.execute(
+        """
+        UPDATE transcription_jobs SET cancel_requested = 1 WHERE id = ?
+        """,
+        (running.id,),
+    )
+    result_ref.path.write_bytes(b"truncated")
+    storage.close()
+
+    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        cancelled = reopened.get_visible_job(running.id)
+        assert cancelled is not None
+        assert cancelled.status is jobs.JobStatus.CANCELLED
+        assert cancelled.result_lease_id is None
+        assert cancelled.input_lease_id is None
+        assert not result_ref.path.exists()
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "artifact_state",
+    ("writing", "renamed-writing", "invalid-sealed", "orphan"),
+)
+def test_startup_cleans_uncommitted_result_then_recovers_running_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_state: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    running = queue_and_claim(storage)
+    artifact_paths: tuple[Path, ...]
+    if artifact_state in {"writing", "renamed-writing"}:
+        assert running.attempt_token is not None
+        writer = storage.begin_job_result_artifact(
+            running.id,
+            running.attempt_token,
+        )
+        storage.append_artifact(writer, b"partial")
+        partial_path = writer.path
+        complete_path = partial_path.with_suffix(".complete")
+        artifact_paths = (partial_path, complete_path)
+        storage.close()
+        if artifact_state == "renamed-writing":
+            partial_path.replace(complete_path)
+    elif artifact_state == "invalid-sealed":
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        invalid = b"not-an-envelope"
+        result_ref.path.write_bytes(invalid)
+        storage._connection.execute(
+            """
+            UPDATE storage_leases SET
+                reserved_bytes = ?, actual_bytes = ?, content_sha256 = ?
+            WHERE id = ?
+            """,
+            (
+                len(invalid),
+                len(invalid),
+                hashlib.sha256(invalid).hexdigest(),
+                result_ref.id,
+            ),
+        )
+        artifact_paths = (result_ref.path,)
+        storage.close()
+    else:
+        orphan_path = storage.artifact_dir / f"{'e' * 32}.complete"
+        orphan_path.write_bytes(b"orphan")
+        artifact_paths = (orphan_path,)
+        storage.close()
+
+    reopened = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        recovered = reopened.get_visible_job(running.id)
+        assert recovered is not None
+        assert recovered.status is jobs.JobStatus.QUEUED
+        assert recovered.crash_recoveries == 1
+        assert recovered.result_lease_id is None
+        assert all(not path.exists() for path in artifact_paths)
+        assert (
+            reopened._connection.execute(
+                """
+                SELECT COUNT(*) FROM storage_leases
+                WHERE lease_type = 'artifact' AND owner_kind = 'job'
+                """
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "owner",
+        "path",
+        "size",
+        "hash",
+        "file-type",
+        "duplicate",
+        "bound-ref",
+        "envelope",
+    ),
+)
+def test_startup_job_result_corruption_fails_closed_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    running = queue_and_claim(storage)
+    finish_progress(storage, running)
+    result_ref = seal_result(storage, running)
+    if corruption in {"bound-ref", "envelope"}:
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        if corruption == "bound-ref":
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET result_lease_id = ? WHERE id = ?
+                """,
+                ("b" * 32, running.id),
+            )
+        else:
+            invalid = b"not-an-envelope"
+            result_ref.path.write_bytes(invalid)
+            storage._connection.execute(
+                """
+                UPDATE storage_leases SET
+                    reserved_bytes = ?, actual_bytes = ?,
+                    content_sha256 = ?
+                WHERE id = ?
+                """,
+                (
+                    len(invalid),
+                    len(invalid),
+                    hashlib.sha256(invalid).hexdigest(),
+                    result_ref.id,
+                ),
+            )
+    elif corruption == "owner":
+        storage._connection.execute(
+            "UPDATE storage_leases SET owner_id = ? WHERE id = ?",
+            ("ABCDEFGH", result_ref.id),
+        )
+    elif corruption == "path":
+        storage._connection.execute(
+            "UPDATE storage_leases SET controlled_path = ? WHERE id = ?",
+            (
+                str(
+                    storage.artifact_dir
+                    / f"{result_ref.id}.partial"
+                ),
+                result_ref.id,
+            ),
+        )
+    elif corruption == "size":
+        storage._connection.execute(
+            """
+            UPDATE storage_leases SET
+                reserved_bytes = reserved_bytes + 1,
+                actual_bytes = actual_bytes + 1
+            WHERE id = ?
+            """,
+            (result_ref.id,),
+        )
+    elif corruption == "hash":
+        storage._connection.execute(
+            """
+            UPDATE storage_leases SET content_sha256 = ? WHERE id = ?
+            """,
+            ("f" * 64, result_ref.id),
+        )
+    elif corruption == "file-type":
+        result_ref.path.unlink()
+        result_ref.path.mkdir()
+    else:
+        duplicate_id = "b" * 32
+        duplicate_path = (
+            storage.artifact_dir / f"{duplicate_id}.complete"
+        )
+        duplicate_path.write_bytes(result_ref.path.read_bytes())
+        storage._connection.execute(
+            """
+            INSERT INTO storage_leases(
+                id, lease_type, resource_kind, owner_kind, owner_id,
+                phase, controlled_path, reserved_bytes, actual_bytes,
+                content_sha256
+            ) VALUES (?, 'artifact', 'result_complete', 'job', ?,
+                      'sealed', ?, ?, ?, ?)
+            """,
+            (
+                duplicate_id,
+                running.id,
+                str(duplicate_path),
+                result_ref.actual_bytes,
+                result_ref.actual_bytes,
+                result_ref.content_sha256,
+            ),
+        )
+    storage.close()
+    before = recovery_snapshot(tmp_path)
+
+    with pytest.raises(StorageSchemaError):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    assert recovery_snapshot(tmp_path) == before
+
+
+def test_success_commit_rechecks_exact_result_lease_in_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        running = queue_and_claim(storage)
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        original_validate = storage_module.ResultEnvelopeReader.validate
+
+        def validate_then_remove(
+            reader: storage_module.ResultEnvelopeReader,
+        ) -> object:
+            manifest = original_validate(reader)
+            storage.release_artifact(result_ref)
+            return manifest
+
+        monkeypatch.setattr(
+            storage_module.ResultEnvelopeReader,
+            "validate",
+            validate_then_remove,
+        )
+
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.STALE
+        )
+        current = storage.get_visible_job(running.id)
+        assert current is not None
+        assert current.status is jobs.JobStatus.RUNNING
+        assert current.result_lease_id is None
     finally:
         storage.close()
 

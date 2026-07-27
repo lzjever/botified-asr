@@ -26,7 +26,11 @@ from botified_asr.jobs import (
     generate_job_id,
     validate_job_id,
 )
-from botified_asr.result_artifact import ResultEnvelopeReader
+from botified_asr.result_artifact import (
+    CanonicalArtifactError,
+    ResultEnvelopeManifest,
+    ResultEnvelopeReader,
+)
 from botified_asr.speaker_profiles import (
     KEEP_EXISTING,
     SpeakerEmbedding,
@@ -61,6 +65,14 @@ _TRANSCRIPTION_JOB_COLUMNS = """
     processor_fingerprint, attempt_no, attempt_token, owner_generation,
     crash_recoveries, cancel_requested, result_lease_id, error_code,
     input_cleanup_pending, created_at, started_at, finished_at
+"""
+_EXACT_SEALED_JOB_RESULT_WHERE = """
+    id = ? AND lease_type = 'artifact'
+    AND resource_kind = 'result_complete'
+    AND owner_kind = 'job' AND owner_id = ?
+    AND phase = 'sealed' AND controlled_path = ?
+    AND reserved_bytes = ? AND actual_bytes = ?
+    AND content_sha256 = ?
 """
 _V4_TRANSCRIPTION_JOBS_DDL = """CREATE TABLE transcription_jobs (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -2115,13 +2127,20 @@ class Storage:
                 """,
                 (job_id,),
             ).fetchone()
+            if self._job_result_is_committed(row, job_id, result_ref):
+                return JobSuccessOutcome.COMMITTED
         if (
             row is None
             or row["phase"] != "visible"
             or row["status"] != "running"
             or row["attempt_token"] != attempt_token
         ):
-            self.release_artifact(result_ref)
+            if not (
+                row is not None
+                and row["status"] == "succeeded"
+                and row["result_lease_id"] == result_ref.id
+            ):
+                self.release_artifact(result_ref)
             return JobSuccessOutcome.STALE
         if row["cancel_requested"] == 1:
             self.release_artifact(result_ref)
@@ -2134,10 +2153,126 @@ class Storage:
             return JobSuccessOutcome.STALE
 
         job = _decode_transcription_job(row)
+        manifest = self._validate_job_result(
+            job,
+            path=self.resolve_artifact(result_ref),
+            actual_bytes=result_ref.actual_bytes,
+            content_sha256=result_ref.content_sha256,
+        )
+
+        with self._transaction():
+            changed = self._connection.execute(
+                f"""
+                UPDATE transcription_jobs SET
+                    status = 'succeeded',
+                    attempt_token = NULL,
+                    owner_generation = NULL,
+                    result_lease_id = ?,
+                    input_cleanup_pending = 1,
+                    finished_at = ?
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'running' AND attempt_token = ?
+                  AND cancel_requested = 0
+                  AND processed_samples = total_samples
+                  AND result_lease_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM storage_leases
+                      WHERE {_EXACT_SEALED_JOB_RESULT_WHERE}
+                  )
+                """,
+                (
+                    result_ref.id,
+                    _encode_job_timestamp(manifest.finished_at),
+                    job_id,
+                    attempt_token,
+                    result_ref.id,
+                    job_id,
+                    str(result_ref.path),
+                    result_ref.actual_bytes,
+                    result_ref.actual_bytes,
+                    result_ref.content_sha256,
+                ),
+            ).rowcount
+            if changed == 1:
+                return JobSuccessOutcome.COMMITTED
+            current = self._connection.execute(
+                """
+                SELECT status, attempt_token, cancel_requested,
+                       result_lease_id
+                FROM transcription_jobs
+                WHERE id = ? AND phase = 'visible'
+                """,
+                (job_id,),
+            ).fetchone()
+            if self._job_result_is_committed(
+                current,
+                job_id,
+                result_ref,
+            ):
+                return JobSuccessOutcome.COMMITTED
+            cancelled = (
+                current is not None
+                and current["status"] == "running"
+                and current["attempt_token"] == attempt_token
+                and current["cancel_requested"] == 1
+            )
+            bound = (
+                current is not None
+                and current["status"] == "succeeded"
+                and current["result_lease_id"] == result_ref.id
+            )
+        if not bound:
+            self.release_artifact(result_ref)
+        if cancelled:
+            return JobSuccessOutcome.CANCEL_REQUESTED
+        return JobSuccessOutcome.STALE
+
+    def _job_result_is_committed(
+        self,
+        row: sqlite3.Row | None,
+        job_id: str,
+        result_ref: ArtifactRef,
+    ) -> bool:
+        if (
+            row is None
+            or row["status"] != "succeeded"
+            or row["result_lease_id"] != result_ref.id
+        ):
+            return False
+        return (
+            self._connection.execute(
+                f"""
+                SELECT 1 FROM storage_leases
+                WHERE {_EXACT_SEALED_JOB_RESULT_WHERE}
+                """,
+                (
+                    result_ref.id,
+                    job_id,
+                    str(result_ref.path),
+                    result_ref.actual_bytes,
+                    result_ref.actual_bytes,
+                    result_ref.content_sha256,
+                ),
+            ).fetchone()
+            is not None
+        )
+
+    def _validate_job_result(
+        self,
+        job: DurableJob,
+        *,
+        path: Path,
+        actual_bytes: int,
+        content_sha256: str,
+    ) -> ResultEnvelopeManifest:
+        if not _is_regular_file_with_size(path, actual_bytes):
+            raise CanonicalArtifactError(
+                "result envelope size does not match storage"
+            )
         manifest = ResultEnvelopeReader(
-            self.resolve_artifact(result_ref),
-            expected_size_bytes=result_ref.actual_bytes,
-            expected_sha256=result_ref.content_sha256,
+            path,
+            expected_size_bytes=actual_bytes,
+            expected_sha256=content_sha256,
             expected_job_id=job.id,
             expected_attempt_no=job.attempt_no,
             expected_request_fingerprint=job.request_fingerprint,
@@ -2152,50 +2287,7 @@ class Storage:
             raise ValueError(
                 "job result finished before its attempt started"
             )
-
-        with self._transaction():
-            changed = self._connection.execute(
-                """
-                UPDATE transcription_jobs SET
-                    status = 'succeeded',
-                    attempt_token = NULL,
-                    owner_generation = NULL,
-                    result_lease_id = ?,
-                    input_cleanup_pending = 1,
-                    finished_at = ?
-                WHERE id = ? AND phase = 'visible'
-                  AND status = 'running' AND attempt_token = ?
-                  AND cancel_requested = 0
-                  AND processed_samples = total_samples
-                  AND result_lease_id IS NULL
-                """,
-                (
-                    result_ref.id,
-                    _encode_job_timestamp(manifest.finished_at),
-                    job_id,
-                    attempt_token,
-                ),
-            ).rowcount
-            if changed == 1:
-                return JobSuccessOutcome.COMMITTED
-            current = self._connection.execute(
-                """
-                SELECT status, attempt_token, cancel_requested
-                FROM transcription_jobs
-                WHERE id = ? AND phase = 'visible'
-                """,
-                (job_id,),
-            ).fetchone()
-            cancelled = (
-                current is not None
-                and current["status"] == "running"
-                and current["attempt_token"] == attempt_token
-                and current["cancel_requested"] == 1
-            )
-        self.release_artifact(result_ref)
-        if cancelled:
-            return JobSuccessOutcome.CANCEL_REQUESTED
-        return JobSuccessOutcome.STALE
+        return manifest
 
     def begin_artifact(
         self,
@@ -2748,6 +2840,7 @@ class Storage:
                     in {
                         JobStatus.QUEUED,
                         JobStatus.RUNNING,
+                        JobStatus.SUCCEEDED,
                         JobStatus.FAILED,
                         JobStatus.CANCELLED,
                     }
@@ -2770,8 +2863,28 @@ class Storage:
             if row["owner_kind"] in {"sync", "legacy"}:
                 generic_cleanup.append(row)
 
+        result_rows_by_job: dict[str, list[sqlite3.Row]] = {}
+        for row in lease_rows:
+            if (
+                row["owner_kind"] == "job"
+                and row["lease_type"] == "artifact"
+            ):
+                if row["owner_id"] not in jobs_by_id:
+                    raise StorageSchemaError(
+                        "job result owner is corrupt"
+                    )
+                result_rows_by_job.setdefault(
+                    row["owner_id"], []
+                ).append(row)
+        if any(len(rows) != 1 for rows in result_rows_by_job.values()):
+            raise StorageSchemaError("duplicate job result artifact")
+
         receiving_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
         terminal_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        result_cleanup: list[sqlite3.Row] = []
+        recoverable_results: dict[
+            str, tuple[sqlite3.Row, ResultEnvelopeManifest]
+        ] = {}
         protected_paths: set[Path] = set()
         referenced_job_leases: set[str] = set()
         for job_id, (job_row, job) in jobs_by_id.items():
@@ -2833,15 +2946,99 @@ class Storage:
                     )
                 terminal_cleanup.append((job_row, lease_row))
 
+        for job_id, (_, job) in jobs_by_id.items():
+            result_rows = result_rows_by_job.get(job_id, [])
+            result_row = result_rows[0] if result_rows else None
+            if job.status is JobStatus.SUCCEEDED:
+                if (
+                    result_row is None
+                    or result_row["id"] != job.result_lease_id
+                    or result_row["phase"] != "sealed"
+                ):
+                    raise StorageSchemaError(
+                        "succeeded job result reference is corrupt"
+                    )
+            if result_row is None:
+                continue
+            referenced_job_leases.add(result_row["id"])
+            result_path = Path(result_row["controlled_path"])
+            should_recover = (
+                job.status is JobStatus.RUNNING
+                and not job.cancel_requested
+                and job.processed_samples == job.total_samples
+            )
+            requires_valid_result = (
+                job.status is JobStatus.SUCCEEDED or should_recover
+            )
+            if result_row["phase"] == "writing":
+                if job.status is JobStatus.SUCCEEDED:
+                    raise StorageSchemaError(
+                        "succeeded job result is incomplete"
+                    )
+                result_cleanup.append(result_row)
+                continue
+            try:
+                result_mode = result_path.lstat().st_mode
+            except FileNotFoundError:
+                if job.status is JobStatus.SUCCEEDED:
+                    raise StorageSchemaError(
+                        "succeeded job result is missing"
+                    ) from None
+                result_cleanup.append(result_row)
+                continue
+            except OSError as error:
+                raise StorageSchemaError(
+                    "job result cannot be inspected"
+                ) from error
+            if not stat.S_ISREG(result_mode):
+                raise StorageSchemaError(
+                    "job result file is not safely unlinkable"
+                )
+            if not requires_valid_result:
+                result_cleanup.append(result_row)
+                continue
+            try:
+                manifest = self._validate_job_result(
+                    job,
+                    path=result_path,
+                    actual_bytes=result_row["actual_bytes"],
+                    content_sha256=result_row["content_sha256"],
+                )
+            except (CanonicalArtifactError, ValueError) as error:
+                storage_mismatch = (
+                    isinstance(error, CanonicalArtifactError)
+                    and error.reason
+                    in {
+                        "result envelope size does not match storage",
+                        "result envelope SHA-256 does not match storage",
+                    }
+                )
+                if (
+                    job.status is JobStatus.SUCCEEDED
+                    or storage_mismatch
+                ):
+                    raise StorageSchemaError(
+                        "job result storage is corrupt"
+                    ) from error
+                result_cleanup.append(result_row)
+                continue
+            if job.status is JobStatus.SUCCEEDED:
+                if manifest.finished_at != job.finished_at:
+                    raise StorageSchemaError(
+                        "succeeded job result timestamp is corrupt"
+                    )
+                protected_paths.add(result_path)
+            elif should_recover:
+                recoverable_results[job_id] = (result_row, manifest)
+                protected_paths.add(result_path)
+            else:
+                result_cleanup.append(result_row)
+
         for lease_id, row in leases_by_id.items():
             if row["owner_kind"] == "job":
-                if row["lease_type"] == "artifact":
-                    raise StorageSchemaError(
-                        "job artifact is unsupported during startup"
-                    )
                 if lease_id not in referenced_job_leases:
                     raise StorageSchemaError(
-                        "job storage lease is not an active input reference"
+                        "job storage lease is unreferenced"
                     )
 
         preflight_paths: set[Path] = set()
@@ -2860,6 +3057,13 @@ class Storage:
                         self.staging_dir / f"{job.id}.ready",
                     }
                 )
+        for row in result_cleanup:
+            preflight_paths.update(
+                {
+                    self.artifact_dir / f"{row['id']}.partial",
+                    self.artifact_dir / f"{row['id']}.complete",
+                }
+            )
         for row in generic_cleanup:
             lease_type = row["lease_type"]
             directory = (
@@ -2923,6 +3127,45 @@ class Storage:
                             job.id,
                             job.attempt_token,
                             job.owner_generation,
+                        ),
+                    ).rowcount
+                elif job.id in recoverable_results:
+                    result_row, manifest = recoverable_results[job.id]
+                    changed = self._connection.execute(
+                        f"""
+                        UPDATE transcription_jobs SET
+                            status = 'succeeded',
+                            attempt_token = NULL,
+                            owner_generation = NULL,
+                            result_lease_id = ?,
+                            input_cleanup_pending = 1,
+                            finished_at = ?
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'running'
+                          AND attempt_token = ?
+                          AND owner_generation = ?
+                          AND cancel_requested = 0
+                          AND processed_samples = total_samples
+                          AND result_lease_id IS NULL
+                          AND EXISTS (
+                              SELECT 1 FROM storage_leases
+                              WHERE {_EXACT_SEALED_JOB_RESULT_WHERE}
+                          )
+                        """,
+                        (
+                            result_row["id"],
+                            _encode_job_timestamp(
+                                manifest.finished_at
+                            ),
+                            job.id,
+                            job.attempt_token,
+                            job.owner_generation,
+                            result_row["id"],
+                            job.id,
+                            result_row["controlled_path"],
+                            result_row["actual_bytes"],
+                            result_row["actual_bytes"],
+                            result_row["content_sha256"],
                         ),
                     ).rowcount
                 elif (
@@ -3041,7 +3284,12 @@ class Storage:
                     )
                 receiving_cleanup.append((job_row, lease_row))
             elif (
-                job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+                job.status
+                in {
+                    JobStatus.SUCCEEDED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                }
                 and job.input_cleanup_pending
             ):
                 if lease_row is None:
@@ -3057,6 +3305,17 @@ class Storage:
                 protected_paths.add(
                     self.staging_dir / f"{job_id}.ready"
                 )
+            if job.status is JobStatus.SUCCEEDED:
+                result_row = leases_by_id.get(
+                    job.result_lease_id or ""
+                )
+                if result_row is None:
+                    raise StorageSchemaError(
+                        "succeeded job result lease disappeared"
+                    )
+                protected_paths.add(
+                    Path(result_row["controlled_path"])
+                )
 
         cleanup_paths: set[Path] = set()
         for _, lease_row in receiving_cleanup + terminal_cleanup:
@@ -3064,6 +3323,13 @@ class Storage:
                 {
                     self.staging_dir / f"{lease_row['id']}.partial",
                     self.staging_dir / f"{lease_row['id']}.ready",
+                }
+            )
+        for row in result_cleanup:
+            cleanup_paths.update(
+                {
+                    self.artifact_dir / f"{row['id']}.partial",
+                    self.artifact_dir / f"{row['id']}.complete",
                 }
             )
         for row in generic_cleanup:
@@ -3102,7 +3368,12 @@ class Storage:
         for directory in touched_dirs:
             _fsync_directory(directory)
 
-        if receiving_cleanup or terminal_cleanup or generic_cleanup:
+        if (
+            receiving_cleanup
+            or terminal_cleanup
+            or result_cleanup
+            or generic_cleanup
+        ):
             with self._transaction():
                 for job_row, lease_row in receiving_cleanup:
                     current_job = self._connection.execute(
@@ -3172,7 +3443,9 @@ class Storage:
                             input_lease_id = NULL,
                             input_cleanup_pending = 0
                         WHERE id = ? AND phase = 'visible'
-                          AND status IN ('failed', 'cancelled')
+                          AND status IN (
+                              'succeeded', 'failed', 'cancelled'
+                          )
                           AND input_lease_id = ?
                           AND input_cleanup_pending = 1
                         """,
@@ -3194,6 +3467,19 @@ class Storage:
                             "terminal job disappeared during cleanup"
                         )
                     _decode_transcription_job(cleaned_row)
+                for row in result_cleanup:
+                    current = self._connection.execute(
+                        "SELECT * FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    if current is None or tuple(current) != tuple(row):
+                        raise StorageSchemaError(
+                            "job result lease changed during startup"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    )
                 for row in generic_cleanup:
                     current = self._connection.execute(
                         "SELECT * FROM storage_leases WHERE id = ?",
@@ -3254,9 +3540,25 @@ class Storage:
             and (
                 owner_kind != "job"
                 or (
-                    owner_id == lease_id
-                    and lease_type == "upload"
-                    and resource_kind == "transcription"
+                    (
+                        (
+                            owner_id == lease_id
+                            and lease_type == "upload"
+                            and resource_kind == "transcription"
+                        )
+                        or (
+                            lease_type == "artifact"
+                            and resource_kind == "result_complete"
+                            and re.fullmatch(
+                                r"[0-9a-f]{32}", lease_id
+                            )
+                            is not None
+                            and re.fullmatch(
+                                r"[0-9A-HJKMNP-TV-Z]{8}", owner_id
+                            )
+                            is not None
+                        )
+                    )
                     and (
                         (
                             phase == "writing"

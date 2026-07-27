@@ -767,8 +767,6 @@ def test_startup_terminal_cleanup_resumes_after_phase_failure(
     (
         "running-owner",
         "terminal-file-type",
-        "job-artifact",
-        "succeeded-artifact",
     ),
 )
 def test_startup_preflights_full_recovery_graph_before_mutating(
@@ -809,41 +807,6 @@ def test_startup_preflights_full_recovery_graph_before_mutating(
                 """,
                 (later.id,),
             )
-        else:
-            artifact_id = "a" * 32
-            artifact_path = tmp_path / "artifacts" / f"{artifact_id}.complete"
-            artifact_path.write_bytes(b"result")
-            connection.execute(
-                """
-                INSERT INTO storage_leases(
-                    id, lease_type, resource_kind, owner_kind, owner_id,
-                    phase, controlled_path, reserved_bytes, actual_bytes,
-                    content_sha256
-                ) VALUES (?, 'artifact', 'result_complete', 'job', ?,
-                          'sealed', ?, 6, 6, ?)
-                """,
-                (
-                    artifact_id,
-                    later.id,
-                    str(artifact_path),
-                    "4" * 64,
-                ),
-            )
-            if corruption == "succeeded-artifact":
-                connection.execute(
-                    """
-                    UPDATE transcription_jobs SET
-                        status = 'succeeded',
-                        processed_samples = total_samples,
-                        attempt_token = NULL,
-                        owner_generation = NULL,
-                        result_lease_id = ?,
-                        input_cleanup_pending = 1,
-                        finished_at = '2026-07-27T12:01:00Z'
-                    WHERE id = ?
-                    """,
-                    (artifact_id, later.id),
-                )
         connection.commit()
     finally:
         connection.close()
