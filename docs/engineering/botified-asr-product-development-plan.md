@@ -153,7 +153,6 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
     "sensevoice": "<sha256>"
   },
   "processor_compatibility_version": 1,
-  "processor_policy_manifest_digest": "<sha256>",
   "result_envelope_version": 1,
   "speaker_snapshot_wire_version": 1,
   "version": 1
@@ -164,11 +163,7 @@ canonical JSON 使用 UTF-8、对象 key 字典序、无无意义空白、JSON a
 
 每个 `model_snapshot_manifest_digests` 值是 ready/loader 已验证的对应完整 runtime model snapshot canonical metadata 的 SHA-256。version 1 metadata 的 exact top-level keys 是 `files,immutable_revision,model_id,provider,version`；`version` 必须是 exact integer `1`。`files` entry 的 exact keys 是 `byte_size,relative_path,sha256`，entries 按 `relative_path` 严格升序且 path 唯一，不在每个 entry 重复 model ID 或 revision。metadata 不得包含 cache/host absolute path、mtime、inode 或其他部署时可变 metadata，也不得只绑定 primary weight。计算 fingerprint 复用 ready/loader 已验证的 canonical metadata，不为 fingerprint 二次读取模型大文件。
 
-`processor_policy_manifest_digest` 是 canonical processor policy manifest 的 SHA-256。该 manifest 的 exact top-level keys 是 `policies,version`，`version` 是 integer `1`；`policies` 的 exact keys 是 `anonymous_clustering,asr_adapter,audio,join,result_projection,rich_label,segment,speaker_embedding,speaker_matching,text,vad`。每个 policy object 的 exact keys 是 `effective_parameters,version`，其中 `version` 是正整数，`effective_parameters` 是只含 JSON scalar/array/object 的 canonical object，并完整列出该 policy 当前生效的命名参数，不得用代码路径、类名或 Git revision 代替参数。
-
-这些 policy object 分别覆盖：audio frontend、ffmpeg argv/protocol/demuxer、downmix、resample、PCM `s16le`/mono/16 kHz、9,600-sample block、EOF 与 sample-count；VAD block/cache、pre-padding 与边界换算；segment 最大长度、切分、padding 与 batching；ASR adapter 输入、语言与模型输出解析；clean text；rich-label parser；canonical join；result projection；anonymous clustering；speaker embedding window/normalization；known-speaker matching threshold/margin。任一 effective value 变化都必须改变对应 canonical policy object。
-
-`processor_compatibility_version` 是兜底兼容版本：任何影响输出或旧 job/result 安全恢复、但不会由上述 model metadata、wire version 或 processor policy manifest 自动体现的代码、依赖、execution backend、adapter、parser、projection 或其他语义变化，都必须递增该值。不影响输出或恢复的重构、文件移动和 HTTP schema 变化不得递增。整个 Git commit 与 request/response/error schema hash 不进入 `processor_fingerprint`。
+`processor_compatibility_version` 是运行时语义兼容版本。除由上述 model snapshot digest 或 wire version 直接表达的变化外，任何会影响输出或旧 job/result 安全恢复语义的代码、依赖、execution backend、adapter、parser、projection、默认值或有效策略变化，都必须递增该值。不影响输出或恢复的重构、文件移动和 HTTP schema 变化不得递增。整个 Git commit 与 request/response/error schema hash 不进入 `processor_fingerprint`。
 
 当前 release 的 `processor_fingerprint` 是进程常量，新 job row 使用该值。只有 queued/running job 的 claim、execute、crash recovery 和 running-result promotion 要求 job 值等于当前 release 值；不一致 fail closed `processor_fingerprint_mismatch`，不得用当前 processor 继续该 job。active job 由持久 metadata 重算出的 request fingerprint 不等于 job row 时 fail closed `request_fingerprint_mismatch`。读取或恢复任意 `.complete` 时，其 request fingerprint 和 processor fingerprint 必须分别等于 job row；request fingerprint 不一致是 result corruption，processor fingerprint 不一致使用 `processor_fingerprint_mismatch`。retained succeeded job 不要求其 processor fingerprint 等于当前 release，只要求 `.complete` 的两个 fingerprint 与该 job row 精确一致。
 

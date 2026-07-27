@@ -160,6 +160,33 @@ def test_snapshot_dtos_are_exact_frozen_slots_and_errors_have_no_code() -> None:
         assert not hasattr(error_type(), "code")
 
 
+def test_snapshot_codec_uses_its_public_wire_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_module = _snapshot_module()
+    assert snapshot_module.SPEAKER_SNAPSHOT_WIRE_VERSION == 1
+    monkeypatch.setattr(
+        snapshot_module,
+        "SPEAKER_SNAPSHOT_WIRE_VERSION",
+        2,
+    )
+    snapshot = snapshot_module.SelectedSpeakerSnapshot(())
+    wire = snapshot_module.serialize_selected_speaker_snapshot(
+        snapshot,
+        _policy(),
+    )
+
+    assert wire == b'{"speakers":[],"version":2}'
+    assert (
+        snapshot_module.parse_selected_speaker_snapshot(
+            wire,
+            _policy(),
+            expected_ids=(),
+        )
+        == snapshot
+    )
+
+
 def test_empty_and_happy_snapshot_use_one_read_and_sorted_projection() -> None:
     snapshot_module = _snapshot_module()
     policy = _policy()

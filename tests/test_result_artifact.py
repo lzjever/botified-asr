@@ -27,6 +27,27 @@ KNOWN_SPEAKER_ID = "4X7K2M9Q"
 UNREQUESTED_SPEAKER_ID = "7N4K2M9Q"
 
 
+def test_result_envelope_codec_uses_public_wire_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    from botified_asr import result_artifact
+
+    assert result_artifact.RESULT_ENVELOPE_VERSION == 1
+    monkeypatch.setattr(result_artifact, "RESULT_ENVELOPE_VERSION", 2)
+    value = result_artifact.ResultEnvelopeManifest(
+        2,
+        "7K3M9Q2W",
+        1,
+        "1" * 64,
+        "2" * 64,
+        datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    wire = result_artifact.serialize_result_manifest(value)
+    assert result_artifact._decode_result_manifest_line(wire + b"\n") == value
+
+
 class NonExactKnownSpeakerMatch(KnownSpeakerMatch):
     __slots__ = ()
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -19,7 +21,10 @@ from botified_asr.model_artifacts import (
     SENSEVOICE_SPEC,
     ModelArtifactSpec,
     ResolvedModelSnapshot,
+    model_snapshot_manifest_digest,
 )
+from botified_asr.result_artifact import RESULT_ENVELOPE_VERSION
+from botified_asr.speaker_snapshot import SPEAKER_SNAPSHOT_WIRE_VERSION
 from botified_asr.speakers import (
     SPEAKER_DOWNMIX_POLICY_VERSION,
     SPEAKER_EMBEDDING_DIMENSION,
@@ -53,6 +58,33 @@ class FunAsrModelBundle:
     vad: FunAsrStreamingVadAdapter
     speaker: FunAsrCampPlusAdapter
     speaker_embedding_policy: SpeakerEmbeddingPolicy
+    processor_fingerprint: str
+
+
+def _build_processor_fingerprint(
+    sensevoice_snapshot: ResolvedModelSnapshot,
+    vad_snapshot: ResolvedModelSnapshot,
+    campplus_snapshot: ResolvedModelSnapshot,
+) -> str:
+    manifest = {
+        "model_snapshot_manifest_digests": {
+            "campplus": model_snapshot_manifest_digest(campplus_snapshot),
+            "fsmn_vad": model_snapshot_manifest_digest(vad_snapshot),
+            "sensevoice": model_snapshot_manifest_digest(sensevoice_snapshot),
+        },
+        "processor_compatibility_version": 1,
+        "result_envelope_version": RESULT_ENVELOPE_VERSION,
+        "speaker_snapshot_wire_version": SPEAKER_SNAPSHOT_WIRE_VERSION,
+        "version": 1,
+    }
+    canonical = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def load_funasr_model_bundle(
@@ -145,9 +177,15 @@ def load_funasr_model_bundle(
             SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION
         ),
     )
+    processor_fingerprint = _build_processor_fingerprint(
+        sensevoice_snapshot,
+        vad_snapshot,
+        speaker_snapshot,
+    )
     return FunAsrModelBundle(
         asr=asr,
         vad=vad,
         speaker=speaker,
         speaker_embedding_policy=speaker_embedding_policy,
+        processor_fingerprint=processor_fingerprint,
     )

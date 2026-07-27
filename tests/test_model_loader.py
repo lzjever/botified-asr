@@ -22,6 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEVICE = "cpu"
 ASR_NOSPEECH = "<|nospeech|><|EMO_UNKNOWN|><|Event_UNK|><|withitn|>"
 LOAD_ERROR_MESSAGE = "FunASR model bundle could not be loaded"
+PROCESSOR_FINGERPRINT = (
+    "15912cff0389a1a0e38828063e4de2018e4787c53ee60a25ca74f7bedfbdd633"
+)
 CAMPLUS_SPEC = getattr(model_artifacts, "CAMPLUS_SPEC", object())
 
 
@@ -161,6 +164,32 @@ def _snapshots(
     }
 
 
+def _fingerprint_snapshots(root: Path) -> tuple:
+    return tuple(
+        model_artifacts.ResolvedModelSnapshot(spec, root / name)
+        for spec, name in (
+            (model_artifacts.SENSEVOICE_SPEC, "sensevoice"),
+            (model_artifacts.FSMN_VAD_SPEC, "vad"),
+            (CAMPLUS_SPEC, "speaker"),
+        )
+    )
+
+
+def test_processor_fingerprint_is_exact_and_root_independent(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    snapshots = _fingerprint_snapshots(tmp_path / "missing-a")
+    other_roots = _fingerprint_snapshots(tmp_path / "missing-b")
+
+    assert loader._build_processor_fingerprint(*snapshots) == (
+        PROCESSOR_FINGERPRINT
+    )
+    assert loader._build_processor_fingerprint(*other_roots) == (
+        PROCESSOR_FINGERPRINT
+    )
+
+
 def _expected_kwargs(
     root: Path,
     *,
@@ -290,6 +319,7 @@ def test_loader_resolves_three_pinned_specs_before_exact_distinct_construction_a
     )
     assert bundle.speaker_embedding_policy == expected_speaker_policy
     assert bundle.speaker_embedding_policy is not expected_speaker_policy
+    assert bundle.processor_fingerprint == PROCESSOR_FINGERPRINT
     assert not hasattr(bundle.speaker_embedding_policy, "threshold")
     assert not hasattr(bundle.speaker_embedding_policy, "top_two_margin")
     with pytest.raises(FrozenInstanceError):

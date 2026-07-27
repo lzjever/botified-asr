@@ -52,7 +52,7 @@ _RICH_FIELDS = {
     "funasr.audio_events": ("audio_events", "audio_event"),
 }
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
-_RESULT_ENVELOPE_VERSION = 1
+RESULT_ENVELOPE_VERSION = 1
 _RESULT_ENVELOPE_CHUNK_BYTES = 64 * 1024
 _RESULT_MANIFEST_MAX_JSON_BYTES = 4 * 1024
 _RESULT_MANIFEST_KEYS = {
@@ -100,7 +100,7 @@ class ResultEnvelopeManifest:
     def __post_init__(self) -> None:
         if type(self.version) is not int:
             raise TypeError("result envelope version must be an integer")
-        if self.version != _RESULT_ENVELOPE_VERSION:
+        if self.version != RESULT_ENVELOPE_VERSION:
             raise ValueError("result envelope version is unsupported")
         validate_job_id(self.job_id)
         if type(self.attempt_no) is not int:

@@ -16,7 +16,7 @@ from botified_asr.speaker_profiles import (
 )
 from botified_asr.speakers import SpeakerEmbeddingPolicy
 
-_SNAPSHOT_VERSION = 1
+SPEAKER_SNAPSHOT_WIRE_VERSION = 1
 _MAX_SELECTED_SPEAKERS = 32
 _TOP_LEVEL_KEYS = {"speakers", "version"}
 _SPEAKER_KEYS = {"embedding", "id", "name"}
@@ -113,7 +113,7 @@ def serialize_selected_speaker_snapshot(
         wire = json.dumps(
             {
                 "speakers": entries,
-                "version": _SNAPSHOT_VERSION,
+                "version": SPEAKER_SNAPSHOT_WIRE_VERSION,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -149,7 +149,10 @@ def parse_selected_speaker_snapshot(
         )
         if type(value) is not dict or set(value) != _TOP_LEVEL_KEYS:
             raise _InvalidSnapshot
-        if type(value["version"]) is not int or value["version"] != _SNAPSHOT_VERSION:
+        if (
+            type(value["version"]) is not int
+            or value["version"] != SPEAKER_SNAPSHOT_WIRE_VERSION
+        ):
             raise _InvalidSnapshot
         raw_speakers = value["speakers"]
         if (
