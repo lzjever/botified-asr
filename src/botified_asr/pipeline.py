@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -22,6 +23,15 @@ from botified_asr.contracts import (
 )
 
 DIRECT_MAX_SAMPLES = 480_000
+VAD_FRONTEND_CONTEXT_SAMPLES = 640
+VAD_BACKTRACK_SAMPLES = 6_400
+VAD_PREPADDING_SAMPLES = 3_200
+VAD_IDLE_RING_SAMPLES = (
+    BLOCK_SAMPLES
+    + VAD_FRONTEND_CONTEXT_SAMPLES
+    + VAD_BACKTRACK_SAMPLES
+    + VAD_PREPADDING_SAMPLES
+)
 HAN_HIRAGANA_KATAKANA_RANGES = (
     (0x2E80, 0x2E99),
     (0x2E9B, 0x2EF3),
@@ -120,6 +130,290 @@ class VadMarker:
 class SpeechSpan:
     start_sample: int
     end_sample: int
+
+
+@dataclass(frozen=True)
+class BufferedSpeechSegment:
+    span: SpeechSpan
+    pcm_start_sample: int
+    pcm: np.ndarray
+
+    def __post_init__(self) -> None:
+        if (
+            self.pcm_start_sample < 0
+            or self.span.start_sample < self.pcm_start_sample
+            or self.span.end_sample <= self.span.start_sample
+            or len(self.pcm) != self.span.end_sample - self.pcm_start_sample
+            or self.pcm.dtype != np.int16
+            or self.pcm.ndim != 1
+            or not self.pcm.flags.c_contiguous
+            or len(self.pcm) > DIRECT_MAX_SAMPLES
+        ):
+            raise ValueError("buffered speech segment is invalid")
+
+
+@dataclass(frozen=True)
+class _BufferedPcmChunk:
+    start_sample: int
+    pcm: np.ndarray
+
+    @property
+    def end_sample(self) -> int:
+        return self.start_sample + len(self.pcm)
+
+
+class BoundedSpeechPcmBuffer:
+    def __init__(self) -> None:
+        self._chunks: deque[_BufferedPcmChunk] = deque()
+        self._processed_end_sample = 0
+        self._open_origin_sample: int | None = None
+        self._canonical_cursor_sample: int | None = None
+        self._pcm_cursor_sample: int | None = None
+        self._canonical_watermark_sample = 0
+        self._terminal = False
+
+    @property
+    def retained_start_sample(self) -> int:
+        if not self._chunks:
+            return self._processed_end_sample
+        return self._chunks[0].start_sample
+
+    @property
+    def retained_sample_count(self) -> int:
+        return self._processed_end_sample - self.retained_start_sample
+
+    def consume(
+        self,
+        block: DecodedBlock,
+        *,
+        completed_spans: tuple[SpeechSpan, ...] = (),
+        open_start_sample: int | None = None,
+    ) -> tuple[BufferedSpeechSegment, ...]:
+        if self._terminal:
+            raise PipelineError(
+                "invalid_model_output",
+                "Speech PCM buffer is no longer usable",
+            )
+        try:
+            return self._consume(
+                block,
+                completed_spans=completed_spans,
+                open_start_sample=open_start_sample,
+            )
+        except Exception:
+            self._terminal = True
+            raise
+
+    def _consume(
+        self,
+        block: DecodedBlock,
+        *,
+        completed_spans: tuple[SpeechSpan, ...],
+        open_start_sample: int | None,
+    ) -> tuple[BufferedSpeechSegment, ...]:
+        if block.start_sample != self._processed_end_sample:
+            raise PipelineError(
+                "invalid_audio",
+                "Decoded audio blocks are not contiguous",
+            )
+        if open_start_sample is not None and (
+            type(open_start_sample) is not int or open_start_sample < 0
+        ):
+            self._raise_invalid_output()
+
+        self._append(block)
+        if self._open_origin_sample is None:
+            self._trim_idle_history()
+
+        for span in completed_spans:
+            self._validate_completed_span(span)
+
+        emitted: list[BufferedSpeechSegment] = []
+        for span in completed_spans:
+            if self._open_origin_sample is None:
+                self._begin_speech(span.start_sample)
+            elif span.start_sample != self._open_origin_sample:
+                self._raise_invalid_output()
+            emitted.extend(self._complete_speech(span.end_sample))
+            self._trim_idle_history()
+
+        if open_start_sample is None:
+            if self._open_origin_sample is not None:
+                self._raise_invalid_output()
+        elif self._open_origin_sample is None:
+            self._begin_speech(open_start_sample)
+        elif open_start_sample != self._open_origin_sample:
+            self._raise_invalid_output()
+
+        if self._open_origin_sample is not None:
+            emitted.extend(self._release_full_segments(self._processed_end_sample))
+        else:
+            self._trim_idle_history()
+
+        return tuple(emitted)
+
+    def _append(self, block: DecodedBlock) -> None:
+        if len(block.pcm):
+            self._chunks.append(
+                _BufferedPcmChunk(
+                    start_sample=block.start_sample,
+                    pcm=block.pcm,
+                )
+            )
+        self._processed_end_sample += len(block.pcm)
+
+    def _validate_completed_span(self, span: SpeechSpan) -> None:
+        if (
+            not isinstance(span, SpeechSpan)
+            or type(span.start_sample) is not int
+            or type(span.end_sample) is not int
+            or span.start_sample < 0
+            or span.end_sample <= span.start_sample
+            or span.end_sample > self._processed_end_sample
+        ):
+            self._raise_invalid_output()
+
+    def _begin_speech(self, origin_sample: int) -> None:
+        if (
+            origin_sample < self._canonical_watermark_sample
+            or origin_sample > self._processed_end_sample
+        ):
+            self._raise_invalid_output()
+        pcm_start_sample = max(0, origin_sample - VAD_PREPADDING_SAMPLES)
+        if pcm_start_sample < self.retained_start_sample:
+            self._raise_invalid_output()
+        self._open_origin_sample = origin_sample
+        self._canonical_cursor_sample = origin_sample
+        self._pcm_cursor_sample = pcm_start_sample
+
+    def _complete_speech(
+        self,
+        end_sample: int,
+    ) -> tuple[BufferedSpeechSegment, ...]:
+        canonical_cursor = self._require_canonical_cursor()
+        if end_sample < canonical_cursor:
+            self._raise_invalid_output()
+
+        emitted = list(self._release_full_segments(end_sample))
+        canonical_cursor = self._require_canonical_cursor()
+        pcm_cursor = self._require_pcm_cursor()
+        if end_sample > pcm_cursor:
+            emitted.append(
+                self._make_segment(
+                    canonical_start=canonical_cursor,
+                    pcm_start=pcm_cursor,
+                    end=end_sample,
+                )
+            )
+
+        self._canonical_watermark_sample = end_sample
+        self._open_origin_sample = None
+        self._canonical_cursor_sample = None
+        self._pcm_cursor_sample = None
+        return tuple(emitted)
+
+    def _release_full_segments(
+        self,
+        available_end_sample: int,
+    ) -> tuple[BufferedSpeechSegment, ...]:
+        emitted: list[BufferedSpeechSegment] = []
+        pcm_cursor = self._require_pcm_cursor()
+        while available_end_sample - pcm_cursor >= DIRECT_MAX_SAMPLES:
+            canonical_cursor = self._require_canonical_cursor()
+            segment_end = pcm_cursor + DIRECT_MAX_SAMPLES
+            emitted.append(
+                self._make_segment(
+                    canonical_start=canonical_cursor,
+                    pcm_start=pcm_cursor,
+                    end=segment_end,
+                )
+            )
+            self._canonical_cursor_sample = segment_end
+            self._pcm_cursor_sample = segment_end
+            self._canonical_watermark_sample = segment_end
+            self._trim_before(segment_end)
+            pcm_cursor = segment_end
+        return tuple(emitted)
+
+    def _make_segment(
+        self,
+        *,
+        canonical_start: int,
+        pcm_start: int,
+        end: int,
+    ) -> BufferedSpeechSegment:
+        return BufferedSpeechSegment(
+            span=SpeechSpan(
+                start_sample=canonical_start,
+                end_sample=end,
+            ),
+            pcm_start_sample=pcm_start,
+            pcm=self._copy_range(pcm_start, end),
+        )
+
+    def _copy_range(self, start_sample: int, end_sample: int) -> np.ndarray:
+        if (
+            start_sample < self.retained_start_sample
+            or end_sample > self._processed_end_sample
+            or end_sample <= start_sample
+            or end_sample - start_sample > DIRECT_MAX_SAMPLES
+        ):
+            self._raise_invalid_output()
+
+        parts: list[np.ndarray] = []
+        copied_samples = 0
+        for chunk in self._chunks:
+            overlap_start = max(start_sample, chunk.start_sample)
+            overlap_end = min(end_sample, chunk.end_sample)
+            if overlap_start >= overlap_end:
+                continue
+            local_start = overlap_start - chunk.start_sample
+            local_end = overlap_end - chunk.start_sample
+            part = chunk.pcm[local_start:local_end]
+            parts.append(part)
+            copied_samples += len(part)
+
+        if copied_samples != end_sample - start_sample:
+            self._raise_invalid_output()
+        if len(parts) == 1:
+            return parts[0].copy()
+        return np.concatenate(parts)
+
+    def _trim_idle_history(self) -> None:
+        self._trim_before(max(0, self._processed_end_sample - VAD_IDLE_RING_SAMPLES))
+
+    def _trim_before(self, start_sample: int) -> None:
+        if start_sample < 0 or start_sample > self._processed_end_sample:
+            self._raise_invalid_output()
+        if start_sample <= self.retained_start_sample:
+            return
+        while self._chunks and self._chunks[0].end_sample <= start_sample:
+            self._chunks.popleft()
+        if self._chunks and self._chunks[0].start_sample < start_sample:
+            chunk = self._chunks.popleft()
+            local_start = start_sample - chunk.start_sample
+            self._chunks.appendleft(
+                _BufferedPcmChunk(
+                    start_sample=start_sample,
+                    pcm=chunk.pcm[local_start:],
+                )
+            )
+
+    def _require_canonical_cursor(self) -> int:
+        if self._canonical_cursor_sample is None:
+            self._raise_invalid_output()
+        return self._canonical_cursor_sample
+
+    def _require_pcm_cursor(self) -> int:
+        if self._pcm_cursor_sample is None:
+            self._raise_invalid_output()
+        return self._pcm_cursor_sample
+
+    def _raise_invalid_output(self) -> None:
+        raise PipelineError(
+            "invalid_model_output",
+            "VAD model returned a span outside retained PCM history",
+        )
 
 
 @runtime_checkable
