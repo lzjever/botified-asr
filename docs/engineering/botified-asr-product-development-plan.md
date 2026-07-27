@@ -913,6 +913,7 @@ server:
 
 runtime:
   device: "auto"
+  model_cache_dir: "~/.cache/botified-asr/models"
   max_speakers: 32
 
 storage:
@@ -936,6 +937,9 @@ limits:
 - 非敏感配置只从该文件读取。
 - CLI 仅接受 `--config` 定位文件，不为每个字段再增加 CLI/env alias。
 - `~` 在配置加载时由应用统一展开。
+- 当前 CPU artifact 的 `runtime.device` 只接受精确值 `auto` 或 `cpu`，并将两者都 canonicalize 为 `cpu`；不得把 `auto` 直接传给 Torch/FunASR，也不得探测硬件后临时启用当前 artifact 未声明的 CUDA 路径。
+- `storage.data_dir` 和 `runtime.model_cache_dir` 展开 `~` 后必须已经是 absolute path，再以 `resolve(strict=False)` 规范为 canonical path；两个 canonical root 相等、任一位于另一目录树内时均 fail closed。
+- model cache 只归 model artifact resolver 管理，不进入 `Storage` ledger、job data reservation、retention 或 orphan cleanup。
 - 未知字段 fail fast。
 - `limits` 下所有值均为正整数；`runtime.max_speakers` 是 `1..32` 的整数。
 - duration 必须满足 `direct_max_audio_duration_secs <= sync_max_audio_duration_secs <= max_audio_duration_secs <= 43200`。
@@ -1162,10 +1166,10 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 1. 支持 `BOTIFIED_ASR_VERSION=vX.Y.Z`，默认最新稳定版。
 2. 检测 Linux x86_64/aarch64；不支持的平台在下载大资产前失败。
 3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
-4. `device=auto` 时检测 NVIDIA runtime，否则使用 CPU。
-5. 下载 release manifest 和 SHA256SUMS 并严格校验。
-6. 按 digest 拉取对应 OCI image。
-7. 创建配置、credential、data 和 model cache 目录。
+4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
+5. 只依据已验证的 runtime/image matrix 选择 device 和 image；CPU artifact 中 `device=auto` 与 `device=cpu` 都 canonicalize 为 CPU，只有 manifest 含目标平台 CUDA digest 且 NVIDIA runtime gate 通过时才可选择 CUDA artifact。
+6. 按选定的 manifest digest 拉取对应 OCI image。
+7. 创建配置、credential、data 和 model cache 目录；data 与 model cache 使用互不相等、互不嵌套的独立持久 mount。
 8. 未提供 API Key 时生成安全随机 token，分别写入 mode `0600` 的 `service.env` 和 §10.3 `client.env`；不得回显。
 9. 安装单个 systemd service；没有 systemd 时安装可执行启动 wrapper 并明确提示。
 10. 启动服务、等待 ready，并用安装器内置的最小 HTTP smoke 执行一个随发布固定的短音频转写。
@@ -1573,7 +1577,7 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 - 上传文件名不进入文件系统路径。
 - ffmpeg 使用无 shell argv。
 - SQLite、credential、job 和 speaker 数据目录权限最小化。
-- OCI container 使用非 root user、read-only rootfs，不使用 host network，只发布配置的 loopback 端口；仅挂载受控 data、revision-isolated model cache 和只读配置，服务 secret 由 launcher 注入进程环境。
+- OCI container 使用非 root user、read-only rootfs，不使用 host network，只发布配置的 loopback 端口；仅挂载受控 data、revision-isolated model cache 和只读配置，其中 data root 与 model cache root 必须互不相等、互不嵌套并使用独立持久 mount，服务 secret 由 launcher 注入进程环境。
 - 原始音频和人物样本不进入日志、错误、metrics 或 crash report。
 - API 不返回 embedding。
 - 删除 profile 只立即删除主记录；已入队 job 的私有 embedding snapshot 保留到该 job 删除或 retention 清理，这是可恢复命名语义所需的最短生命周期。

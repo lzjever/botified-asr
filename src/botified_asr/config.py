@@ -25,6 +25,19 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _canonical_directory(value: object, field_name: str) -> Path:
+    try:
+        path = Path(value).expanduser()
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ConfigError(f"{field_name} must be a valid path") from error
+    if not path.is_absolute():
+        raise ConfigError(f"{field_name} must be an absolute path")
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ConfigError(f"{field_name} could not be resolved") from error
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     listen: str = "127.0.0.1:8090"
@@ -34,9 +47,21 @@ class ServerConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     device: str = "auto"
+    model_cache_dir: Path = Path("~/.cache/botified-asr/models")
     max_speakers: int = 32
 
     def __post_init__(self) -> None:
+        if not isinstance(self.device, str) or self.device not in {"auto", "cpu"}:
+            raise ConfigError("runtime.device must be auto or cpu")
+        object.__setattr__(self, "device", "cpu")
+        object.__setattr__(
+            self,
+            "model_cache_dir",
+            _canonical_directory(
+                self.model_cache_dir,
+                "runtime.model_cache_dir",
+            ),
+        )
         if not _is_int(self.max_speakers) or not 1 <= self.max_speakers <= 32:
             raise ConfigError("runtime.max_speakers must be an integer from 1 to 32")
 
@@ -46,8 +71,11 @@ class StorageConfig:
     data_dir: Path = Path("~/.local/share/botified-asr")
 
     def __post_init__(self) -> None:
-        value = Path(self.data_dir).expanduser()
-        object.__setattr__(self, "data_dir", value)
+        object.__setattr__(
+            self,
+            "data_dir",
+            _canonical_directory(self.data_dir, "storage.data_dir"),
+        )
 
 
 @dataclass(frozen=True)
@@ -105,6 +133,18 @@ class Config:
     runtime: RuntimeConfig = RuntimeConfig()
     storage: StorageConfig = StorageConfig()
     limits: LimitsConfig = LimitsConfig()
+
+    def __post_init__(self) -> None:
+        model_cache_dir = self.runtime.model_cache_dir
+        data_dir = self.storage.data_dir
+        if (
+            model_cache_dir == data_dir
+            or model_cache_dir.is_relative_to(data_dir)
+            or data_dir.is_relative_to(model_cache_dir)
+        ):
+            raise ConfigError(
+                "runtime.model_cache_dir and storage.data_dir must not overlap"
+            )
 
 
 def load_config(path: str | Path) -> Config:
