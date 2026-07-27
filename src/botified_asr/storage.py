@@ -17,8 +17,10 @@ from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
 from botified_asr.jobs import (
     DurableJob,
     JobPhase,
+    JobProgressOutcome,
     JobStatus,
     QueuedJobSpec,
+    generate_attempt_token,
     generate_job_id,
     validate_job_id,
 )
@@ -1452,11 +1454,205 @@ class Storage:
                 f"""
                 SELECT {_TRANSCRIPTION_JOB_COLUMNS}
                 FROM transcription_jobs
-                WHERE id = ? AND phase = 'visible' AND status = 'queued'
+                WHERE id = ? AND phase = 'visible'
                 """,
                 (job_id,),
             ).fetchone()
         return None if row is None else _decode_transcription_job(row)
+
+    def claim_next_job(
+        self,
+        generation: str,
+        claimed_at: datetime,
+    ) -> DurableJob | None:
+        _validate_nonempty_text(generation, name="generation")
+        encoded_claimed_at = _encode_job_timestamp(claimed_at)
+        with self._transaction():
+            marker = self._connection.execute(
+                "SELECT 1 FROM shutdown_marker"
+            ).fetchone()
+            if marker is not None:
+                raise RuntimeError(
+                    "cannot claim jobs after shutdown has started"
+                )
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs
+                WHERE phase = 'visible' AND status = 'queued'
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            queued = _decode_transcription_job(row)
+            if claimed_at < queued.created_at:
+                raise ValueError(
+                    "job claim time must not precede creation"
+                )
+            attempt_token = generate_attempt_token()
+            _validate_nonempty_text(
+                attempt_token,
+                name="attempt token",
+            )
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET
+                    status = 'running',
+                    attempt_no = attempt_no + 1,
+                    attempt_token = ?,
+                    owner_generation = ?,
+                    started_at = ?
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'queued' AND cancel_requested = 0
+                """,
+                (
+                    attempt_token,
+                    generation,
+                    encoded_claimed_at,
+                    queued.id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("queued job changed during claim")
+            claimed_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (queued.id,),
+            ).fetchone()
+        if claimed_row is None:
+            raise StorageSchemaError("claimed job row is missing")
+        return _decode_transcription_job(claimed_row)
+
+    def update_job_progress(
+        self,
+        job_id: str,
+        attempt_token: str,
+        processed_samples: int,
+    ) -> JobProgressOutcome:
+        if type(processed_samples) is not int:
+            raise TypeError("processed samples must be an integer")
+        if processed_samples < 0:
+            raise ValueError("processed samples must be nonnegative")
+        validate_job_id(job_id)
+        _validate_nonempty_text(
+            attempt_token,
+            name="attempt token",
+        )
+        with self._transaction():
+            row = self._connection.execute(
+                """
+                SELECT status, attempt_token, processed_samples,
+                       total_samples, cancel_requested
+                FROM transcription_jobs
+                WHERE id = ? AND phase = 'visible'
+                """,
+                (job_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "running"
+                or row["attempt_token"] != attempt_token
+            ):
+                return JobProgressOutcome.STALE
+            if (
+                processed_samples < row["processed_samples"]
+                or processed_samples > row["total_samples"]
+            ):
+                raise ValueError(
+                    "processed samples are outside the current job bounds"
+                )
+            if row["cancel_requested"] == 1:
+                return JobProgressOutcome.CANCEL_REQUESTED
+            if row["cancel_requested"] != 0:
+                raise StorageSchemaError(
+                    "job cancellation flag is corrupt"
+                )
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET processed_samples = ?
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'running' AND attempt_token = ?
+                  AND cancel_requested = 0
+                """,
+                (processed_samples, job_id, attempt_token),
+            ).rowcount
+            if changed != 1:
+                return JobProgressOutcome.STALE
+        return JobProgressOutcome.UPDATED
+
+    def write_shutdown_marker(
+        self,
+        generation: str,
+        created_at: datetime,
+    ) -> None:
+        _validate_nonempty_text(generation, name="generation")
+        encoded_created_at = _encode_job_timestamp(created_at)
+        with self._transaction():
+            row = self._connection.execute(
+                """
+                SELECT generation, created_at
+                FROM shutdown_marker WHERE singleton = 1
+                """
+            ).fetchone()
+            if row is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO shutdown_marker(
+                        singleton, generation, created_at
+                    ) VALUES (1, ?, ?)
+                    """,
+                    (generation, encoded_created_at),
+                )
+                return
+            if row["generation"] != generation:
+                raise RuntimeError(
+                    "shutdown marker belongs to another generation"
+                )
+
+    def requeue_job_at_shutdown(
+        self,
+        job_id: str,
+        attempt_token: str,
+        generation: str,
+    ) -> bool:
+        validate_job_id(job_id)
+        _validate_nonempty_text(
+            attempt_token,
+            name="attempt token",
+        )
+        _validate_nonempty_text(generation, name="generation")
+        with self._transaction():
+            marker = self._connection.execute(
+                """
+                SELECT generation FROM shutdown_marker
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if marker is None or marker["generation"] != generation:
+                return False
+            changed = self._connection.execute(
+                """
+                UPDATE transcription_jobs SET
+                    status = 'queued',
+                    processed_samples = 0,
+                    attempt_token = NULL,
+                    owner_generation = NULL,
+                    cancel_requested = 0,
+                    started_at = NULL,
+                    finished_at = NULL
+                WHERE id = ? AND phase = 'visible'
+                  AND status = 'running'
+                  AND attempt_token = ?
+                  AND owner_generation = ?
+                  AND cancel_requested = 0
+                """,
+                (job_id, attempt_token, generation),
+            ).rowcount
+        return changed == 1
 
     def _compensate_failed_job_open(
         self,
@@ -2346,10 +2542,21 @@ class Storage:
             lease_rows = self._connection.execute(
                 "SELECT * FROM storage_leases"
             ).fetchall()
+        if len(marker_rows) > 1:
+            raise StorageSchemaError("multiple shutdown markers")
+        marker_generation: str | None = None
         if marker_rows:
-            raise StorageSchemaError(
-                "shutdown marker is unsupported during startup"
-            )
+            marker = marker_rows[0]
+            try:
+                marker_generation = _validate_nonempty_text(
+                    marker["generation"],
+                    name="shutdown marker generation",
+                )
+                _decode_job_timestamp(marker["created_at"])
+            except (IndexError, TypeError, ValueError) as error:
+                raise StorageSchemaError(
+                    "shutdown marker is corrupt"
+                ) from error
 
         jobs_by_id: dict[str, tuple[sqlite3.Row, DurableJob]] = {}
         for row in job_rows:
@@ -2363,7 +2570,13 @@ class Storage:
                 )
                 or (
                     job.phase is JobPhase.VISIBLE
-                    and job.status is JobStatus.QUEUED
+                    and job.status
+                    in {
+                        JobStatus.QUEUED,
+                        JobStatus.RUNNING,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                    }
                 )
             ):
                 raise StorageSchemaError(
@@ -2383,10 +2596,23 @@ class Storage:
             if row["owner_kind"] in {"sync", "legacy"}:
                 generic_cleanup.append(row)
 
-        job_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        receiving_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        terminal_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
         protected_paths: set[Path] = set()
+        referenced_job_leases: set[str] = set()
         for job_id, (job_row, job) in jobs_by_id.items():
-            lease_row = leases_by_id.get(job.input_lease_id)
+            requires_input = (
+                job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}
+                or job.status in {JobStatus.QUEUED, JobStatus.RUNNING}
+                or job.input_cleanup_pending
+            )
+            if not requires_input:
+                if job.input_lease_id is not None:
+                    raise StorageSchemaError(
+                        "clean terminal job retains an input reference"
+                    )
+                continue
+            lease_row = leases_by_id.get(job.input_lease_id or "")
             if (
                 lease_row is None
                 or lease_row["id"] != job_id
@@ -2398,9 +2624,10 @@ class Storage:
                 raise StorageSchemaError(
                     "transcription job input reference is corrupt"
                 )
+            referenced_job_leases.add(lease_row["id"])
             controlled_path = Path(lease_row["controlled_path"])
             if job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}:
-                job_cleanup.append((job_row, lease_row))
+                receiving_cleanup.append((job_row, lease_row))
                 continue
             if (
                 lease_row["phase"] != "sealed"
@@ -2409,15 +2636,28 @@ class Storage:
                 or lease_row["reserved_bytes"]
                 != lease_row["actual_bytes"]
                 or job.input_size_bytes != lease_row["actual_bytes"]
-                or not _is_regular_file_with_size(
-                    controlled_path,
-                    lease_row["actual_bytes"],
-                )
             ):
                 raise StorageSchemaError(
-                    "queued transcription job input is corrupt"
+                    "visible transcription job input is corrupt"
                 )
-            protected_paths.add(controlled_path)
+            if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+                if not _is_regular_file_with_size(
+                    controlled_path,
+                    lease_row["actual_bytes"],
+                ):
+                    raise StorageSchemaError(
+                        "active transcription job input is corrupt"
+                    )
+                protected_paths.add(controlled_path)
+            else:
+                if not _is_absent_or_regular_file_with_size(
+                    controlled_path,
+                    lease_row["actual_bytes"],
+                ):
+                    raise StorageSchemaError(
+                        "terminal transcription job input is corrupt"
+                    )
+                terminal_cleanup.append((job_row, lease_row))
 
         for lease_id, row in leases_by_id.items():
             if row["owner_kind"] == "job":
@@ -2425,19 +2665,27 @@ class Storage:
                     raise StorageSchemaError(
                         "job artifact is unsupported during startup"
                     )
-                if lease_id not in jobs_by_id:
+                if lease_id not in referenced_job_leases:
                     raise StorageSchemaError(
-                        "job storage lease has no transcription job"
+                        "job storage lease is not an active input reference"
                     )
 
-        cleanup_paths: set[Path] = set()
-        for _, lease_row in job_cleanup:
-            cleanup_paths.update(
+        preflight_paths: set[Path] = set()
+        for _, lease_row in receiving_cleanup + terminal_cleanup:
+            preflight_paths.update(
                 {
                     self.staging_dir / f"{lease_row['id']}.partial",
                     self.staging_dir / f"{lease_row['id']}.ready",
                 }
             )
+        for _, job in jobs_by_id.values():
+            if job.status is JobStatus.RUNNING:
+                preflight_paths.update(
+                    {
+                        self.staging_dir / f"{job.id}.partial",
+                        self.staging_dir / f"{job.id}.ready",
+                    }
+                )
         for row in generic_cleanup:
             lease_type = row["lease_type"]
             directory = (
@@ -2448,6 +2696,211 @@ class Storage:
             suffixes = (
                 ("partial", "ready")
                 if lease_type == "upload"
+                else ("partial", "complete")
+            )
+            preflight_paths.update(
+                directory / f"{row['id']}.{suffix}"
+                for suffix in suffixes
+            )
+        for directory, pattern in (
+            (self.staging_dir, STAGING_NAME_PATTERN),
+            (self.artifact_dir, ARTIFACT_NAME_PATTERN),
+        ):
+            preflight_paths.update(
+                entry
+                for entry in directory.iterdir()
+                if pattern.fullmatch(entry.name)
+                and entry not in protected_paths
+            )
+        for path in preflight_paths:
+            self._preflight_cleanup_path(path)
+
+        running_jobs = tuple(
+            job
+            for _, job in jobs_by_id.values()
+            if job.status is JobStatus.RUNNING
+        )
+        now = _utc_now()
+        _encode_job_timestamp(now)
+        with self._transaction():
+            for job in running_jobs:
+                assert job.attempt_token is not None
+                assert job.owner_generation is not None
+                assert job.started_at is not None
+                if job.cancel_requested:
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            status = 'cancelled',
+                            attempt_token = NULL,
+                            owner_generation = NULL,
+                            input_cleanup_pending = 1,
+                            finished_at = ?
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'running'
+                          AND attempt_token = ?
+                          AND owner_generation = ?
+                          AND cancel_requested = 1
+                        """,
+                        (
+                            _encode_job_timestamp(
+                                max(now, job.started_at)
+                            ),
+                            job.id,
+                            job.attempt_token,
+                            job.owner_generation,
+                        ),
+                    ).rowcount
+                elif (
+                    marker_generation is not None
+                    and job.owner_generation == marker_generation
+                ):
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            status = 'queued',
+                            processed_samples = 0,
+                            attempt_token = NULL,
+                            owner_generation = NULL,
+                            started_at = NULL,
+                            finished_at = NULL
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'running'
+                          AND attempt_token = ?
+                          AND owner_generation = ?
+                          AND cancel_requested = 0
+                        """,
+                        (
+                            job.id,
+                            job.attempt_token,
+                            job.owner_generation,
+                        ),
+                    ).rowcount
+                elif job.crash_recoveries == 0:
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            status = 'queued',
+                            processed_samples = 0,
+                            attempt_token = NULL,
+                            owner_generation = NULL,
+                            crash_recoveries = 1,
+                            started_at = NULL,
+                            finished_at = NULL
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'running'
+                          AND attempt_token = ?
+                          AND owner_generation = ?
+                          AND crash_recoveries = 0
+                          AND cancel_requested = 0
+                        """,
+                        (
+                            job.id,
+                            job.attempt_token,
+                            job.owner_generation,
+                        ),
+                    ).rowcount
+                else:
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            status = 'failed',
+                            attempt_token = NULL,
+                            owner_generation = NULL,
+                            error_code = 'worker_crashed',
+                            input_cleanup_pending = 1,
+                            finished_at = ?
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'running'
+                          AND attempt_token = ?
+                          AND owner_generation = ?
+                          AND crash_recoveries = 1
+                          AND cancel_requested = 0
+                        """,
+                        (
+                            _encode_job_timestamp(
+                                max(now, job.started_at)
+                            ),
+                            job.id,
+                            job.attempt_token,
+                            job.owner_generation,
+                        ),
+                    ).rowcount
+                if changed != 1:
+                    raise StorageSchemaError(
+                        "running job changed during startup"
+                    )
+            for job_row, _ in receiving_cleanup:
+                if job_row["phase"] == "receiving":
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET phase = 'deleting'
+                        WHERE id = ? AND phase = 'receiving'
+                          AND status IS NULL AND input_lease_id = ?
+                        """,
+                        (job_row["id"], job_row["input_lease_id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise StorageSchemaError(
+                            "transcription job changed during startup"
+                        )
+            self._connection.execute("DELETE FROM shutdown_marker")
+            classified_rows = self._connection.execute(
+                f"SELECT {_TRANSCRIPTION_JOB_COLUMNS} FROM transcription_jobs"
+            ).fetchall()
+            for row in classified_rows:
+                _decode_transcription_job(row)
+
+        classified_jobs = {
+            row["id"]: (row, _decode_transcription_job(row))
+            for row in classified_rows
+        }
+        receiving_cleanup = []
+        terminal_cleanup = []
+        protected_paths = set()
+        for job_id, (job_row, job) in classified_jobs.items():
+            lease_row = leases_by_id.get(job.input_lease_id or "")
+            if job.phase is JobPhase.DELETING and job.status is None:
+                if lease_row is None:
+                    raise StorageSchemaError(
+                        "deleting job input lease disappeared"
+                    )
+                receiving_cleanup.append((job_row, lease_row))
+            elif (
+                job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+                and job.input_cleanup_pending
+            ):
+                if lease_row is None:
+                    raise StorageSchemaError(
+                        "terminal job input lease disappeared"
+                    )
+                terminal_cleanup.append((job_row, lease_row))
+            elif job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+                if lease_row is None:
+                    raise StorageSchemaError(
+                        "active job input lease disappeared"
+                    )
+                protected_paths.add(
+                    self.staging_dir / f"{job_id}.ready"
+                )
+
+        cleanup_paths: set[Path] = set()
+        for _, lease_row in receiving_cleanup + terminal_cleanup:
+            cleanup_paths.update(
+                {
+                    self.staging_dir / f"{lease_row['id']}.partial",
+                    self.staging_dir / f"{lease_row['id']}.ready",
+                }
+            )
+        for row in generic_cleanup:
+            directory = (
+                self.staging_dir
+                if row["lease_type"] == "upload"
+                else self.artifact_dir
+            )
+            suffixes = (
+                ("partial", "ready")
+                if row["lease_type"] == "upload"
                 else ("partial", "complete")
             )
             cleanup_paths.update(
@@ -2464,25 +2917,10 @@ class Storage:
                 if pattern.fullmatch(entry.name)
                 and entry not in protected_paths
             )
-        for path in cleanup_paths:
-            self._preflight_cleanup_path(path)
-
-        if job_cleanup:
-            with self._transaction():
-                for job_row, _ in job_cleanup:
-                    if job_row["phase"] == "receiving":
-                        changed = self._connection.execute(
-                            """
-                            UPDATE transcription_jobs SET phase = 'deleting'
-                            WHERE id = ? AND phase = 'receiving'
-                              AND status IS NULL AND input_lease_id = ?
-                            """,
-                            (job_row["id"], job_row["input_lease_id"]),
-                        ).rowcount
-                        if changed != 1:
-                            raise StorageSchemaError(
-                                "transcription job changed during startup"
-                            )
+        if not cleanup_paths.issubset(preflight_paths):
+            raise StorageSchemaError(
+                "startup cleanup plan changed after classification"
+            )
 
         touched_dirs = {path.parent for path in cleanup_paths}
         for path in cleanup_paths:
@@ -2490,9 +2928,9 @@ class Storage:
         for directory in touched_dirs:
             _fsync_directory(directory)
 
-        if job_cleanup or generic_cleanup:
+        if receiving_cleanup or terminal_cleanup or generic_cleanup:
             with self._transaction():
-                for job_row, lease_row in job_cleanup:
+                for job_row, lease_row in receiving_cleanup:
                     current_job = self._connection.execute(
                         f"""
                         SELECT {_TRANSCRIPTION_JOB_COLUMNS}
@@ -2529,6 +2967,59 @@ class Storage:
                         """,
                         (job_row["id"],),
                     )
+                for job_row, lease_row in terminal_cleanup:
+                    current_job = self._connection.execute(
+                        f"""
+                        SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                        FROM transcription_jobs WHERE id = ?
+                        """,
+                        (job_row["id"],),
+                    ).fetchone()
+                    current_lease = self._connection.execute(
+                        "SELECT * FROM storage_leases WHERE id = ?",
+                        (lease_row["id"],),
+                    ).fetchone()
+                    if (
+                        current_job is None
+                        or tuple(current_job) != tuple(job_row)
+                        or current_lease is None
+                        or tuple(current_lease) != tuple(lease_row)
+                    ):
+                        raise StorageSchemaError(
+                            "terminal cleanup state changed during startup"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM storage_leases WHERE id = ?",
+                        (lease_row["id"],),
+                    )
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            input_lease_id = NULL,
+                            input_cleanup_pending = 0
+                        WHERE id = ? AND phase = 'visible'
+                          AND status IN ('failed', 'cancelled')
+                          AND input_lease_id = ?
+                          AND input_cleanup_pending = 1
+                        """,
+                        (job_row["id"], lease_row["id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise StorageSchemaError(
+                            "terminal job changed during input cleanup"
+                        )
+                    cleaned_row = self._connection.execute(
+                        f"""
+                        SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                        FROM transcription_jobs WHERE id = ?
+                        """,
+                        (job_row["id"],),
+                    ).fetchone()
+                    if cleaned_row is None:
+                        raise StorageSchemaError(
+                            "terminal job disappeared during cleanup"
+                        )
+                    _decode_transcription_job(cleaned_row)
                 for row in generic_cleanup:
                     current = self._connection.execute(
                         "SELECT * FROM storage_leases WHERE id = ?",
@@ -2836,6 +3327,14 @@ def _decode_sqlite_boolean(value: object, *, name: str) -> bool:
     return bool(value)
 
 
+def _validate_nonempty_text(value: object, *, name: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
 def _encode_job_timestamp(value: datetime) -> str:
     if type(value) is not datetime:
         raise TypeError("job timestamp must be a datetime")
@@ -2935,6 +3434,20 @@ def _is_regular_file_with_size(path: Path, size: int) -> bool:
         )
     except OSError:
         return False
+
+
+def _is_absent_or_regular_file_with_size(path: Path, size: int) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return _is_regular_file_with_size(path, size)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _fsync_directory(path: Path) -> None:

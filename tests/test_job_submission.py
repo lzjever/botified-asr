@@ -885,7 +885,7 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
             connection.execute(
                 """
                 INSERT INTO shutdown_marker(singleton, generation, created_at)
-                VALUES (1, 'generation-1', '2026-07-27T12:00:00Z')
+                VALUES (1, 'generation-1', '2026-07-27T12:00:00.000Z')
                 """
             )
         else:

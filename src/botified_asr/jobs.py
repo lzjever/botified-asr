@@ -25,6 +25,12 @@ class JobPhase(str, Enum):
     DELETING = "deleting"
 
 
+class JobProgressOutcome(str, Enum):
+    UPDATED = "updated"
+    STALE = "stale"
+    CANCEL_REQUESTED = "cancel_requested"
+
+
 def validate_job_id(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("job ID must be a string")
@@ -35,6 +41,10 @@ def validate_job_id(value: object) -> str:
 
 def generate_job_id() -> str:
     return "".join(secrets.choice(_CROCKFORD_ALPHABET) for _ in range(8))
+
+
+def generate_attempt_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
 @dataclass(frozen=True, slots=True)
