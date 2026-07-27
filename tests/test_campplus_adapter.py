@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from botified_asr import funasr_adapter
+from botified_asr import funasr_adapter, speakers
 from botified_asr.pipeline import PipelineError
 
 
@@ -60,6 +60,8 @@ def test_campplus_adapter_normalizes_pcm_and_embeddings_in_one_lane_call() -> No
 
     windows = _adapter(model, lane).embed_windows(pcm)
 
+    assert funasr_adapter.SpeakerEmbeddingWindow is speakers.SpeakerEmbeddingWindow
+    assert all(type(window) is speakers.SpeakerEmbeddingWindow for window in windows)
     assert len(lane.operations) == 1
     assert len(model.calls) == 1
     assert set(model.calls[0]) == {"input", "batch_size"}

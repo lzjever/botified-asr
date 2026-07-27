@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
 import torch
 
+from botified_asr.errors import PipelineError
 from botified_asr.inference import InferenceLane
 from botified_asr.pipeline import (
     DIRECT_MAX_SAMPLES,
     AsrResult,
-    PipelineError,
     RichAnnotations,
     VadMarker,
 )
+from botified_asr.speakers import SpeakerEmbeddingWindow
 
 _LANGUAGES = frozenset({"auto", "zh", "en", "yue", "ja", "ko"})
 _OUTPUT_LANGUAGES = _LANGUAGES - {"auto"}
@@ -54,13 +54,6 @@ CAMPLUS_EMBEDDING_DIMENSION = 192
 
 class FunAsrAutoModel(Protocol):
     def generate(self, **kwargs: object) -> object: ...
-
-
-@dataclass(frozen=True)
-class SpeakerEmbeddingWindow:
-    start_sample: int
-    end_sample: int
-    embedding: np.ndarray
 
 
 class FunAsrCampPlusAdapter:

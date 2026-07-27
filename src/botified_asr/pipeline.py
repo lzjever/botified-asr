@@ -21,6 +21,7 @@ from botified_asr.contracts import (
     MAX_AUDIO_SAMPLES,
     CanonicalOptions,
 )
+from botified_asr.errors import PipelineError, PipelineNotReady
 
 DIRECT_MAX_SAMPLES = 480_000
 ASR_BATCH_MAX_SEGMENTS = 32
@@ -84,20 +85,6 @@ HAN_HIRAGANA_KATAKANA_RANGES = (
     (0x30000, 0x3134A),
     (0x31350, 0x33479),
 )
-
-
-class PipelineError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-class PipelineNotReady(PipelineError):
-    def __init__(self) -> None:
-        super().__init__(
-            "pipeline_not_ready",
-            "The requested audio pipeline is not ready",
-        )
 
 
 @dataclass(frozen=True)
