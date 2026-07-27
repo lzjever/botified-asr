@@ -81,7 +81,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 | 普通转写 | `POST /v1/audio/transcriptions` |
 | 长音频转写 | 同一端点 + `Prefer: respond-async` |
 | VAD | OpenAI `chunking_strategy` |
-| 说话人分离 | `model=sensevoice-diarize` + `response_format=diarized_json` |
+| 说话人分离 | `model=sensevoice-diarize` + `chunking_strategy=auto` + `response_format=diarized_json` |
 | 已知人物 | `/v1/speakers` 注册，转写时提交 `known_speaker_ids[]` |
 | 情感/事件 | namespaced `include[]` |
 | API 鉴权 | Bearer Token |
@@ -180,7 +180,7 @@ Codex、OpenClaw 或 Botified Agent 安装同一份 Skill，通过稳定脚本�
 
 ### 6.1 鉴权
 
-除 `/health/live` 外，所有端点要求：
+发行运行时只注册产品 API 和 health 端点；`/health/live` 是唯一不要求鉴权的运行时端点，其余已注册端点均要求：
 
 ```http
 Authorization: Bearer <BOTIFIED_ASR_API_KEY>
@@ -190,6 +190,7 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 - 比较使用 constant-time 实现。
 - 不在日志、错误或 job 记录中保存 Authorization header。
 - 首版只有一个部署级 API Key，不增加用户或租户概念。
+- 发行运行时不注册 `/docs` 或 `/openapi.json`；OpenAPI JSON 在 release 构建时离线生成。
 
 ### 6.2 `POST /v1/audio/transcriptions`
 
@@ -210,7 +211,7 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 | `prompt` / 非零 `temperature` / `stream` | 依模型而定 | 不支持 |
 | 异步 job | 非本兼容承诺 | `Prefer: respond-async` 扩展 |
 | 已知人物参考 | 请求内 name + reference | 持久 speaker ID 扩展 |
-| diarization format | 依模型和格式组合 | 固定 alias + `diarized_json` |
+| diarization format | 依模型和格式组合 | 固定 alias + 显式 `auto` chunking + `diarized_json` |
 | 情感和事件 | 无 | namespaced `include[]` 扩展 |
 
 标准 SDK 只保证基础同步路径；扩展能力由本仓库 helper 或直接 HTTP 调用。
@@ -221,7 +222,7 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 multipart/form-data
 ```
 
-multipart parser 只接受一个 `file` part 和下表字段白名单；总 part 数最多 64、单 part header 最多 32 KiB、除 file 内容外的总 multipart overhead 最多 1 MiB。重复 scalar 字段、未知 part 和第二个 file 在进入模型前返回 `400 invalid_multipart`。
+multipart parser 只接受一个 `file` part 和下表字段白名单；总 part 数最多 64、单 part header 最多 32 KiB。multipart overhead 定义为整个 multipart body 的实际字节数减去唯一 `file` payload 的实际字节数，包含 boundary、part header 和所有非 file part payload，最多 1 MiB。重复 scalar 字段、未知 part 和第二个 file 在进入模型前返回 `400 invalid_multipart`。
 
 首版字段：
 
@@ -230,10 +231,15 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 | `file` | 是 | 音频或含音频的视频 |
 | `model` | 是 | `sensevoice` 或 `sensevoice-diarize` |
 | `language` | 否 | `auto`、`zh`、`en`、`yue`、`ja`、`ko` |
-| `response_format` | 否 | `json`、`text`、`verbose_json`、`diarized_json` |
-| `chunking_strategy` | 否 | 首版只接受缺省或 `auto` |
+| `response_format` | 条件 | `sensevoice` 可省略；`sensevoice-diarize` 必须显式提交 `diarized_json` |
+| `chunking_strategy` | 条件 | `sensevoice` 可省略；`sensevoice-diarize` 必须显式提交 `auto` |
 | `include[]` | 否 | `funasr.emotion`、`funasr.audio_events` |
 | `known_speaker_ids[]` | 否 | 本次允许匹配的已注册人物 |
+
+数组字段在 canonical request options 中使用稳定规则：
+
+- `include[]` 先逐项验证；合法重复值去重后按 `funasr.emotion`、`funasr.audio_events` 的固定枚举顺序保存。
+- `known_speaker_ids[]` 出现重复 ID 时返回 `400 invalid_known_speaker_ids`；全部 ID 验证存在且兼容后按 ID 排序，再用于 profile snapshot 和 request fingerprint。
 
 首版明确拒绝：
 
@@ -244,11 +250,12 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 - `srt`、`vtt`；
 - 任意未知 model；
 - 任意未知 namespaced include；
+- `sensevoice-diarize` 未显式提交 `chunking_strategy=auto`；
 - `sensevoice-diarize` 未使用 `diarized_json`；
 - `diarized_json` 未使用 `sensevoice-diarize`；
 - 已知人物参数与非 diarization model 组合。
 
-拒绝使用 OpenAI 风格 `400 invalid_request_error`，不得静默忽略。
+上述拒绝项使用 OpenAI 风格 `400 invalid_request_error`，不得静默忽略。
 
 ### 6.3 Model 行为
 
@@ -261,8 +268,8 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 
 #### `sensevoice-diarize`
 
-- 强制 `chunking_strategy=auto`。
-- 强制 `response_format=diarized_json`。
+- 客户端必须显式提交 `chunking_strategy=auto`；缺省或其他值均返回 `400`，服务不得自动补齐。
+- 客户端必须显式提交 `response_format=diarized_json`；缺省或其他值均返回 `400`，服务不得自动补齐。
 - 在 VAD segment 上提取 CAM++ embedding。
 - 使用同一套 speaker clustering 处理短音频和长会议。
 - 已知人物只在匿名 cluster 完成后命名。
@@ -462,11 +469,14 @@ limits:
 
 - 部署者可以收紧这些边界，安装器使用以上发布上限。
 - `max_upload_bytes` 不得高于 1 GiB，`max_audio_duration_secs` 不得高于 12 小时；服务启动时拒绝超过首版验证上限的配置。
-- 不能只依据 Content-Length；应用层按实际流入字节计数。
+- `max_upload_bytes` 只计算 transcription 请求中唯一 `file` part 的 payload 实际字节数；`file` payload 小于或等于上限时可接受。multipart overhead 另按 §6.2 的独立 1 MiB 上限计算。
+- 不能只依据 Content-Length；应用层按实际流入的 `file` payload 和 multipart overhead 分别累计计数，Content-Length 是否存在或其声明值不得改变下述公开错误优先级。
 - duration 在上传完成后由 `ffprobe` 获取并再次校验。
 - 没有 `chunking_strategy=auto` 的请求超过 `direct_max_audio_duration_secs` 时，无论 sync/async 都返回 `422 long_audio_requires_vad`。
-- 超过 sync 任一边界且未请求异步时返回 `422 async_required`。
-- 校验顺序固定为：实际上传硬上限、媒体可解码、总时长硬上限、VAD 要求、async 要求；一次响应只返回首个错误。
+- 带 `Prefer: respond-async` 时，累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`。
+- 未带 `Prefer: respond-async` 且 `sync_max_upload_bytes < max_upload_bytes` 时，累计收到第 `sync_max_upload_bytes + 1` 个 `file` payload 字节便立即停止接收，稳定返回 `422 async_required` 并幂等清理 upload lease、reservation 和 staging 文件；不得继续接收以推测最终是否超过硬上限。
+- 未带 `Prefer: respond-async` 且 `sync_max_upload_bytes == max_upload_bytes` 时，累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`，不得返回 `422`。
+- 完成上传后的校验顺序固定为：媒体可解码、总时长硬上限、VAD 要求、基于 sync 时长边界的 async 要求；流式接收期间已按上述累计 byte 规则处理 byte 上限。一次响应只返回首个错误。
 
 ### 7.2 异步提交
 
@@ -796,7 +806,9 @@ DELETE /v1/speakers/{speaker_id}
 - 客户端必须显式提交 `known_speaker_ids[]`。
 - 不提交时不扫描全库。
 - 单请求最多 32 个已知人物。
+- 重复 ID 按 §6.2 返回 `400`；全部 ID 验证存在且与当前 embedding policy 兼容后按 ID 排序。
 - sync 请求在进入 processor 前、async 请求在 job 创建事务中 snapshot profile ID、name 和 embedding，避免运行中更新造成同一会议前后不一致。
+- 排序后的 ID 和对应 profile snapshot 用于 canonical request options、job-private profile snapshot hash 和 request fingerprint。
 - snapshot 只存储在 job 私有数据中，job 清理时一并删除。
 
 ### 9.5 匹配规则
@@ -898,7 +910,11 @@ limits:
 - CLI 仅接受 `--config` 定位文件，不为每个字段再增加 CLI/env alias。
 - `~` 在配置加载时由应用统一展开。
 - 未知字段 fail fast。
-- limit 必须做上下界和交叉校验，且只能收紧 §7.1 的 1 GiB / 12 小时发布上限。
+- `limits` 下所有值均为正整数；`runtime.max_speakers` 是 `1..32` 的整数。
+- duration 必须满足 `direct_max_audio_duration_secs <= sync_max_audio_duration_secs <= max_audio_duration_secs <= 43200`。
+- upload bytes 必须满足 `sync_max_upload_bytes <= max_upload_bytes <= 1073741824`。
+- storage 必须满足 `max_job_storage_bytes >= ceil(max_upload_bytes / 8388608) * 8388608`，即将 `max_upload_bytes` 向上取整到 8 MiB reservation 量子的整数倍。
+- 上一条只保证没有其他 reservation 且 filesystem free-space floor 满足时，单个最大 transcription 输入可获得 staging reservation；不保证并发上传或后续 intermediate、attempt、complete、terminal artifact 的空间，后者仍在每次写盘前执行 §11.3 的 SQLite 原子 reservation 和 free-space admission。
 
 ### 10.2 Secret
 
@@ -908,10 +924,11 @@ limits:
 BOTIFIED_ASR_API_KEY
 ```
 
-- 服务只从 mode `0600` 的 `${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/service.env` 读取该变量。
+- 应用只读取进程环境中的 `BOTIFIED_ASR_API_KEY`，不定位、打开或解析 `service.env`。
+- installer 创建 mode `0600` 的 `${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/service.env`，systemd/container launcher 从该文件向服务进程注入唯一同名环境变量。
 - YAML 不支持明文 `api_key` 字段。
 - 无论监听地址是什么，缺少或空 secret 都拒绝启动。
-- 本地开发显式使用测试 token，不提供隐式 no-auth。
+- 本地开发在进程环境中显式设置测试 token，不提供隐式 no-auth。
 
 ### 10.3 唯一客户端连接配置
 
@@ -930,7 +947,7 @@ BOTIFIED_ASR_API_KEY=<secret>
 
 规则：
 
-- fresh 本机 `install-asr.sh` 创建 `service.env` 和该客户端文件，初始 key 相同；已有 `client.env` 时只创建/保留服务 secret，不改 active target。systemd 只读 `service.env`，Skill helper 只读 `client.env`。
+- fresh 本机 `install-asr.sh` 创建 `service.env` 和该客户端文件，初始 key 相同；已有 `client.env` 时只创建/保留服务 secret，不改 active target。systemd 从 `service.env` 注入服务进程环境，Skill helper 只读 `client.env`。
 - 连接远程现有服务时，`install-asr-skill.sh` 接受显式 `BOTIFIED_ASR_BASE_URL` 和 `BOTIFIED_ASR_API_KEY`，并写入相同路径。
 - 已存在 `client.env` 且安装命令未提供连接参数时保持现有 active target；同时显式提供远程 URL/Key 时先验证格式再原子切换。
 - URL 与 Key 必须成对提供，拒绝半更新；任何 active target 切换都不得读取或修改 `service.env`。
@@ -1057,8 +1074,9 @@ botified-asr/
 - CPU OCI image；
 - 通过真实 runner 验证时构建 CUDA OCI image；
 - `botified-asr-skill.tar.gz`；
+- `botified-asr-smoke.flac` 固定短转写音频；
 - 版本和 image digest manifest；
-- OpenAPI JSON；
+- 离线生成的 OpenAPI JSON；
 - release smoke 结果。
 
 `botified-releases` 公开：
@@ -1067,6 +1085,7 @@ botified-asr/
 install-asr.sh
 install-asr-skill.sh
 botified-asr-skill.tar.gz
+botified-asr-smoke.flac
 botified-asr-release.json
 SHA256SUMS
 ```
@@ -1111,8 +1130,8 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - `device=auto` 只有在当前 manifest 含本平台 CUDA digest且 runtime 校验通过时选择 CUDA；否则确定性使用 CPU，不临时拼装未发布 GPU 路径。
 - unit 位于 `~/.config/systemd/user/botified-asr.service`，通过 `systemctl --user enable --now` 管理。
 - installer 检测 user manager 和 linger；无 user systemd 时仅生成 `~/.local/bin/botified-asr-service` wrapper，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
-- `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer 和固定 smoke 音频；manifest 在校验 checksum 后才解析。
-- manifest 为每个受支持平台给出 image digest、模型 ID/revision、runtime 要求和 artifact checksum。
+- `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer 和 `botified-asr-smoke.flac`；manifest 在校验 checksum 后才解析。
+- manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
 - Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
 - checksum harness 向现有 `botified-releases/tests/installers.sh` 注入损坏 manifest/tarball，并断言拉 image、写 systemd 或替换当前安装前已失败；不另建 installer framework。
 - 唯一卸载入口为已安装的 `botified-asr-uninstall [--purge]`。
@@ -1252,6 +1271,7 @@ speaker-delete
 - `/health/live`、`/health/ready`；
 - OpenAI error envelope；
 - bounded multipart upload；
+- transcription sync/async 与 speaker enrollment 共用的 SQLite upload lease、原子 storage reservation、受控 staging 和 receiving cleanup 最小底座；
 - `/v1/models`。
 
 完成条件：
@@ -1259,6 +1279,7 @@ speaker-delete
 - 无模型时契约测试可运行；
 - 模型未 ready 时不会接收转写；
 - 1 GiB 之外的流式上传在应用层有界拒绝。
+- 上传拒绝、断连或启动恢复后，Phase 1 共用底座不会遗留 staging 文件或 reservation。
 
 ### Phase 2：Canonical 音频 pipeline
 
@@ -1306,7 +1327,7 @@ speaker-delete
 - executor、progress、cancel/delete；
 - crash recovery；
 - bounded batch yielding；
-- retention 和 storage admission。
+- 在 Phase 1 共用上传底座上扩展完整 job artifact accounting、retention 和 job admission。
 
 完成条件：
 
@@ -1488,13 +1509,13 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 - 上传文件名不进入文件系统路径。
 - ffmpeg 使用无 shell argv。
 - SQLite、credential、job 和 speaker 数据目录权限最小化。
-- OCI container 使用非 root user、read-only rootfs，不使用 host network，只发布配置的 loopback 端口；仅挂载受控 data、revision-isolated model cache 和只读配置/credential。
+- OCI container 使用非 root user、read-only rootfs，不使用 host network，只发布配置的 loopback 端口；仅挂载受控 data、revision-isolated model cache 和只读配置，服务 secret 由 launcher 注入进程环境。
 - 原始音频和人物样本不进入日志、错误、metrics 或 crash report。
 - API 不返回 embedding。
 - 删除 profile 只立即删除主记录；已入队 job 的私有 embedding snapshot 保留到该 job 删除或 retention 清理，这是可恢复命名语义所需的最短生命周期。
 - Skill 不将 token 放入命令历史示例。
 - description 是不可信文本，只作为 metadata，不进入 prompt 或模型。
-- `/docs` 和 `/openapi.json` 是否公开由 listen 边界决定，不泄漏 speaker 数据。
+- 发行运行时始终不注册 `/docs` 和 `/openapi.json`；release 离线 OpenAPI artifact 不包含 speaker 数据或其他实例数据。
 
 ## 20. 明确非目标
 
