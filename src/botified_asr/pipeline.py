@@ -22,6 +22,7 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError, PipelineNotReady
+from botified_asr.speakers import is_anonymous_speaker_label
 
 DIRECT_MAX_SAMPLES = 480_000
 ASR_BATCH_MAX_SEGMENTS = 32
@@ -108,6 +109,7 @@ class SegmentRecord:
     text: str
     language: str | None
     annotations: RichAnnotations
+    anonymous_speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -720,6 +722,11 @@ class CanonicalJsonlSegmentSink:
             )
         ):
             raise TypeError("rich annotation values must be strings or None")
+        if record.anonymous_speaker is not None:
+            if type(record.anonymous_speaker) is not str:
+                raise TypeError("anonymous speaker must be a string or None")
+            if not is_anonymous_speaker_label(record.anonymous_speaker):
+                raise ValueError("anonymous speaker label is invalid")
         payload = serialize_canonical_record(record)
         if len(payload) > CANONICAL_JSONL_MAX_RECORD_BYTES:
             raise ValueError("canonical result record exceeds byte limit")

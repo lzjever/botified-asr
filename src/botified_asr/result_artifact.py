@@ -18,9 +18,11 @@ from botified_asr.pipeline import (
     iter_canonical_join,
     serialize_canonical_record,
 )
+from botified_asr.speakers import is_anonymous_speaker_label
 
 _TOP_LEVEL_KEYS = {
     "annotations",
+    "anonymous_speaker",
     "end_sample",
     "index",
     "language",
@@ -45,6 +47,7 @@ class CanonicalArtifactError(ValueError):
 class CanonicalSummary:
     record_count: int
     nonempty_record_count: int
+    labeled_record_count: int
     last_end_sample: int
     first_nonempty_language: str | None
 
@@ -123,12 +126,15 @@ class CanonicalJsonlReader:
     def scan(self) -> CanonicalSummary:
         record_count = 0
         nonempty_record_count = 0
+        labeled_record_count = 0
         last_end_sample = 0
         first_nonempty_language: str | None = None
         saw_nonempty = False
         for record in self.iter_records():
             record_count += 1
             last_end_sample = record.end_sample
+            if record.anonymous_speaker is not None:
+                labeled_record_count += 1
             if record.text.strip():
                 nonempty_record_count += 1
                 if not saw_nonempty:
@@ -137,6 +143,7 @@ class CanonicalJsonlReader:
         return CanonicalSummary(
             record_count=record_count,
             nonempty_record_count=nonempty_record_count,
+            labeled_record_count=labeled_record_count,
             last_end_sample=last_end_sample,
             first_nonempty_language=first_nonempty_language,
         )
@@ -169,6 +176,7 @@ def _decode_record(
     end_sample = value["end_sample"]
     record_text = value["text"]
     language = value["language"]
+    anonymous_speaker = value["anonymous_speaker"]
     emotion = annotations["emotion"]
     audio_event = annotations["audio_event"]
     if any(type(item) is not int for item in (index, start_sample, end_sample)):
@@ -183,8 +191,14 @@ def _decode_record(
         and type(emotion) is not str
         or audio_event is not None
         and type(audio_event) is not str
+        or anonymous_speaker is not None
+        and type(anonymous_speaker) is not str
     ):
         raise CanonicalArtifactError("result artifact values have invalid types")
+    if anonymous_speaker is not None and not is_anonymous_speaker_label(
+        anonymous_speaker
+    ):
+        raise CanonicalArtifactError("result artifact speaker label is invalid")
     if index != expected_index:
         raise CanonicalArtifactError("result artifact indices are not contiguous")
     if (
@@ -204,6 +218,7 @@ def _decode_record(
             emotion=emotion,
             audio_event=audio_event,
         ),
+        anonymous_speaker=anonymous_speaker,
     )
     try:
         canonical_payload = serialize_canonical_record(record)
@@ -234,8 +249,18 @@ class ResultProjector:
             "json",
             "text",
             "verbose_json",
+            "diarized_json",
         }:
             raise ValueError("unsupported response format")
+        if options.response_format == "diarized_json":
+            if summary.labeled_record_count != summary.record_count:
+                raise CanonicalArtifactError(
+                    "diarized result artifact contains an unlabeled record"
+                )
+        elif summary.labeled_record_count != 0:
+            raise CanonicalArtifactError(
+                "non-diarized result artifact contains a labeled record"
+            )
         rich_fields = _rich_fields(options.include)
         if options.response_format == "text":
             if rich_fields:
@@ -248,6 +273,15 @@ class ResultProjector:
             return Projection(
                 content_type="application/json",
                 body_factory=lambda: _iter_json_body(reader, rich_fields),
+            )
+        if options.response_format == "diarized_json":
+            return Projection(
+                content_type="application/json",
+                body_factory=lambda: _iter_diarized_body(
+                    reader,
+                    rich_fields,
+                    total_samples=total_samples,
+                ),
             )
         language = (
             options.language
@@ -340,6 +374,48 @@ def _iter_verbose_body(
                 "id": str(record.index),
                 "start": record.start_sample / SAMPLE_RATE,
                 "end": record.end_sample / SAMPLE_RATE,
+                "text": text,
+            }
+        )
+    yield b"]"
+    if rich_fields:
+        yield b',"funasr":'
+        yield from _iter_rich(reader, rich_fields)
+    yield b"}"
+
+
+def _iter_diarized_body(
+    reader: CanonicalJsonlReader,
+    rich_fields: tuple[tuple[str, str], ...],
+    *,
+    total_samples: int,
+) -> Iterator[bytes]:
+    duration: int | float = 0 if total_samples == 0 else total_samples / SAMPLE_RATE
+    yield b'{"task":"transcribe","duration":'
+    yield _json_scalar(duration)
+    yield b',"text":"'
+    for chunk in _iter_joined_text(reader):
+        yield _json_string_fragment(chunk)
+    yield b'","segments":['
+    first = True
+    for record in reader.iter_records():
+        text = record.text.strip()
+        if not text:
+            continue
+        if record.anonymous_speaker is None:
+            raise CanonicalArtifactError(
+                "diarized result artifact contains an unlabeled record"
+            )
+        if not first:
+            yield b","
+        first = False
+        yield _json_scalar(
+            {
+                "id": str(record.index),
+                "type": "transcript.text.segment",
+                "start": record.start_sample / SAMPLE_RATE,
+                "end": record.end_sample / SAMPLE_RATE,
+                "speaker": record.anonymous_speaker,
                 "text": text,
             }
         )

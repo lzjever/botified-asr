@@ -60,11 +60,12 @@ def _options(
     language: str = "auto",
     include: tuple[str, ...] = (),
 ) -> CanonicalOptions:
+    diarized = response_format == "diarized_json"
     return CanonicalOptions(
-        model="sensevoice",
+        model="sensevoice-diarize" if diarized else "sensevoice",
         language=language,
         response_format=response_format,
-        chunking_strategy=None,
+        chunking_strategy="auto" if diarized else None,
         include=include,
         known_speaker_ids=(),
     )
@@ -79,12 +80,14 @@ def _mapping(
     language: object = "en",
     emotion: object = None,
     audio_event: object = None,
+    anonymous_speaker: object = None,
 ) -> dict[str, object]:
     return {
         "annotations": {
             "audio_event": audio_event,
             "emotion": emotion,
         },
+        "anonymous_speaker": anonymous_speaker,
         "end_sample": end_sample,
         "index": index,
         "language": language,
@@ -169,6 +172,7 @@ def test_corruption_cap_lf_and_writer_multibyte_cap_are_fail_closed(
     )
     unknown = canonical.replace(b'"text":"ok"', b'"text":"ok","unknown":1')
     missing = canonical.replace(b',"text":"ok"', b"")
+    missing_speaker = canonical.replace(b',"anonymous_speaker":null', b"")
     corruptions = (
         b"\n",
         canonical + b"\n",
@@ -185,6 +189,7 @@ def test_corruption_cap_lf_and_writer_multibyte_cap_are_fail_closed(
         duplicate_nested,
         unknown,
         missing,
+        missing_speaker,
         canonical.replace(
             b'"emotion":null',
             b'"emotion":null,"unknown":null',
@@ -196,7 +201,8 @@ def test_corruption_cap_lf_and_writer_multibyte_cap_are_fail_closed(
         b"x" * (CANONICAL_JSONL_MAX_RECORD_BYTES + 1) + b"\n",
         (
             b'{"annotations":{"audio_event":null,"emotion":null},'
-            + b'"end_sample":1,"index":0,"language":"en","start_sample":0,"text":"'
+            + b'"anonymous_speaker":null,"end_sample":1,"index":0,'
+            + b'"language":"en","start_sample":0,"text":"'
             + ("界" * (CANONICAL_JSONL_MAX_RECORD_BYTES // 3)).encode()
             + b'"}\n'
         ),
@@ -265,6 +271,10 @@ def test_corruption_cap_lf_and_writer_multibyte_cap_are_fail_closed(
         _jsonl(_mapping(language=False)),
         _jsonl(_mapping(emotion=True)),
         _jsonl(_mapping(audio_event=1)),
+        _jsonl(_mapping(anonymous_speaker=True)),
+        _jsonl(_mapping(anonymous_speaker=1)),
+        _jsonl(_mapping(anonymous_speaker="Unknown A")),
+        _jsonl(_mapping(anonymous_speaker="AG")),
         _jsonl(_mapping(index=1)),
         _jsonl(_mapping(start_sample=-1)),
         _jsonl(_mapping(end_sample=0)),
@@ -292,6 +302,36 @@ def test_read_side_rejects_strict_types_indices_bounds_and_overlap(
             ).iter_records()
         )
     assert caught.value.code == "invalid_result_artifact"
+
+
+@pytest.mark.parametrize("anonymous_speaker", [None, "A", "Z", "AA", "AF"])
+def test_canonical_speaker_field_round_trips_exactly(
+    anonymous_speaker: str | None,
+    tmp_path: Path,
+) -> None:
+    from botified_asr.pipeline import serialize_canonical_record
+    from botified_asr.result_artifact import CanonicalJsonlReader
+
+    payload = _jsonl(_mapping(anonymous_speaker=anonymous_speaker))
+    records = list(
+        CanonicalJsonlReader(
+            tmp_path / "artifact.jsonl",
+            opener=FreshOpener(payload),
+        ).iter_records()
+    )
+
+    assert records == [
+        SegmentRecord(
+            0,
+            0,
+            1,
+            "ok",
+            "en",
+            RichAnnotations(),
+            anonymous_speaker=anonymous_speaker,
+        )
+    ]
+    assert serialize_canonical_record(records[0]) + b"\n" == payload
 
 
 def test_three_projections_share_reader_sample_clock_and_streaming_join(
@@ -377,6 +417,11 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
     assert b'\\"' in json_body
     assert b"\\n" in json_body
     assert b"\\\\" in json_body
+    assert json_body == (
+        b'{"text":"\xe4\xbd\xa0\\"\\n\\\\ hello","funasr":'
+        b'{"emotion":[{"label":"happy","start":0.0,"end":0.5}],'
+        b'"audio_events":[{"label":"speech","start":1.5,"end":2.0}]}}'
+    )
 
     verbose_projection = projector.prepare(
         reader,
@@ -426,9 +471,77 @@ def test_three_projections_share_reader_sample_clock_and_streaming_join(
     assert all(
         "funasr" not in segment for segment in json.loads(verbose_body)["segments"]
     )
+    assert verbose_body == (
+        b'{"task":"transcribe","language":"zh","duration":3.0,'
+        b'"text":"\xe4\xbd\xa0\\"\\n\\\\ hello","segments":['
+        b'{"id":"0","start":0.0,"end":0.5,"text":"\xe4\xbd\xa0\\"\\n\\\\"},'
+        b'{"id":"2","start":1.5,"end":2.0,"text":"hello"}],'
+        b'"funasr":{"emotion":[{"label":"happy","start":0.0,"end":0.5}],'
+        b'"audio_events":[{"label":"speech","start":1.5,"end":2.0}]}}'
+    )
     assert all(
         set(stream.readline_sizes) == {1_048_576 + 2} for stream in opener.streams
     )
+
+
+def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    reader = CanonicalJsonlReader(
+        tmp_path / "diarized.jsonl",
+        opener=FreshOpener(
+            _jsonl(
+                _mapping(
+                    index=0,
+                    start_sample=0,
+                    end_sample=8_000,
+                    text=" 你 ",
+                    language="zh",
+                    emotion="happy",
+                    anonymous_speaker="A",
+                ),
+                _mapping(
+                    index=1,
+                    start_sample=16_000,
+                    end_sample=32_000,
+                    text="hello",
+                    language="en",
+                    audio_event="speech",
+                    anonymous_speaker="AA",
+                ),
+            )
+        ),
+    )
+
+    projection = ResultProjector().prepare(
+        reader,
+        _options(
+            "diarized_json",
+            include=("funasr.emotion", "funasr.audio_events"),
+        ),
+        total_samples=48_000,
+    )
+    _, body = _body(projection)
+
+    assert projection.content_type == "application/json"
+    assert body == (
+        b'{"task":"transcribe","duration":3.0,"text":"\xe4\xbd\xa0hello",'
+        b'"segments":[{"id":"0","type":"transcript.text.segment",'
+        b'"start":0.0,"end":0.5,"speaker":"A","text":"\xe4\xbd\xa0"},'
+        b'{"id":"1","type":"transcript.text.segment","start":1.0,'
+        b'"end":2.0,"speaker":"AA","text":"hello"}],'
+        b'"funasr":{"emotion":[{"label":"happy","start":0.0,"end":0.5}],'
+        b'"audio_events":[{"label":"speech","start":1.0,"end":2.0}]}}'
+    )
+    decoded = json.loads(body)
+    assert "language" not in decoded
+    assert "embedding" not in decoded
+    assert all("funasr" not in segment for segment in decoded["segments"])
 
 
 def test_empty_projection_language_duration_and_requested_rich_shape(
@@ -467,6 +580,16 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
         b'{"task":"transcribe","language":"unknown","duration":0,'
         b'"text":"","segments":[],"funasr":{"audio_events":[]}}'
     )
+    _, diarized_empty = _body(
+        projector.prepare(
+            reader,
+            _options("diarized_json"),
+            total_samples=0,
+        )
+    )
+    assert (
+        diarized_empty == b'{"task":"transcribe","duration":0,"text":"","segments":[]}'
+    )
     _, verbose_explicit = _body(
         projector.prepare(
             reader,
@@ -499,6 +622,71 @@ def test_empty_projection_language_duration_and_requested_rich_shape(
         )
     )
     assert json.loads(verbose_unknown)["language"] == "unknown"
+
+
+@pytest.mark.parametrize("response_format", ["json", "text", "verbose_json"])
+def test_normal_projection_rejects_any_labeled_artifact_before_return(
+    response_format: str,
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalArtifactError,
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    opener = FreshOpener(
+        _jsonl(
+            _mapping(index=0, end_sample=10),
+            _mapping(
+                index=1,
+                start_sample=10,
+                end_sample=20,
+                anonymous_speaker="A",
+            ),
+        )
+    )
+    reader = CanonicalJsonlReader(tmp_path / "labeled.jsonl", opener=opener)
+
+    with pytest.raises(CanonicalArtifactError) as caught:
+        ResultProjector().prepare(
+            reader,
+            _options(response_format),
+            total_samples=20,
+        )
+
+    assert caught.value.code == "invalid_result_artifact"
+    assert len(opener.streams) == 1
+    assert len(opener.streams[0].readline_sizes) >= 2
+
+
+def test_diarized_projection_rejects_any_unlabeled_record_before_return(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalArtifactError,
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+
+    opener = FreshOpener(
+        _jsonl(
+            _mapping(index=0, end_sample=10, anonymous_speaker="A"),
+            _mapping(index=1, start_sample=10, end_sample=20),
+        )
+    )
+    reader = CanonicalJsonlReader(tmp_path / "unlabeled.jsonl", opener=opener)
+
+    with pytest.raises(CanonicalArtifactError) as caught:
+        ResultProjector().prepare(
+            reader,
+            _options("diarized_json"),
+            total_samples=20,
+        )
+
+    assert caught.value.code == "invalid_result_artifact"
+    assert len(opener.streams) == 1
+    assert len(opener.streams[0].readline_sizes) >= 2
 
 
 def test_prepare_fully_scans_before_return_and_rejects_corrupt_or_bad_total(
@@ -535,10 +723,3 @@ def test_prepare_fully_scans_before_return_and_rejects_corrupt_or_bad_total(
                 total_samples=total_samples,  # type: ignore[arg-type]
             )
         assert caught.value.code == "invalid_result_artifact"
-
-    with pytest.raises(ValueError, match="response format"):
-        ResultProjector().prepare(
-            valid_reader,
-            _options("diarized_json"),
-            total_samples=10,
-        )

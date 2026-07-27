@@ -11,6 +11,15 @@ from botified_asr.errors import PipelineError
 SPEAKER_EMBEDDING_DIMENSION = 192
 SPEAKER_WINDOW_MAX_SAMPLES = 24_000
 SPEAKER_EMBEDDING_NORM_TOLERANCE = 1e-5
+ANONYMOUS_SPEAKER_LABELS = tuple(chr(ord("A") + ordinal) for ordinal in range(26)) + (
+    "AA",
+    "AB",
+    "AC",
+    "AD",
+    "AE",
+    "AF",
+)
+_ANONYMOUS_SPEAKER_LABEL_SET = frozenset(ANONYMOUS_SPEAKER_LABELS)
 
 
 @dataclass(frozen=True)
@@ -196,12 +205,11 @@ def _assign_window(
 
 
 def _speaker_label(ordinal: int) -> str:
-    value = ordinal + 1
-    parts: list[str] = []
-    while value:
-        value, remainder = divmod(value - 1, 26)
-        parts.append(chr(ord("A") + remainder))
-    return "".join(reversed(parts))
+    return ANONYMOUS_SPEAKER_LABELS[ordinal]
+
+
+def is_anonymous_speaker_label(value: object) -> bool:
+    return type(value) is str and value in _ANONYMOUS_SPEAKER_LABEL_SET
 
 
 def _raise_invalid_output() -> None:

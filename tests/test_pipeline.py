@@ -438,7 +438,7 @@ def test_canonical_jsonl_sink_is_canonical_ordered_and_returns_opaque_ref() -> N
     assert writer.payloads == [
         (
             '{"annotations":{"audio_event":null,"emotion":"喜悦"},'
-            '"end_sample":16000,"index":0,"language":"zh",'
+            '"anonymous_speaker":null,"end_sample":16000,"index":0,"language":"zh",'
             '"start_sample":0,"text":"line\\n\\"二\\""}\n'
         ).encode()
     ]
@@ -495,6 +495,20 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
                     "invalid annotation",
                     "en",
                     invalid_annotations,
+                )
+            )
+    assert len(writer.payloads) == payload_count
+    for invalid_speaker in (True, 1, "Unknown A", "AG"):
+        with pytest.raises((TypeError, ValueError)):
+            sink.append(
+                SegmentRecord(
+                    1,
+                    20,
+                    30,
+                    "invalid speaker",
+                    "en",
+                    RichAnnotations(),
+                    anonymous_speaker=invalid_speaker,  # type: ignore[arg-type]
                 )
             )
     assert len(writer.payloads) == payload_count
