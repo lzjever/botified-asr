@@ -39,7 +39,7 @@ from botified_asr.speaker_profiles import (
     SpeakerProfileUpdate,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_SPEAKER_PROFILES = 256
 LEASE_ID_PATTERN = re.compile(
     r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})$"
@@ -61,6 +61,7 @@ _SPEAKER_PROFILE_COLUMNS = """
 _TRANSCRIPTION_JOB_COLUMNS = """
     id, phase, status, input_lease_id, canonical_options_json,
     selected_speaker_snapshot, snapshot_sha256, input_size_bytes,
+    effective_max_audio_samples, effective_direct_max_audio_samples,
     total_samples, processed_samples, request_fingerprint,
     processor_fingerprint, attempt_no, attempt_token, owner_generation,
     crash_recoveries, cancel_requested, result_lease_id, error_code,
@@ -152,6 +153,75 @@ _V4_SHUTDOWN_MARKER_DDL = """CREATE TABLE shutdown_marker (
                 generation TEXT NOT NULL CHECK (length(generation) > 0),
                 created_at TEXT NOT NULL
             )"""
+_V5_TRANSCRIPTION_JOBS_DDL = _V4_TRANSCRIPTION_JOBS_DDL.replace(
+    """                input_size_bytes INTEGER,
+                total_samples INTEGER,""",
+    """                input_size_bytes INTEGER,
+                effective_max_audio_samples INTEGER,
+                effective_direct_max_audio_samples INTEGER,
+                total_samples INTEGER,""",
+).replace(
+    """                CHECK (input_size_bytes IS NULL OR input_size_bytes >= 0),
+                CHECK (total_samples IS NULL OR total_samples >= 0),""",
+    """                CHECK (input_size_bytes IS NULL OR input_size_bytes >= 0),
+                CHECK (
+                    effective_max_audio_samples IS NULL
+                    OR effective_max_audio_samples BETWEEN 1 AND 691200000
+                ),
+                CHECK (
+                    effective_direct_max_audio_samples IS NULL
+                    OR effective_direct_max_audio_samples BETWEEN 1 AND 480000
+                ),
+                CHECK (
+                    (
+                        effective_max_audio_samples IS NULL
+                        AND effective_direct_max_audio_samples IS NULL
+                    )
+                    OR (
+                        effective_max_audio_samples IS NOT NULL
+                        AND effective_direct_max_audio_samples IS NOT NULL
+                        AND effective_direct_max_audio_samples
+                            <= effective_max_audio_samples
+                    )
+                ),
+                CHECK (total_samples IS NULL OR total_samples >= 0),""",
+)
+_V4_TRANSCRIPTION_JOB_COLUMNS = (
+    ("id", "TEXT", 1, None, 1),
+    ("phase", "TEXT", 1, None, 0),
+    ("status", "TEXT", 0, None, 0),
+    ("input_lease_id", "TEXT", 0, None, 0),
+    ("canonical_options_json", "TEXT", 0, None, 0),
+    ("selected_speaker_snapshot", "BLOB", 0, None, 0),
+    ("snapshot_sha256", "TEXT", 0, None, 0),
+    ("input_size_bytes", "INTEGER", 0, None, 0),
+    ("total_samples", "INTEGER", 0, None, 0),
+    ("processed_samples", "INTEGER", 1, None, 0),
+    ("request_fingerprint", "TEXT", 0, None, 0),
+    ("processor_fingerprint", "TEXT", 0, None, 0),
+    ("attempt_no", "INTEGER", 1, None, 0),
+    ("attempt_token", "TEXT", 0, None, 0),
+    ("owner_generation", "TEXT", 0, None, 0),
+    ("crash_recoveries", "INTEGER", 1, None, 0),
+    ("cancel_requested", "INTEGER", 1, None, 0),
+    ("result_lease_id", "TEXT", 0, None, 0),
+    ("error_code", "TEXT", 0, None, 0),
+    ("input_cleanup_pending", "INTEGER", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("started_at", "TEXT", 0, None, 0),
+    ("finished_at", "TEXT", 0, None, 0),
+)
+_V5_TRANSCRIPTION_JOB_COLUMNS = (
+    *_V4_TRANSCRIPTION_JOB_COLUMNS[:8],
+    ("effective_max_audio_samples", "INTEGER", 0, None, 0),
+    ("effective_direct_max_audio_samples", "INTEGER", 0, None, 0),
+    *_V4_TRANSCRIPTION_JOB_COLUMNS[8:],
+)
+_SHUTDOWN_MARKER_COLUMNS = (
+    ("singleton", "INTEGER", 0, None, 1),
+    ("generation", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+)
 
 
 class StorageSchemaError(RuntimeError):
@@ -387,7 +457,7 @@ class Storage:
                 )
                 self._create_v2_ledger()
                 self._create_v3_speaker_profiles()
-                self._create_v4_job_foundation()
+                self._create_v5_job_foundation()
                 self._connection.execute(
                     "INSERT INTO schema_meta(singleton, version) VALUES (1, ?)",
                     (SCHEMA_VERSION,),
@@ -402,7 +472,7 @@ class Storage:
             raise StorageSchemaError("storage schema version is missing")
         version = int(row["version"])
         if version == SCHEMA_VERSION:
-            self._verify_v4_schema()
+            self._verify_v5_schema()
             return
         if version == 1:
             self._migrate_v1_to_v2()
@@ -412,6 +482,9 @@ class Storage:
             version = 3
         if version == 3:
             self._migrate_v3_to_v4()
+            version = 4
+        if version == 4:
+            self._migrate_v4_to_v5()
             return
         raise StorageSchemaError(
             f"unsupported storage schema version: {version}"
@@ -723,38 +796,44 @@ class Storage:
         )
         self._connection.execute(_V4_SHUTDOWN_MARKER_DDL)
 
+    def _create_v5_job_foundation(self) -> None:
+        self._connection.execute(_V5_TRANSCRIPTION_JOBS_DDL)
+        self._connection.execute(
+            """
+            CREATE INDEX transcription_jobs_fifo_idx
+            ON transcription_jobs(phase, status, created_at, id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX transcription_jobs_retention_idx
+            ON transcription_jobs(phase, status, finished_at, id)
+            """
+        )
+        self._connection.execute(_V4_SHUTDOWN_MARKER_DDL)
+
     def _verify_v4_schema(self) -> None:
+        self._verify_job_foundation_schema(
+            version=4,
+            expected_job_ddl=_V4_TRANSCRIPTION_JOBS_DDL,
+            expected_job_columns=_V4_TRANSCRIPTION_JOB_COLUMNS,
+        )
+
+    def _verify_v5_schema(self) -> None:
+        self._verify_job_foundation_schema(
+            version=5,
+            expected_job_ddl=_V5_TRANSCRIPTION_JOBS_DDL,
+            expected_job_columns=_V5_TRANSCRIPTION_JOB_COLUMNS,
+        )
+
+    def _verify_job_foundation_schema(
+        self,
+        *,
+        version: int,
+        expected_job_ddl: str,
+        expected_job_columns: tuple[tuple[object, ...], ...],
+    ) -> None:
         self._verify_v3_schema()
-        expected_job_columns = (
-            ("id", "TEXT", 1, None, 1),
-            ("phase", "TEXT", 1, None, 0),
-            ("status", "TEXT", 0, None, 0),
-            ("input_lease_id", "TEXT", 0, None, 0),
-            ("canonical_options_json", "TEXT", 0, None, 0),
-            ("selected_speaker_snapshot", "BLOB", 0, None, 0),
-            ("snapshot_sha256", "TEXT", 0, None, 0),
-            ("input_size_bytes", "INTEGER", 0, None, 0),
-            ("total_samples", "INTEGER", 0, None, 0),
-            ("processed_samples", "INTEGER", 1, None, 0),
-            ("request_fingerprint", "TEXT", 0, None, 0),
-            ("processor_fingerprint", "TEXT", 0, None, 0),
-            ("attempt_no", "INTEGER", 1, None, 0),
-            ("attempt_token", "TEXT", 0, None, 0),
-            ("owner_generation", "TEXT", 0, None, 0),
-            ("crash_recoveries", "INTEGER", 1, None, 0),
-            ("cancel_requested", "INTEGER", 1, None, 0),
-            ("result_lease_id", "TEXT", 0, None, 0),
-            ("error_code", "TEXT", 0, None, 0),
-            ("input_cleanup_pending", "INTEGER", 1, None, 0),
-            ("created_at", "TEXT", 1, None, 0),
-            ("started_at", "TEXT", 0, None, 0),
-            ("finished_at", "TEXT", 0, None, 0),
-        )
-        expected_marker_columns = (
-            ("singleton", "INTEGER", 0, None, 1),
-            ("generation", "TEXT", 1, None, 0),
-            ("created_at", "TEXT", 1, None, 0),
-        )
         with self._lock:
             job_exists = self._connection.execute(
                 """
@@ -778,27 +857,31 @@ class Storage:
             }
         if job_exists is None:
             raise StorageSchemaError(
-                "storage schema v4 transcription job table is missing"
+                f"storage schema v{version} transcription job table is missing"
             )
-        if job_exists["sql"] != _V4_TRANSCRIPTION_JOBS_DDL:
+        if job_exists["sql"] != expected_job_ddl:
             raise StorageSchemaError(
-                "storage schema v4 transcription job table has unexpected definition"
+                f"storage schema v{version} transcription job table "
+                "has unexpected definition"
             )
         if job_columns != expected_job_columns:
             raise StorageSchemaError(
-                "storage schema v4 transcription job table has unexpected columns"
+                f"storage schema v{version} transcription job table "
+                "has unexpected columns"
             )
         if marker_exists is None:
             raise StorageSchemaError(
-                "storage schema v4 shutdown marker table is missing"
+                f"storage schema v{version} shutdown marker table is missing"
             )
         if marker_exists["sql"] != _V4_SHUTDOWN_MARKER_DDL:
             raise StorageSchemaError(
-                "storage schema v4 shutdown marker table has unexpected definition"
+                f"storage schema v{version} shutdown marker table "
+                "has unexpected definition"
             )
-        if marker_columns != expected_marker_columns:
+        if marker_columns != _SHUTDOWN_MARKER_COLUMNS:
             raise StorageSchemaError(
-                "storage schema v4 shutdown marker table has unexpected columns"
+                f"storage schema v{version} shutdown marker table "
+                "has unexpected columns"
             )
         expected_indexes = {
             "transcription_jobs_fifo_idx": (
@@ -818,7 +901,7 @@ class Storage:
             index = job_indexes.get(name)
             if index is None or index["unique"] != 0 or index["partial"] != 0:
                 raise StorageSchemaError(
-                    f"storage schema v4 job index {name} is invalid"
+                    f"storage schema v{version} job index {name} is invalid"
                 )
             with self._lock:
                 indexed_columns = tuple(
@@ -827,7 +910,7 @@ class Storage:
                 )
             if indexed_columns != expected_columns:
                 raise StorageSchemaError(
-                    f"storage schema v4 job index {name} is invalid"
+                    f"storage schema v{version} job index {name} is invalid"
                 )
 
     def _table_columns(
@@ -860,6 +943,51 @@ class Storage:
                     "storage schema version changed during migration"
                 )
             self._verify_v4_schema()
+
+    def _migrate_v4_to_v5(self) -> None:
+        with self._transaction():
+            self._verify_v4_schema()
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM transcription_jobs LIMIT 1"
+                ).fetchone()
+                is not None
+            ):
+                raise StorageSchemaError(
+                    "storage schema v4 contains transcription jobs"
+                )
+            self._connection.execute("DROP INDEX transcription_jobs_fifo_idx")
+            self._connection.execute(
+                "DROP INDEX transcription_jobs_retention_idx"
+            )
+            self._connection.execute(
+                "ALTER TABLE transcription_jobs RENAME TO transcription_jobs_v4"
+            )
+            self._connection.execute(_V5_TRANSCRIPTION_JOBS_DDL)
+            self._connection.execute(
+                """
+                CREATE INDEX transcription_jobs_fifo_idx
+                ON transcription_jobs(phase, status, created_at, id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX transcription_jobs_retention_idx
+                ON transcription_jobs(phase, status, finished_at, id)
+                """
+            )
+            self._connection.execute("DROP TABLE transcription_jobs_v4")
+            changed = self._connection.execute(
+                """
+                UPDATE schema_meta SET version = 5
+                WHERE singleton = 1 AND version = 4
+                """
+            ).rowcount
+            if changed != 1:
+                raise StorageSchemaError(
+                    "storage schema version changed during migration"
+                )
+            self._verify_v5_schema()
 
     def create_speaker_profile(
         self,
@@ -1475,7 +1603,9 @@ class Storage:
                     selected_speaker_snapshot = ?,
                     snapshot_sha256 = ?,
                     input_size_bytes = ?,
-                    total_samples = ?,
+                    effective_max_audio_samples = ?,
+                    effective_direct_max_audio_samples = ?,
+                    total_samples = NULL,
                     request_fingerprint = ?,
                     processor_fingerprint = ?
                 WHERE id = ? AND phase = 'receiving'
@@ -1486,7 +1616,8 @@ class Storage:
                     sqlite3.Binary(spec.selected_speaker_snapshot),
                     spec.snapshot_sha256,
                     input_ref.actual_bytes,
-                    spec.total_samples,
+                    spec.effective_max_audio_samples,
+                    spec.effective_direct_max_audio_samples,
                     spec.request_fingerprint,
                     spec.processor_fingerprint,
                     input_ref.id,
@@ -1591,11 +1722,22 @@ class Storage:
         job_id: str,
         attempt_token: str,
         processed_samples: int,
+        *,
+        total_samples: int | None = None,
     ) -> JobProgressOutcome:
         if type(processed_samples) is not int:
             raise TypeError("processed samples must be an integer")
         if processed_samples < 0:
             raise ValueError("processed samples must be nonnegative")
+        if total_samples is not None:
+            if type(total_samples) is not int:
+                raise TypeError("total samples must be an integer or None")
+            if total_samples < 0:
+                raise ValueError("total samples must be nonnegative")
+            if processed_samples != total_samples:
+                raise ValueError(
+                    "EOF progress must report equal processed and total samples"
+                )
         validate_job_id(job_id)
         _validate_nonempty_text(
             attempt_token,
@@ -1605,7 +1747,8 @@ class Storage:
             row = self._connection.execute(
                 """
                 SELECT status, attempt_token, processed_samples,
-                       total_samples, cancel_requested
+                       total_samples, effective_max_audio_samples,
+                       cancel_requested
                 FROM transcription_jobs
                 WHERE id = ? AND phase = 'visible'
                 """,
@@ -1617,28 +1760,88 @@ class Storage:
                 or row["attempt_token"] != attempt_token
             ):
                 return JobProgressOutcome.STALE
-            if (
-                processed_samples < row["processed_samples"]
-                or processed_samples > row["total_samples"]
-            ):
-                raise ValueError(
-                    "processed samples are outside the current job bounds"
-                )
             if row["cancel_requested"] == 1:
                 return JobProgressOutcome.CANCEL_REQUESTED
             if row["cancel_requested"] != 0:
                 raise StorageSchemaError(
                     "job cancellation flag is corrupt"
                 )
-            changed = self._connection.execute(
-                """
-                UPDATE transcription_jobs SET processed_samples = ?
-                WHERE id = ? AND phase = 'visible'
-                  AND status = 'running' AND attempt_token = ?
-                  AND cancel_requested = 0
-                """,
-                (processed_samples, job_id, attempt_token),
-            ).rowcount
+            effective_max = row["effective_max_audio_samples"]
+            if type(effective_max) is not int or effective_max <= 0:
+                raise StorageSchemaError("job effective maximum is corrupt")
+            if (
+                processed_samples < row["processed_samples"]
+                or processed_samples > effective_max
+            ):
+                raise ValueError(
+                    "processed samples are outside the current job bounds"
+                )
+            current_total = row["total_samples"]
+            if total_samples is None:
+                if (
+                    current_total is not None
+                    and processed_samples > current_total
+                ):
+                    raise ValueError(
+                        "processed samples exceed the fixed total"
+                    )
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET processed_samples = ?
+                    WHERE id = ? AND phase = 'visible'
+                      AND status = 'running' AND attempt_token = ?
+                      AND cancel_requested = 0
+                      AND processed_samples <= ?
+                      AND (
+                          (
+                              total_samples IS NULL
+                              AND ? <= effective_max_audio_samples
+                          )
+                          OR (
+                              total_samples IS NOT NULL
+                              AND ? <= total_samples
+                          )
+                      )
+                    """,
+                    (
+                        processed_samples,
+                        job_id,
+                        attempt_token,
+                        processed_samples,
+                        processed_samples,
+                        processed_samples,
+                    ),
+                ).rowcount
+            else:
+                if current_total is not None and current_total != total_samples:
+                    raise ValueError(
+                        "EOF total samples do not match the fixed total"
+                    )
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET
+                        processed_samples = ?,
+                        total_samples = ?
+                    WHERE id = ? AND phase = 'visible'
+                      AND status = 'running' AND attempt_token = ?
+                      AND cancel_requested = 0
+                      AND processed_samples <= ?
+                      AND ? <= effective_max_audio_samples
+                      AND (
+                          total_samples IS NULL
+                          OR total_samples = ?
+                      )
+                    """,
+                    (
+                        processed_samples,
+                        total_samples,
+                        job_id,
+                        attempt_token,
+                        processed_samples,
+                        total_samples,
+                        total_samples,
+                    ),
+                ).rowcount
             if changed != 1:
                 return JobProgressOutcome.STALE
         return JobProgressOutcome.UPDATED
@@ -2197,6 +2400,7 @@ class Storage:
             return JobSuccessOutcome.CANCEL_REQUESTED
         if (
             row["cancel_requested"] != 0
+            or row["total_samples"] is None
             or row["processed_samples"] != row["total_samples"]
         ):
             self.release_artifact(result_ref)
@@ -2226,6 +2430,7 @@ class Storage:
                 WHERE id = ? AND phase = 'visible'
                   AND status = 'running' AND attempt_token = ?
                   AND cancel_requested = 0
+                  AND total_samples IS NOT NULL
                   AND processed_samples = total_samples
                   AND result_lease_id IS NULL
                   AND EXISTS (
@@ -3268,6 +3473,7 @@ class Storage:
             should_recover = (
                 job.status is JobStatus.RUNNING
                 and not job.cancel_requested
+                and job.total_samples is not None
                 and job.processed_samples == job.total_samples
             )
             requires_valid_result = (
@@ -3448,6 +3654,7 @@ class Storage:
                           AND attempt_token = ?
                           AND owner_generation = ?
                           AND cancel_requested = 0
+                          AND total_samples IS NOT NULL
                           AND processed_samples = total_samples
                           AND result_lease_id IS NULL
                           AND EXISTS (
@@ -4065,6 +4272,10 @@ def _decode_transcription_job(row: sqlite3.Row) -> DurableJob:
             selected_speaker_snapshot=row["selected_speaker_snapshot"],
             snapshot_sha256=row["snapshot_sha256"],
             input_size_bytes=row["input_size_bytes"],
+            effective_max_audio_samples=row["effective_max_audio_samples"],
+            effective_direct_max_audio_samples=row[
+                "effective_direct_max_audio_samples"
+            ],
             total_samples=row["total_samples"],
             processed_samples=row["processed_samples"],
             request_fingerprint=row["request_fingerprint"],

@@ -27,6 +27,7 @@ from botified_asr.storage import Storage, StorageSchemaError
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 STARTED_AT = CREATED_AT + timedelta(minutes=1)
 FINISHED_AT = STARTED_AT + timedelta(minutes=1)
+TOTAL_SAMPLES = 32_000
 CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
@@ -65,7 +66,8 @@ def queue_and_claim(storage: Storage) -> jobs.DurableJob:
             canonical_options_json=CANONICAL_OPTIONS_JSON,
             selected_speaker_snapshot=b'{"speakers":[]}',
             snapshot_sha256="1" * 64,
-            total_samples=32_000,
+            effective_max_audio_samples=TOTAL_SAMPLES,
+            effective_direct_max_audio_samples=16_000,
             request_fingerprint="2" * 64,
             processor_fingerprint="3" * 64,
         ),
@@ -111,7 +113,7 @@ def seal_result(
             opener=lambda: io.BytesIO(),
         ),
         parse_canonical_options_json(running.canonical_options_json),
-        running.total_samples,
+        TOTAL_SAMPLES,
         writer=StorageResultWriter(storage, writer),
         manifest=ResultEnvelopeManifest(
             version=1,
@@ -163,7 +165,8 @@ def finish_progress(storage: Storage, running: jobs.DurableJob) -> None:
         storage.update_job_progress(
             running.id,
             running.attempt_token,
-            running.total_samples,
+            TOTAL_SAMPLES,
+            total_samples=TOTAL_SAMPLES,
         )
         is jobs.JobProgressOutcome.UPDATED
     )
@@ -182,7 +185,8 @@ def test_job_result_writer_commits_exact_success_state(
             storage.update_job_progress(
                 running.id,
                 running.attempt_token,
-                running.total_samples,
+                TOTAL_SAMPLES,
+                total_samples=TOTAL_SAMPLES,
             )
             is jobs.JobProgressOutcome.UPDATED
         )
@@ -851,7 +855,8 @@ def test_losing_success_commit_cleans_result_without_overwriting_job(
                 storage.update_job_progress(
                     running.id,
                     running.attempt_token,
-                    running.total_samples,
+                    TOTAL_SAMPLES,
+                    total_samples=TOTAL_SAMPLES,
                 )
                 is jobs.JobProgressOutcome.UPDATED
             )

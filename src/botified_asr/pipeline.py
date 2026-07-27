@@ -18,6 +18,7 @@ from botified_asr.audio import (
 )
 from botified_asr.contracts import (
     CANONICAL_JSONL_MAX_RECORD_BYTES,
+    DIRECT_MAX_SAMPLES,
     MAX_AUDIO_SAMPLES,
     CanonicalOptions,
 )
@@ -38,7 +39,6 @@ from botified_asr.speakers import (
     is_anonymous_speaker_label,
 )
 
-DIRECT_MAX_SAMPLES = 480_000
 ASR_BATCH_MAX_SEGMENTS = 32
 ASR_BATCH_MAX_PCM_SAMPLES = 960_000
 ASR_BATCH_MAX_WALL_SAMPLES = 4_800_000

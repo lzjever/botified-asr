@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import botified_asr.storage as storage_module
 from botified_asr.config import LimitsConfig
 from botified_asr.storage import (
     ArtifactRef,
@@ -192,6 +193,45 @@ def create_v3_database(data_dir: Path) -> None:
         connection.close()
 
 
+def create_v4_database(
+    data_dir: Path,
+    *,
+    with_receiving_job: bool = False,
+) -> None:
+    create_v3_database(data_dir)
+    connection = sqlite3.connect(data_dir / "botified-asr.sqlite3")
+    try:
+        connection.execute(storage_module._V4_TRANSCRIPTION_JOBS_DDL)
+        connection.executescript(
+            """
+            CREATE INDEX transcription_jobs_fifo_idx
+                ON transcription_jobs(phase, status, created_at, id);
+            CREATE INDEX transcription_jobs_retention_idx
+                ON transcription_jobs(phase, status, finished_at, id);
+            """
+        )
+        connection.execute(storage_module._V4_SHUTDOWN_MARKER_DDL)
+        if with_receiving_job:
+            connection.execute(
+                """
+                INSERT INTO transcription_jobs(
+                    id, phase, status, input_lease_id, processed_samples,
+                    attempt_no, crash_recoveries, cancel_requested,
+                    input_cleanup_pending, created_at
+                ) VALUES (
+                    '7K3M9Q2W', 'receiving', NULL, '7K3M9Q2W', 0,
+                    0, 0, 0, 0, '2026-07-27T12:00:00Z'
+                )
+                """
+            )
+        connection.execute(
+            "UPDATE schema_meta SET version = 4 WHERE singleton = 1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _speaker_profile_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "id": "01234567",
@@ -242,6 +282,8 @@ JOB_COLUMNS = (
     ("selected_speaker_snapshot", "BLOB", 0, None, 0),
     ("snapshot_sha256", "TEXT", 0, None, 0),
     ("input_size_bytes", "INTEGER", 0, None, 0),
+    ("effective_max_audio_samples", "INTEGER", 0, None, 0),
+    ("effective_direct_max_audio_samples", "INTEGER", 0, None, 0),
     ("total_samples", "INTEGER", 0, None, 0),
     ("processed_samples", "INTEGER", 1, None, 0),
     ("request_fingerprint", "TEXT", 0, None, 0),
@@ -265,6 +307,26 @@ MARKER_COLUMNS = (
 )
 
 
+def _job_schema_snapshot(database: Path) -> tuple[object, ...]:
+    connection = sqlite3.connect(database)
+    try:
+        return (
+            connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0],
+            connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'transcription_jobs'
+                """
+            ).fetchone()[0],
+            tuple(connection.execute("PRAGMA table_info(transcription_jobs)")),
+            tuple(connection.execute("SELECT * FROM transcription_jobs")),
+        )
+    finally:
+        connection.close()
+
+
 def _transcription_job_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "id": "7K3M9Q2W",
@@ -278,6 +340,8 @@ def _transcription_job_row(**overrides: object) -> dict[str, object]:
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
         "input_size_bytes": 4,
+        "effective_max_audio_samples": 32_000,
+        "effective_direct_max_audio_samples": 16_000,
         "total_samples": 32_000,
         "processed_samples": 0,
         "request_fingerprint": "2" * 64,
@@ -310,7 +374,7 @@ def _insert_transcription_job(
     )
 
 
-def _recreate_v4_table_with_column_drift(
+def _recreate_v5_table_with_column_drift(
     connection: sqlite3.Connection,
     *,
     table: str,
@@ -433,7 +497,7 @@ def _recreate_speaker_profiles_with_column_drift(
     )
 
 
-def test_fresh_schema_is_explicit_v4_with_job_foundation(tmp_path: Path) -> None:
+def test_fresh_schema_is_explicit_v5_with_job_foundation(tmp_path: Path) -> None:
     storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     try:
         version = storage._connection.execute(
@@ -479,7 +543,7 @@ def test_fresh_schema_is_explicit_v4_with_job_foundation(tmp_path: Path) -> None
             )
         )
 
-        assert version == 4
+        assert version == 5
         assert {
             row["name"]
             for row in storage._connection.execute(
@@ -657,7 +721,7 @@ def test_job_tables_enforce_local_values_without_encoding_state_machine(
         storage.close()
 
 
-def test_v3_schema_migrates_to_v4_atomically_preserving_existing_rows(
+def test_v3_schema_migrates_through_v5_atomically_preserving_existing_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -678,7 +742,7 @@ def test_v3_schema_migrates_to_v4_atomically_preserving_existing_rows(
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert tuple(
             storage._connection.execute(
                 "SELECT * FROM storage_leases"
@@ -769,13 +833,112 @@ def test_failed_v3_to_v4_migration_rolls_back_then_retries_cleanly(
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM storage_leases"
         ).fetchone()[0] == 1
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM speaker_profiles"
         ).fetchone()[0] == 1
+    finally:
+        storage.close()
+
+
+def test_empty_exact_v4_schema_migrates_to_v5_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v4_database(tmp_path)
+    monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        assert storage._connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0] == 5
+        assert tuple(
+            row[1:]
+            for row in storage._connection.execute(
+                "PRAGMA table_info(transcription_jobs)"
+            )
+        ) == JOB_COLUMNS
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM transcription_jobs"
+        ).fetchone()[0] == 0
+    finally:
+        storage.close()
+
+
+def test_v4_schema_with_any_job_fails_closed_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v4_database(tmp_path, with_receiving_job=True)
+    database = tmp_path / "botified-asr.sqlite3"
+    before = _job_schema_snapshot(database)
+
+    def unexpected_reconcile(_storage: Storage) -> None:
+        raise AssertionError("startup reconciliation must not run")
+
+    monkeypatch.setattr(Storage, "_reconcile_startup", unexpected_reconcile)
+    with pytest.raises(StorageSchemaError):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    assert before[0] == 4
+    assert before[1] == storage_module._V4_TRANSCRIPTION_JOBS_DDL
+    assert len(before[3]) == 1
+    assert _job_schema_snapshot(database) == before
+
+
+def test_failed_v4_to_v5_version_update_rolls_back_then_retries_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v4_database(tmp_path)
+    database = tmp_path / "botified-asr.sqlite3"
+    before = _job_schema_snapshot(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_v5_schema_version
+            BEFORE UPDATE OF version ON schema_meta
+            WHEN NEW.version = 5
+            BEGIN
+                SELECT RAISE(ABORT, 'injected v5 migration failure');
+            END;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected v5 migration failure",
+    ):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    assert _job_schema_snapshot(database) == before
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TRIGGER reject_v5_schema_version")
+        connection.commit()
+    finally:
+        connection.close()
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        assert storage._connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0] == 5
+        assert tuple(
+            row[1:]
+            for row in storage._connection.execute(
+                "PRAGMA table_info(transcription_jobs)"
+            )
+        ) == JOB_COLUMNS
     finally:
         storage.close()
 
@@ -799,7 +962,7 @@ def test_failed_v3_to_v4_migration_rolls_back_then_retries_cleanly(
         "marker-generation-check",
     ),
 )
-def test_v4_schema_verifier_rejects_critical_job_foundation_drift(
+def test_v5_schema_verifier_rejects_critical_job_foundation_drift(
     tmp_path: Path,
     mutation: str,
 ) -> None:
@@ -843,7 +1006,7 @@ def test_v4_schema_verifier_rejects_critical_job_foundation_drift(
             "marker-generation-check": "shutdown_marker",
         }
         if mutation in check_drifts:
-            _recreate_v4_table_with_column_drift(
+            _recreate_v5_table_with_column_drift(
                 connection,
                 table=check_drifts[mutation],
                 include_critical_check=False,
@@ -851,7 +1014,7 @@ def test_v4_schema_verifier_rejects_critical_job_foundation_drift(
             connection.commit()
         elif mutation in column_drifts:
             table, column, replacement = column_drifts[mutation]
-            _recreate_v4_table_with_column_drift(
+            _recreate_v5_table_with_column_drift(
                 connection,
                 table=table,
                 column=column,
@@ -898,7 +1061,7 @@ def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM storage_leases"
         ).fetchone()[0] == 0
@@ -985,7 +1148,7 @@ def test_failed_v1_migration_rolls_back_structure_and_version(
         connection.close()
 
 
-def test_v2_schema_migrates_through_v4_without_rewriting_ledger(
+def test_v2_schema_migrates_through_v5_without_rewriting_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -998,7 +1161,7 @@ def test_v2_schema_migrates_through_v4_without_rewriting_ledger(
             storage._connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 4
+            == 5
         )
         lease = storage._connection.execute(
             """
@@ -1102,7 +1265,7 @@ def test_failed_v2_migration_rolls_back_then_retries_cleanly(
             storage._connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 4
+            == 5
         )
         assert (
             storage._connection.execute(
@@ -1166,7 +1329,7 @@ def test_failed_v3_verification_rolls_back_then_retries_cleanly(
             connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == 4
+            == 5
         )
         assert (
             connection.execute(

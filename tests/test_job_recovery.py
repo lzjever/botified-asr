@@ -78,7 +78,8 @@ def queue_job(storage: Storage, created_at: datetime) -> jobs.DurableJob:
             canonical_options_json=CANONICAL_OPTIONS_JSON,
             selected_speaker_snapshot=b'{"speakers":[]}',
             snapshot_sha256="1" * 64,
-            total_samples=32_000,
+            effective_max_audio_samples=32_000,
+            effective_direct_max_audio_samples=16_000,
             request_fingerprint="2" * 64,
             processor_fingerprint="3" * 64,
         ),
@@ -203,14 +204,27 @@ def test_progress_is_monotonic_token_fenced_and_cancel_aware(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    patch_job_ids(monkeypatch, "01234567", "ABCDEFGH")
-    patch_attempt_tokens(monkeypatch, "token-1")
+    patch_job_ids(monkeypatch, "01234567", "ABCDEFGH", "7K3M9Q2W")
+    patch_attempt_tokens(monkeypatch, "token-1", "token-2")
     storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     try:
-        running = queue_job(storage, CREATED_AT)
-        queued = queue_job(storage, CREATED_AT + timedelta(seconds=1))
+        assert (
+            storage.update_job_progress(
+                "01234567",
+                "stale-token",
+                0,
+                total_samples=0,
+            )
+            is jobs.JobProgressOutcome.STALE
+        )
+        queue_job(storage, CREATED_AT)
+        queue_job(storage, CREATED_AT + timedelta(seconds=1))
+        queued = queue_job(storage, CREATED_AT + timedelta(seconds=2))
         running = storage.claim_next_job("generation-1", CLAIMED_AT)
+        cancel_target = storage.claim_next_job("generation-1", CLAIMED_AT)
         assert storage.get_visible_job(running.id) == running
+        assert running.total_samples is None
+        assert cancel_target.total_samples is None
 
         for invalid in (True, 1.0, "1"):
             with pytest.raises(TypeError):
@@ -219,52 +233,166 @@ def test_progress_is_monotonic_token_fenced_and_cancel_aware(
             storage.update_job_progress("7K3M9Q2W", "stale", -1)
 
         assert (
-            storage.update_job_progress(queued.id, "stale", 0)
+            storage.update_job_progress(
+                queued.id,
+                "stale",
+                0,
+                total_samples=0,
+            )
+            is jobs.JobProgressOutcome.STALE
+        )
+        assert storage.get_visible_job(queued.id).total_samples is None
+        assert (
+            storage.update_job_progress(
+                running.id,
+                "wrong-token",
+                0,
+                total_samples=0,
+            )
             is jobs.JobProgressOutcome.STALE
         )
         assert (
-            storage.update_job_progress("7K3M9Q2W", "stale", 0)
-            is jobs.JobProgressOutcome.STALE
-        )
-        assert (
-            storage.update_job_progress(running.id, "wrong-token", 0)
-            is jobs.JobProgressOutcome.STALE
-        )
-        assert (
-            storage.update_job_progress(running.id, "token-1", 100)
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                100,
+                total_samples=None,
+            )
             is jobs.JobProgressOutcome.UPDATED
         )
         assert (
-            storage.update_job_progress(running.id, "token-1", 100)
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                100,
+                total_samples=None,
+            )
             is jobs.JobProgressOutcome.UPDATED
         )
         with pytest.raises(ValueError):
-            storage.update_job_progress(running.id, "token-1", 99)
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                99,
+                total_samples=None,
+            )
         with pytest.raises(ValueError):
-            storage.update_job_progress(running.id, "token-1", 32_001)
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                32_001,
+                total_samples=None,
+            )
+        with pytest.raises(ValueError):
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                32_001,
+                total_samples=32_001,
+            )
+        assert storage.get_visible_job(running.id).total_samples is None
+
+        assert (
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                200,
+                total_samples=200,
+            )
+            is jobs.JobProgressOutcome.UPDATED
+        )
+        assert (
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                200,
+                total_samples=200,
+            )
+            is jobs.JobProgressOutcome.UPDATED
+        )
+        fixed = storage.get_visible_job(running.id)
+        assert fixed.processed_samples == fixed.total_samples == 200
+        with pytest.raises(ValueError):
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                201,
+                total_samples=201,
+            )
 
         storage._connection.execute(
             """
             UPDATE transcription_jobs SET cancel_requested = 1 WHERE id = ?
             """,
-            (running.id,),
+            (cancel_target.id,),
         )
         assert (
-            storage.update_job_progress(running.id, "token-1", 101)
+            storage.update_job_progress(
+                cancel_target.id,
+                "token-2",
+                100,
+                total_samples=100,
+            )
             is jobs.JobProgressOutcome.CANCEL_REQUESTED
         )
-        assert storage.get_visible_job(running.id).processed_samples == 100
-        assert (
-            storage._connection.execute(
-                """
-                SELECT processed_samples FROM transcription_jobs WHERE id = ?
-                """,
-                (running.id,),
-            ).fetchone()[0]
-            == 100
-        )
+        cancelled = storage.get_visible_job(cancel_target.id)
+        assert cancelled.processed_samples == 0
+        assert cancelled.total_samples is None
     finally:
         storage.close()
+
+
+def test_requeued_attempt_preserves_its_fixed_total_until_eof_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    patch_attempt_tokens(monkeypatch, "token-1", "token-2")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    first = queue_job(storage, CREATED_AT)
+    first = storage.claim_next_job("generation-1", CLAIMED_AT)
+    assert (
+        storage.update_job_progress(
+            first.id,
+            first.attempt_token,
+            100,
+            total_samples=100,
+        )
+        is jobs.JobProgressOutcome.UPDATED
+    )
+    storage.close()
+
+    recovered = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        requeued = recovered.get_visible_job(first.id)
+        assert requeued.status is jobs.JobStatus.QUEUED
+        assert requeued.processed_samples == 0
+        assert requeued.total_samples == 100
+
+        running = recovered.claim_next_job("generation-2", CLAIMED_AT)
+        assert (
+            recovered.update_job_progress(
+                running.id,
+                running.attempt_token,
+                100,
+                total_samples=None,
+            )
+            is jobs.JobProgressOutcome.UPDATED
+        )
+        intermediate = recovered.get_visible_job(running.id)
+        assert intermediate.processed_samples == 100
+        assert intermediate.total_samples == 100
+        assert (
+            recovered.update_job_progress(
+                running.id,
+                running.attempt_token,
+                100,
+                total_samples=100,
+            )
+            is jobs.JobProgressOutcome.UPDATED
+        )
+    finally:
+        recovered.close()
 
 
 def test_shutdown_marker_is_idempotent_and_fences_requeue(
@@ -389,9 +517,16 @@ def test_startup_classifies_all_running_jobs_and_clears_marker(
         storage.claim_next_job("generation-2", CLAIMED_AT),
         storage.claim_next_job("generation-2", CLAIMED_AT),
     )
-    for job, progress in zip(claimed, (10, 20, 30, 40), strict=True):
+    for index, (job, progress) in enumerate(
+        zip(claimed, (10, 20, 30, 40), strict=True)
+    ):
         assert (
-            storage.update_job_progress(job.id, job.attempt_token, progress)
+            storage.update_job_progress(
+                job.id,
+                job.attempt_token,
+                progress,
+                total_samples=progress if index in {1, 2} else None,
+            )
             is jobs.JobProgressOutcome.UPDATED
         )
     storage._connection.execute(
@@ -434,10 +569,12 @@ def test_startup_classifies_all_running_jobs_and_clears_marker(
 
         assert graceful.status is jobs.JobStatus.QUEUED
         assert graceful.processed_samples == 0
+        assert graceful.total_samples == 20
         assert graceful.attempt_no == 1
         assert graceful.crash_recoveries == 0
         assert retried.status is jobs.JobStatus.QUEUED
         assert retried.processed_samples == 0
+        assert retried.total_samples == 30
         assert retried.attempt_no == 1
         assert retried.crash_recoveries == 1
         for queued in (graceful, retried):

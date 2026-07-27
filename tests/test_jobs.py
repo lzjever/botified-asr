@@ -29,7 +29,9 @@ def _queued_values(jobs: ModuleType) -> dict[str, object]:
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
         "input_size_bytes": 4,
-        "total_samples": 32_000,
+        "effective_max_audio_samples": 32_000,
+        "effective_direct_max_audio_samples": 16_000,
+        "total_samples": None,
         "processed_samples": 0,
         "request_fingerprint": "2" * 64,
         "processor_fingerprint": "3" * 64,
@@ -61,6 +63,8 @@ def _receiving_changes(jobs: ModuleType) -> dict[str, object]:
         "selected_speaker_snapshot": None,
         "snapshot_sha256": None,
         "input_size_bytes": None,
+        "effective_max_audio_samples": None,
+        "effective_direct_max_audio_samples": None,
         "total_samples": None,
         "request_fingerprint": None,
         "processor_fingerprint": None,
@@ -191,6 +195,7 @@ def test_transcription_job_accepts_each_exact_state_shape() -> None:
         {
             "status": jobs.JobStatus.SUCCEEDED,
             "input_lease_id": None,
+            "total_samples": 32_000,
             "processed_samples": 32_000,
             "attempt_no": 1,
             "result_lease_id": "b" * 32,
@@ -199,6 +204,7 @@ def test_transcription_job_accepts_each_exact_state_shape() -> None:
         },
         {
             "status": jobs.JobStatus.SUCCEEDED,
+            "total_samples": 32_000,
             "processed_samples": 32_000,
             "attempt_no": 1,
             "result_lease_id": "b" * 32,
@@ -256,6 +262,7 @@ def test_transcription_job_accepts_each_exact_state_shape() -> None:
             "phase": jobs.JobPhase.DELETING,
             "status": jobs.JobStatus.SUCCEEDED,
             "input_lease_id": None,
+            "total_samples": 32_000,
             "processed_samples": 32_000,
             "attempt_no": 1,
             "result_lease_id": "b" * 32,
@@ -275,12 +282,23 @@ def test_transcription_job_accepts_each_exact_state_shape() -> None:
     )
 
 
+def test_only_requeued_job_may_have_a_fixed_total() -> None:
+    jobs = _jobs()
+
+    with pytest.raises(ValueError):
+        _job(jobs, total_samples=32_000)
+
+    requeued = _job(jobs, attempt_no=1, total_samples=32_000)
+    assert requeued.total_samples == 32_000
+
+
 def test_transcription_job_rejects_cross_field_state_drift() -> None:
     jobs = _jobs()
     terminal_changes = (
         {
             "status": jobs.JobStatus.SUCCEEDED,
             "input_lease_id": None,
+            "total_samples": 32_000,
             "processed_samples": 32_000,
             "attempt_no": 1,
             "result_lease_id": "b" * 32,

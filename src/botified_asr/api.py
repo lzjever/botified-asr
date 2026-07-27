@@ -333,7 +333,9 @@ def create_app(
                             job.processed_samples / SAMPLE_RATE
                         ),
                         "total_audio_secs": (
-                            job.total_samples / SAMPLE_RATE
+                            None
+                            if job.total_samples is None
+                            else job.total_samples / SAMPLE_RATE
                         ),
                     },
                 }

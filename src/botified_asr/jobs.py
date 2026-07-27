@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from botified_asr.canonical_options import parse_canonical_options_json
+from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
 
 _JOB_ID = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -60,7 +61,8 @@ class QueuedJobSpec:
     canonical_options_json: str
     selected_speaker_snapshot: bytes
     snapshot_sha256: str
-    total_samples: int
+    effective_max_audio_samples: int
+    effective_direct_max_audio_samples: int
     request_fingerprint: str
     processor_fingerprint: str
 
@@ -70,10 +72,22 @@ class QueuedJobSpec:
         parse_canonical_options_json(self.canonical_options_json)
         if type(self.selected_speaker_snapshot) is not bytes:
             raise TypeError("selected speaker snapshot must be bytes")
-        if type(self.total_samples) is not int:
-            raise TypeError("job total samples must be an integer")
-        if self.total_samples < 0:
-            raise ValueError("job total samples must be nonnegative")
+        for name in (
+            "effective_max_audio_samples",
+            "effective_direct_max_audio_samples",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"job {name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"job {name} must be positive")
+        if self.effective_max_audio_samples > MAX_AUDIO_SAMPLES:
+            raise ValueError("job effective max audio samples exceeds release limit")
+        if self.effective_direct_max_audio_samples > min(
+            self.effective_max_audio_samples,
+            DIRECT_MAX_SAMPLES,
+        ):
+            raise ValueError("job effective direct max audio samples is invalid")
         for name in (
             "snapshot_sha256",
             "request_fingerprint",
@@ -96,6 +110,8 @@ class DurableJob:
     selected_speaker_snapshot: bytes | None
     snapshot_sha256: str | None
     input_size_bytes: int | None
+    effective_max_audio_samples: int | None
+    effective_direct_max_audio_samples: int | None
     total_samples: int | None
     processed_samples: int
     request_fingerprint: str | None
@@ -161,6 +177,29 @@ def _validate_local_values(job: DurableJob) -> None:
             name=name,
             optional=name in {"input_size_bytes", "total_samples"},
         )
+    for name in (
+        "effective_max_audio_samples",
+        "effective_direct_max_audio_samples",
+    ):
+        value = getattr(job, name)
+        if value is not None and type(value) is not int:
+            raise TypeError(f"job {name} must be an integer or None")
+        if value is not None and value <= 0:
+            raise ValueError(f"job {name} must be positive")
+    if (
+        job.effective_max_audio_samples is not None
+        and job.effective_max_audio_samples > MAX_AUDIO_SAMPLES
+    ):
+        raise ValueError("job effective max audio samples exceeds release limit")
+    if (
+        job.effective_direct_max_audio_samples is not None
+        and (
+            job.effective_max_audio_samples is None
+            or job.effective_direct_max_audio_samples
+            > min(job.effective_max_audio_samples, DIRECT_MAX_SAMPLES)
+        )
+    ):
+        raise ValueError("job effective direct max audio samples is invalid")
     if job.crash_recoveries > 1:
         raise ValueError("job crash recoveries must not exceed one")
     if job.crash_recoveries > job.attempt_no:
@@ -185,6 +224,17 @@ def _validate_local_values(job: DurableJob) -> None:
 
     if job.total_samples is not None and job.processed_samples > job.total_samples:
         raise ValueError("job processed samples exceed total samples")
+    if (
+        job.total_samples is not None
+        and job.effective_max_audio_samples is not None
+        and job.total_samples > job.effective_max_audio_samples
+    ):
+        raise ValueError("job total samples exceed effective maximum")
+    if (
+        job.effective_max_audio_samples is not None
+        and job.processed_samples > job.effective_max_audio_samples
+    ):
+        raise ValueError("job processed samples exceed effective maximum")
 
 
 def _validate_state_shape(job: DurableJob) -> None:
@@ -219,6 +269,8 @@ def _validate_receiving_shape(job: DurableJob) -> None:
         job.selected_speaker_snapshot,
         job.snapshot_sha256,
         job.input_size_bytes,
+        job.effective_max_audio_samples,
+        job.effective_direct_max_audio_samples,
         job.total_samples,
         job.request_fingerprint,
         job.processor_fingerprint,
@@ -248,7 +300,8 @@ def _require_visible_metadata(job: DurableJob) -> None:
         job.selected_speaker_snapshot,
         job.snapshot_sha256,
         job.input_size_bytes,
-        job.total_samples,
+        job.effective_max_audio_samples,
+        job.effective_direct_max_audio_samples,
         job.request_fingerprint,
         job.processor_fingerprint,
     )
@@ -259,6 +312,7 @@ def _require_visible_metadata(job: DurableJob) -> None:
 def _validate_queued_shape(job: DurableJob) -> None:
     if (
         job.input_lease_id is None
+        or (job.attempt_no == 0 and job.total_samples is not None)
         or job.processed_samples != 0
         or job.attempt_token is not None
         or job.owner_generation is not None
@@ -301,6 +355,7 @@ def _validate_terminal_shape(job: DurableJob) -> None:
         if (
             job.attempt_no < 1
             or job.started_at is None
+            or job.total_samples is None
             or job.processed_samples != job.total_samples
             or job.result_lease_id is None
             or job.error_code is not None

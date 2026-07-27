@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -11,6 +11,7 @@ import pytest
 import botified_asr.jobs as jobs
 import botified_asr.storage as storage_module
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
 from botified_asr.storage import Storage, StorageAdmissionError, StorageSchemaError
 
 
@@ -37,7 +38,8 @@ def queued_spec(**overrides: object) -> object:
         "canonical_options_json": CANONICAL_OPTIONS_JSON,
         "selected_speaker_snapshot": b'{"speakers":[]}',
         "snapshot_sha256": "1" * 64,
-        "total_samples": 32_000,
+        "effective_max_audio_samples": 32_000,
+        "effective_direct_max_audio_samples": 16_000,
         "request_fingerprint": "2" * 64,
         "processor_fingerprint": "3" * 64,
     }
@@ -71,7 +73,7 @@ def patch_job_ids(
 def test_queued_job_spec_validation_and_generated_ids() -> None:
     spec = queued_spec()
     with pytest.raises(FrozenInstanceError):
-        spec.total_samples = 1
+        spec.effective_max_audio_samples = 1
 
     generated = tuple(jobs.generate_job_id() for _ in range(64))
     assert all(jobs.validate_job_id(job_id) == job_id for job_id in generated)
@@ -86,9 +88,22 @@ def test_queued_job_spec_validation_and_generated_ids() -> None:
             )
         },
         {"selected_speaker_snapshot": '{"speakers":[]}'},
-        {"total_samples": True},
-        {"total_samples": 1.0},
-        {"total_samples": -1},
+        {"total_samples": 1},
+        {"effective_max_audio_samples": True},
+        {"effective_max_audio_samples": 1.0},
+        {"effective_max_audio_samples": 0},
+        {"effective_max_audio_samples": MAX_AUDIO_SAMPLES + 1},
+        {"effective_direct_max_audio_samples": True},
+        {"effective_direct_max_audio_samples": 1.0},
+        {"effective_direct_max_audio_samples": 0},
+        {
+            "effective_max_audio_samples": 16_000,
+            "effective_direct_max_audio_samples": 16_001,
+        },
+        {
+            "effective_max_audio_samples": DIRECT_MAX_SAMPLES + 1,
+            "effective_direct_max_audio_samples": DIRECT_MAX_SAMPLES + 1,
+        },
         {"snapshot_sha256": "A" * 64},
         {"request_fingerprint": "2" * 63},
         {"processor_fingerprint": "g" * 64},
@@ -203,11 +218,25 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
         assert published.phase is jobs.JobPhase.VISIBLE
         assert published.status is jobs.JobStatus.QUEUED
         assert published.input_size_bytes == 5
-        assert published.total_samples == 32_000
+        assert published.effective_max_audio_samples == 32_000
+        assert published.effective_direct_max_audio_samples == 16_000
+        assert published.total_samples is None
+        assert published.processed_samples == 0
         assert published.created_at == CREATED_AT
         assert published.canonical_options_json == spec.canonical_options_json
         assert published.selected_speaker_snapshot == spec.selected_speaker_snapshot
         assert storage.get_visible_job("ABCDEFGH") is None
+
+        with pytest.raises(ValueError):
+            replace(
+                published,
+                status=jobs.JobStatus.SUCCEEDED,
+                input_lease_id=None,
+                attempt_no=1,
+                result_lease_id="a" * 32,
+                started_at=CREATED_AT,
+                finished_at=CREATED_AT,
+            )
 
         with pytest.raises(RuntimeError):
             storage.publish_job(input_ref, spec)

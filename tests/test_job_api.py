@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Callable
 
 import anyio
@@ -63,13 +64,15 @@ def durable_job(
         selected_speaker_snapshot=b'{"speakers":[]}',
         snapshot_sha256="1" * 64,
         input_size_bytes=5,
+        effective_max_audio_samples=32_000,
+        effective_direct_max_audio_samples=16_000,
         total_samples=32_000,
         processed_samples=(
             32_000 if succeeded else 16_000 if running else 0
         ),
         request_fingerprint="2" * 64,
         processor_fingerprint="3" * 64,
-        attempt_no=0 if status is JobStatus.QUEUED else 1,
+        attempt_no=1,
         attempt_token="attempt-1" if running else None,
         owner_generation="generation-1" if running else None,
         crash_recoveries=0,
@@ -228,6 +231,41 @@ def test_job_get_returns_exact_active_progress(
         "progress": {
             "processed_audio_secs": processed,
             "total_audio_secs": 2.0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "processed_samples"),
+    (
+        (JobStatus.QUEUED, 0),
+        (JobStatus.RUNNING, 16_000),
+    ),
+)
+def test_job_get_returns_null_total_until_decoder_eof(
+    status: JobStatus,
+    processed_samples: int,
+) -> None:
+    job = SimpleNamespace(
+        id="7K3M9Q2W",
+        status=status,
+        processed_samples=processed_samples,
+        total_samples=None,
+    )
+    storage = FakeStorage(job)
+    with TestClient(app(storage), raise_server_exceptions=False) as client:
+        response = client.get(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": "7K3M9Q2W",
+        "status": status.value,
+        "progress": {
+            "processed_audio_secs": processed_samples / 16_000,
+            "total_audio_secs": None,
         },
     }
 

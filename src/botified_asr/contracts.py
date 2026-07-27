@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 CANONICAL_JSONL_MAX_RECORD_BYTES = 1024 * 1024
 MAX_AUDIO_SAMPLES = 691_200_000
+DIRECT_MAX_SAMPLES = 480_000
 
 
 @dataclass(frozen=True)
