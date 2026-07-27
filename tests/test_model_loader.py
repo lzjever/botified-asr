@@ -9,8 +9,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
-from botified_asr import model_artifacts
+from botified_asr import funasr_adapter, model_artifacts
 from botified_asr.funasr_adapter import (
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
@@ -21,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEVICE = "cpu"
 ASR_NOSPEECH = "<|nospeech|><|EMO_UNKNOWN|><|Event_UNK|><|withitn|>"
 LOAD_ERROR_MESSAGE = "FunASR model bundle could not be loaded"
+CAMPLUS_SPEC = getattr(model_artifacts, "CAMPLUS_SPEC", object())
 
 
 def _model_loader():
@@ -79,7 +81,9 @@ class RecordingAutoModel:
             raise self._failure
         if self.role == "asr":
             return [{"text": ASR_NOSPEECH}]
-        return [{"value": self._vad_markers or []}]
+        if self.role == "vad":
+            return [{"value": self._vad_markers or []}]
+        return [{"spk_embedding": torch.ones((1, 192), dtype=torch.float32)}]
 
 
 class RecordingAutoModelFactory:
@@ -101,7 +105,7 @@ class RecordingAutoModelFactory:
         self.models: list[RecordingAutoModel] = []
 
     def __call__(self, **kwargs: object) -> RecordingAutoModel:
-        role = "asr" if not self.calls else "vad"
+        role = ("asr", "vad", "speaker")[len(self.calls)]
         self.calls.append(kwargs)
         self._events.append(("construct", role))
         if role == self._construct_failure_role:
@@ -134,10 +138,13 @@ def _snapshots(
 ]:
     sensevoice_root = tmp_path / "verified SenseVoice root"
     vad_root = tmp_path / "verified FSMN root"
+    speaker_root = tmp_path / "verified CAM++ root"
     sensevoice_root.mkdir()
     vad_root.mkdir()
+    speaker_root.mkdir()
     assert sensevoice_root.is_absolute()
     assert vad_root.is_absolute()
+    assert speaker_root.is_absolute()
     return {
         model_artifacts.SENSEVOICE_SPEC: model_artifacts.ResolvedModelSnapshot(
             spec=model_artifacts.SENSEVOICE_SPEC,
@@ -146,6 +153,10 @@ def _snapshots(
         model_artifacts.FSMN_VAD_SPEC: model_artifacts.ResolvedModelSnapshot(
             spec=model_artifacts.FSMN_VAD_SPEC,
             root=vad_root,
+        ),
+        CAMPLUS_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=CAMPLUS_SPEC,
+            root=speaker_root,
         ),
     }
 
@@ -215,7 +226,7 @@ assert funasr_imports == []
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
 
 
-def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_and_warmup(
+def test_loader_resolves_three_pinned_specs_before_exact_distinct_construction_and_warmup(
     tmp_path: Path,
 ) -> None:
     loader = _model_loader()
@@ -234,6 +245,7 @@ def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_an
     assert resolver.calls == [
         model_artifacts.SENSEVOICE_SPEC,
         model_artifacts.FSMN_VAD_SPEC,
+        CAMPLUS_SPEC,
     ]
     assert factory.calls == [
         _expected_kwargs(snapshots[model_artifacts.SENSEVOICE_SPEC].root),
@@ -241,29 +253,36 @@ def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_an
             snapshots[model_artifacts.FSMN_VAD_SPEC].root,
             vad=True,
         ),
+        _expected_kwargs(snapshots[CAMPLUS_SPEC].root),
     ]
     assert events == [
         ("resolve", model_artifacts.SENSEVOICE_SPEC),
         ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("resolve", CAMPLUS_SPEC),
         ("construct", "asr"),
         ("construct", "vad"),
+        ("construct", "speaker"),
         ("warmup", "asr"),
         ("warmup", "vad"),
+        ("warmup", "speaker"),
         ("observed", "return"),
     ]
-    assert len(factory.models) == 2
-    assert factory.models[0] is not factory.models[1]
+    assert len(factory.models) == 3
+    assert len({id(model) for model in factory.models}) == 3
     assert isinstance(bundle, loader.FunAsrModelBundle)
     assert isinstance(bundle.asr, FunAsrSenseVoiceBatchAdapter)
     assert isinstance(bundle.vad, FunAsrStreamingVadAdapter)
-    assert bundle.asr is not bundle.vad
+    assert isinstance(bundle.speaker, funasr_adapter.FunAsrCampPlusAdapter)
+    assert len({id(bundle.asr), id(bundle.vad), id(bundle.speaker)}) == 3
     with pytest.raises(FrozenInstanceError):
         bundle.asr = bundle.asr
 
     asr_call = factory.models[0].calls
     vad_call = factory.models[1].calls
+    speaker_call = factory.models[2].calls
     assert len(asr_call) == 1
     assert len(vad_call) == 1
+    assert len(speaker_call) == 1
     assert set(asr_call[0]) == {
         "input",
         "language",
@@ -290,9 +309,15 @@ def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_an
     assert vad_call[0]["cache"] == {}
     assert vad_call[0]["is_final"] is True
     assert vad_call[0]["chunk_size"] == 200
+    assert set(speaker_call[0]) == {"input", "batch_size"}
+    assert speaker_call[0]["batch_size"] == 1
+    speaker_inputs = speaker_call[0]["input"]
+    assert isinstance(speaker_inputs, list)
+    assert len(speaker_inputs) == 1
+    _assert_normalized_speaker_silence(speaker_inputs[0])
 
 
-def test_loader_shares_one_lane_across_warmup_and_later_asr_vad_calls(
+def test_loader_shares_one_lane_across_all_three_adapters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,7 +339,7 @@ def test_loader_shares_one_lane_across_warmup_and_later_asr_vad_calls(
     )
 
     assert len(lanes) == 1
-    assert len(lanes[0].operations) == 2
+    assert len(lanes[0].operations) == 3
 
     bundle.asr.transcribe(np.zeros(16_000, dtype=np.int16))
     bundle.vad.generate(
@@ -322,10 +347,12 @@ def test_loader_shares_one_lane_across_warmup_and_later_asr_vad_calls(
         cache={},
         is_final=True,
     )
+    bundle.speaker.embed_windows(np.zeros(24_000, dtype=np.int16))
 
-    assert len(lanes[0].operations) == 4
+    assert len(lanes[0].operations) == 6
     assert len(factory.models[0].calls) == 2
     assert len(factory.models[1].calls) == 2
+    assert len(factory.models[2].calls) == 2
 
 
 def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> None:
@@ -333,8 +360,10 @@ def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> N
     events: list[object] = []
     sensevoice_root = Path("relative verified SenseVoice root")
     vad_root = Path("relative verified FSMN root")
+    speaker_root = Path("relative verified CAM++ root")
     assert not sensevoice_root.is_absolute()
     assert not vad_root.is_absolute()
+    assert not speaker_root.is_absolute()
     snapshots = {
         model_artifacts.SENSEVOICE_SPEC: model_artifacts.ResolvedModelSnapshot(
             spec=model_artifacts.SENSEVOICE_SPEC,
@@ -343,6 +372,10 @@ def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> N
         model_artifacts.FSMN_VAD_SPEC: model_artifacts.ResolvedModelSnapshot(
             spec=model_artifacts.FSMN_VAD_SPEC,
             root=vad_root,
+        ),
+        CAMPLUS_SPEC: model_artifacts.ResolvedModelSnapshot(
+            spec=CAMPLUS_SPEC,
+            root=speaker_root,
         ),
     }
     factory = RecordingAutoModelFactory(events)
@@ -356,6 +389,7 @@ def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> N
     assert factory.calls == [
         _expected_kwargs(sensevoice_root.absolute()),
         _expected_kwargs(vad_root.absolute(), vad=True),
+        _expected_kwargs(speaker_root.absolute()),
     ]
     for kwargs in factory.calls:
         assert kwargs["model"] == kwargs["model_path"]
@@ -366,6 +400,14 @@ def _assert_normalized_one_second_silence(value: object) -> None:
     assert isinstance(value, np.ndarray)
     assert value.dtype == np.float32
     assert value.shape == (16_000,)
+    assert value.flags.c_contiguous
+    assert np.count_nonzero(value) == 0
+
+
+def _assert_normalized_speaker_silence(value: object) -> None:
+    assert isinstance(value, np.ndarray)
+    assert value.dtype == np.float32
+    assert value.shape == (24_000,)
     assert value.flags.c_contiguous
     assert np.count_nonzero(value) == 0
 
@@ -407,6 +449,36 @@ def test_second_artifact_resolution_error_is_unchanged_and_factory_is_not_called
     ]
 
 
+def test_third_artifact_resolution_error_is_unchanged_and_factory_is_not_called(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    failure = model_artifacts.ModelArtifactUnavailable("CAM++ artifact failure")
+    resolver = RecordingResolver(
+        _snapshots(tmp_path),
+        events,
+        failure_index=2,
+        failure=failure,
+    )
+    factory = RecordingAutoModelFactory(events)
+
+    with pytest.raises(model_artifacts.ModelArtifactUnavailable) as caught:
+        loader.load_funasr_model_bundle(
+            resolver,
+            device=DEVICE,
+            auto_model_factory=factory,
+        )
+
+    assert caught.value is failure
+    assert factory.calls == []
+    assert resolver.calls == [
+        model_artifacts.SENSEVOICE_SPEC,
+        model_artifacts.FSMN_VAD_SPEC,
+        CAMPLUS_SPEC,
+    ]
+
+
 def test_default_factory_import_failure_is_stably_wrapped_after_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -433,10 +505,12 @@ def test_default_factory_import_failure_is_stably_wrapped_after_resolution(
     assert resolver.calls == [
         model_artifacts.SENSEVOICE_SPEC,
         model_artifacts.FSMN_VAD_SPEC,
+        CAMPLUS_SPEC,
     ]
     assert events == [
         ("resolve", model_artifacts.SENSEVOICE_SPEC),
         ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("resolve", CAMPLUS_SPEC),
     ]
 
 
@@ -466,8 +540,10 @@ def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
     assert events == [
         ("resolve", model_artifacts.SENSEVOICE_SPEC),
         ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("resolve", CAMPLUS_SPEC),
         ("construct", "asr"),
         ("construct", "vad"),
+        ("construct", "speaker"),
         ("warmup", "asr"),
         ("warmup", "vad"),
     ]
@@ -481,6 +557,7 @@ def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
             (
                 ("resolve", model_artifacts.SENSEVOICE_SPEC),
                 ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
                 ("construct", "asr"),
             ),
         ),
@@ -489,8 +566,20 @@ def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
             (
                 ("resolve", model_artifacts.SENSEVOICE_SPEC),
                 ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
                 ("construct", "asr"),
                 ("construct", "vad"),
+            ),
+        ),
+        (
+            "construct_speaker",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
+                ("construct", "asr"),
+                ("construct", "vad"),
+                ("construct", "speaker"),
             ),
         ),
         (
@@ -498,8 +587,10 @@ def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
             (
                 ("resolve", model_artifacts.SENSEVOICE_SPEC),
                 ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
                 ("construct", "asr"),
                 ("construct", "vad"),
+                ("construct", "speaker"),
                 ("warmup", "asr"),
             ),
         ),
@@ -508,10 +599,26 @@ def test_non_empty_vad_warmup_markers_fail_with_the_stable_load_error(
             (
                 ("resolve", model_artifacts.SENSEVOICE_SPEC),
                 ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
                 ("construct", "asr"),
                 ("construct", "vad"),
+                ("construct", "speaker"),
                 ("warmup", "asr"),
                 ("warmup", "vad"),
+            ),
+        ),
+        (
+            "warmup_speaker",
+            (
+                ("resolve", model_artifacts.SENSEVOICE_SPEC),
+                ("resolve", model_artifacts.FSMN_VAD_SPEC),
+                ("resolve", CAMPLUS_SPEC),
+                ("construct", "asr"),
+                ("construct", "vad"),
+                ("construct", "speaker"),
+                ("warmup", "asr"),
+                ("warmup", "vad"),
+                ("warmup", "speaker"),
             ),
         ),
     ),

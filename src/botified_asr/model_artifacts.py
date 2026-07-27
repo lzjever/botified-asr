@@ -383,3 +383,26 @@ FSMN_VAD_SPEC = ModelArtifactSpec(
         ),
     ),
 )
+
+CAMPLUS_SPEC = ModelArtifactSpec(
+    provider="huggingface",
+    model_id="funasr/campplus",
+    revision="e4b6ede7ce16997aff4ae69fbca1f0175e2afede",
+    files=(
+        ModelArtifactFile(
+            relative_path="campplus_cn_common.bin",
+            sha256="3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+            expected_bytes=28_036_335,
+        ),
+        ModelArtifactFile(
+            relative_path="configuration.json",
+            sha256="6f7acaf1e81ca121f4a3c71b6ddb66beec24350a3ef330e2c846f17829176a8f",
+            expected_bytes=581,
+        ),
+        ModelArtifactFile(
+            relative_path="config.yaml",
+            sha256="17342041bd5b22f6fd7e32f6e7a267b0bf65f018c0a721bada6547e3d28fbfc9",
+            expected_bytes=537,
+        ),
+    ),
+)

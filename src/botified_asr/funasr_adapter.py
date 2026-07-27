@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+import torch
 
 from botified_asr.inference import InferenceLane
 from botified_asr.pipeline import (
@@ -45,10 +47,69 @@ _CONTROL_PREFIX = re.compile(
     r"<\|([^|<>]{1,64})\|>"
 )
 _UNKNOWN_TAG = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+CAMPLUS_WINDOW_SAMPLES = 24_000
+CAMPLUS_WINDOW_SHIFT_SAMPLES = 12_000
+CAMPLUS_EMBEDDING_DIMENSION = 192
 
 
 class FunAsrAutoModel(Protocol):
     def generate(self, **kwargs: object) -> object: ...
+
+
+@dataclass(frozen=True)
+class SpeakerEmbeddingWindow:
+    start_sample: int
+    end_sample: int
+    embedding: np.ndarray
+
+
+class FunAsrCampPlusAdapter:
+    def __init__(
+        self,
+        model: FunAsrAutoModel,
+        *,
+        inference_lane: InferenceLane,
+    ) -> None:
+        self._model = model
+        self._inference_lane = inference_lane
+
+    def embed_windows(
+        self,
+        pcm: np.ndarray,
+    ) -> tuple[SpeakerEmbeddingWindow, ...]:
+        if not _valid_campplus_pcm(pcm):
+            raise PipelineError(
+                "invalid_audio",
+                "CAM++ input segment is invalid",
+            )
+
+        sample_ranges = _campplus_sample_ranges(len(pcm))
+        normalized = [
+            _normalize_campplus_window(pcm, start_sample, end_sample)
+            for start_sample, end_sample in sample_ranges
+        ]
+        raw_result = self._inference_lane.invoke(
+            lambda: self._model.generate(
+                input=normalized,
+                batch_size=len(normalized),
+            )
+        )
+        embeddings = _decode_campplus_embeddings(
+            raw_result,
+            expected_count=len(sample_ranges),
+        )
+        return tuple(
+            SpeakerEmbeddingWindow(
+                start_sample=start_sample,
+                end_sample=end_sample,
+                embedding=embedding,
+            )
+            for (start_sample, end_sample), embedding in zip(
+                sample_ranges,
+                embeddings,
+                strict=True,
+            )
+        )
 
 
 class FunAsrSenseVoiceBatchAdapter:
@@ -185,6 +246,105 @@ def _valid_asr_pcm(pcm: object) -> bool:
         and pcm.ndim == 1
         and pcm.flags.c_contiguous
         and 1 <= len(pcm) <= DIRECT_MAX_SAMPLES
+    )
+
+
+def _valid_campplus_pcm(pcm: object) -> bool:
+    return (
+        isinstance(pcm, np.ndarray)
+        and pcm.dtype == np.int16
+        and pcm.ndim == 1
+        and pcm.flags.c_contiguous
+        and 1 <= len(pcm) <= DIRECT_MAX_SAMPLES
+    )
+
+
+def _campplus_sample_ranges(sample_count: int) -> tuple[tuple[int, int], ...]:
+    if sample_count <= CAMPLUS_WINDOW_SAMPLES:
+        return ((0, sample_count),)
+
+    final_start = sample_count - CAMPLUS_WINDOW_SAMPLES
+    starts = list(
+        range(
+            0,
+            final_start + 1,
+            CAMPLUS_WINDOW_SHIFT_SAMPLES,
+        )
+    )
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return tuple(
+        (start_sample, start_sample + CAMPLUS_WINDOW_SAMPLES) for start_sample in starts
+    )
+
+
+def _normalize_campplus_window(
+    pcm: np.ndarray,
+    start_sample: int,
+    end_sample: int,
+) -> np.ndarray:
+    window = np.zeros(CAMPLUS_WINDOW_SAMPLES, dtype=np.float32)
+    real_sample_count = end_sample - start_sample
+    window[:real_sample_count] = pcm[start_sample:end_sample]
+    window /= np.float32(32768.0)
+    return window
+
+
+def _decode_campplus_embeddings(
+    raw_result: object,
+    *,
+    expected_count: int,
+) -> tuple[np.ndarray, ...]:
+    if (
+        not isinstance(raw_result, list)
+        or len(raw_result) != 1
+        or not isinstance(raw_result[0], dict)
+    ):
+        _raise_invalid_campplus_output()
+    raw_embeddings = raw_result[0].get("spk_embedding")
+    if not isinstance(raw_embeddings, torch.Tensor) or not torch.is_floating_point(
+        raw_embeddings
+    ):
+        _raise_invalid_campplus_output()
+    try:
+        embeddings = (
+            raw_embeddings.detach().to(device="cpu", dtype=torch.float32).numpy()
+        )
+    except (RuntimeError, TypeError):
+        _raise_invalid_campplus_output()
+    if (
+        not isinstance(embeddings, np.ndarray)
+        or embeddings.shape != (expected_count, CAMPLUS_EMBEDDING_DIMENSION)
+        or not np.issubdtype(embeddings.dtype, np.number)
+    ):
+        _raise_invalid_campplus_output()
+
+    embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+    if not np.isfinite(embeddings).all():
+        _raise_invalid_campplus_output()
+    norms = np.linalg.norm(embeddings, axis=1)
+    if not np.isfinite(norms).all() or np.any(norms <= 0):
+        _raise_invalid_campplus_output()
+    normalized = embeddings / norms[:, np.newaxis]
+    if not np.isfinite(normalized).all():
+        _raise_invalid_campplus_output()
+    decoded: list[np.ndarray] = []
+    for embedding in normalized:
+        owned_embedding = np.array(
+            embedding,
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        owned_embedding.setflags(write=False)
+        decoded.append(owned_embedding)
+    return tuple(decoded)
+
+
+def _raise_invalid_campplus_output() -> None:
+    raise PipelineError(
+        "invalid_model_output",
+        "CAM++ model returned an invalid result",
     )
 
 

@@ -43,6 +43,17 @@ FSMN_VAD_AM_MVN_SHA256 = (
     "df189fd5f4352df84a0fd464eeab4e450a5e645665d6b38f13c832492261a739"
 )
 FSMN_VAD_AM_MVN_BYTES = 8_033
+CAMPLUS_REVISION = "e4b6ede7ce16997aff4ae69fbca1f0175e2afede"
+CAMPLUS_SHA256 = "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8"
+CAMPLUS_BYTES = 28_036_335
+CAMPLUS_CONFIGURATION_SHA256 = (
+    "6f7acaf1e81ca121f4a3c71b6ddb66beec24350a3ef330e2c846f17829176a8f"
+)
+CAMPLUS_CONFIGURATION_BYTES = 581
+CAMPLUS_CONFIG_SHA256 = (
+    "17342041bd5b22f6fd7e32f6e7a267b0bf65f018c0a721bada6547e3d28fbfc9"
+)
+CAMPLUS_CONFIG_BYTES = 537
 
 
 def _sha256(payload: bytes) -> str:
@@ -162,6 +173,28 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
                 relative_path="am.mvn",
                 sha256=FSMN_VAD_AM_MVN_SHA256,
                 expected_bytes=FSMN_VAD_AM_MVN_BYTES,
+            ),
+        ),
+    )
+    assert model_artifacts.CAMPLUS_SPEC == model_artifacts.ModelArtifactSpec(
+        provider="huggingface",
+        model_id="funasr/campplus",
+        revision=CAMPLUS_REVISION,
+        files=(
+            model_artifacts.ModelArtifactFile(
+                relative_path="campplus_cn_common.bin",
+                sha256=CAMPLUS_SHA256,
+                expected_bytes=CAMPLUS_BYTES,
+            ),
+            model_artifacts.ModelArtifactFile(
+                relative_path="configuration.json",
+                sha256=CAMPLUS_CONFIGURATION_SHA256,
+                expected_bytes=CAMPLUS_CONFIGURATION_BYTES,
+            ),
+            model_artifacts.ModelArtifactFile(
+                relative_path="config.yaml",
+                sha256=CAMPLUS_CONFIG_SHA256,
+                expected_bytes=CAMPLUS_CONFIG_BYTES,
             ),
         ),
     )

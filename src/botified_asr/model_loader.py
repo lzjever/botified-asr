@@ -8,11 +8,13 @@ import numpy as np
 
 from botified_asr.funasr_adapter import (
     FunAsrAutoModel,
+    FunAsrCampPlusAdapter,
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
 )
 from botified_asr.inference import SerialInferenceLane
 from botified_asr.model_artifacts import (
+    CAMPLUS_SPEC,
     FSMN_VAD_SPEC,
     SENSEVOICE_SPEC,
     ModelArtifactSpec,
@@ -38,6 +40,7 @@ AutoModelFactory = Callable[..., FunAsrAutoModel]
 class FunAsrModelBundle:
     asr: FunAsrSenseVoiceBatchAdapter
     vad: FunAsrStreamingVadAdapter
+    speaker: FunAsrCampPlusAdapter
 
 
 def load_funasr_model_bundle(
@@ -48,6 +51,7 @@ def load_funasr_model_bundle(
 ) -> FunAsrModelBundle:
     sensevoice_snapshot = resolver.resolve(SENSEVOICE_SPEC)
     vad_snapshot = resolver.resolve(FSMN_VAD_SPEC)
+    speaker_snapshot = resolver.resolve(CAMPLUS_SPEC)
 
     try:
         if auto_model_factory is None:
@@ -57,6 +61,7 @@ def load_funasr_model_bundle(
 
         sensevoice_root = str(sensevoice_snapshot.root.absolute())
         vad_root = str(vad_snapshot.root.absolute())
+        speaker_root = str(speaker_snapshot.root.absolute())
         asr_model = auto_model_factory(
             model=sensevoice_root,
             model_path=sensevoice_root,
@@ -78,6 +83,16 @@ def load_funasr_model_bundle(
             disable_log=True,
             max_single_segment_time=29_790,
         )
+        speaker_model = auto_model_factory(
+            model=speaker_root,
+            model_path=speaker_root,
+            hub="hf",
+            device=device,
+            disable_update=True,
+            trust_remote_code=False,
+            disable_pbar=True,
+            disable_log=True,
+        )
 
         inference_lane = SerialInferenceLane()
         asr = FunAsrSenseVoiceBatchAdapter(
@@ -88,6 +103,10 @@ def load_funasr_model_bundle(
             vad_model,
             inference_lane=inference_lane,
         )
+        speaker = FunAsrCampPlusAdapter(
+            speaker_model,
+            inference_lane=inference_lane,
+        )
         silence = np.zeros(_WARMUP_SAMPLES, dtype=np.int16)
         asr.transcribe(silence)
         markers = vad.generate(silence, cache={}, is_final=True)
@@ -96,4 +115,8 @@ def load_funasr_model_bundle(
 
     if markers:
         raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE)
-    return FunAsrModelBundle(asr=asr, vad=vad)
+    try:
+        speaker.embed_windows(np.zeros(24_000, dtype=np.int16))
+    except Exception as error:
+        raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE) from error
+    return FunAsrModelBundle(asr=asr, vad=vad, speaker=speaker)
