@@ -282,19 +282,16 @@ def create_app(
         try:
             lease = storage.begin_upload("transcription")
         except StorageAdmissionError as exc:
-            raise ApiError(
-                429,
-                exc.code,
-                "Upload admission is saturated",
-                error_type="rate_limit_error",
-            ) from exc
+            raise _storage_admission_error(exc) from exc
 
+        input_ref = None
         try:
             fields = await _ingest_multipart(
                 request, storage, lease, prefer_async=prefer_async
             )
             options = canonicalize_options(fields)
-            input_path = storage.complete_upload(lease)
+            input_ref = storage.seal_upload(lease)
+            input_path = storage.resolve_input(input_ref)
             if prefer_async:
                 raise ApiError(
                     503,
@@ -308,8 +305,13 @@ def create_app(
             if options.response_format == "text":
                 return PlainTextResponse(str(result.get("text", "")))
             return JSONResponse(result)
+        except StorageAdmissionError as exc:
+            raise _storage_admission_error(exc) from exc
         finally:
-            storage.abort_upload(lease)
+            if input_ref is None:
+                storage.abort_upload(lease)
+            else:
+                storage.release_input(input_ref)
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
@@ -593,6 +595,15 @@ def _prefers_async(headers: Headers) -> bool:
 def _invalid_multipart(message: str) -> ApiError:
     return ApiError(
         400, "invalid_multipart", message, param=None
+    )
+
+
+def _storage_admission_error(exc: StorageAdmissionError) -> ApiError:
+    return ApiError(
+        429,
+        exc.code,
+        "Storage admission is saturated",
+        error_type="rate_limit_error",
     )
 
 

@@ -149,7 +149,7 @@ def test_auth_and_not_ready_do_not_receive_body_or_create_lease(
 
     assert status == expected_status
     assert receive_calls == 0
-    assert storage.receiving_count() == 0
+    assert storage.active_upload_count() == 0
     assert storage.total_reserved_bytes() == 0
 
 
@@ -195,6 +195,9 @@ def test_errors_use_openai_envelope_without_internal_exception(
         }
     }
     assert "secret" not in response.text
+    assert storage.active_upload_count() == 0
+    assert storage.total_reserved_bytes() == 0
+    assert not list(storage.staging_dir.iterdir())
 
 
 def test_diarization_fields_are_conditionally_required() -> None:
@@ -649,7 +652,7 @@ def test_joint_cap_wins_when_file_limit_crosses_after_full_overhead_budget(
     assert one_body["error"]["code"] == "invalid_multipart"
     assert one_receives == 1
     assert byte_receives == overhead_limit + file_limit + 1
-    assert storage.receiving_count() == 0
+    assert storage.active_upload_count() == 0
     assert storage.total_reserved_bytes() == 0
     assert not list(storage.staging_dir.iterdir())
 
@@ -709,7 +712,7 @@ def test_client_disconnect_cleans_receiving_upload(storage: Storage) -> None:
 
     assert status == 400
     assert body["error"]["code"] == "client_disconnected"
-    assert storage.receiving_count() == 0
+    assert storage.active_upload_count() == 0
     assert storage.total_reserved_bytes() == 0
     assert not list(storage.staging_dir.iterdir())
 
