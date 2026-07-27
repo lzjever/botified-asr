@@ -21,6 +21,7 @@ from botified_asr.result_artifact import (
     finalize_result_envelope,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import Storage, StorageSchemaError
 
 
@@ -45,6 +46,23 @@ def limits() -> LimitsConfig:
     )
 
 
+def speaker_policy() -> SpeakerEmbeddingPolicy:
+    return SpeakerEmbeddingPolicy(
+        model_id="funasr/campplus",
+        model_revision="1" * 40,
+        embedding_dimension=2,
+        sample_rate=16_000,
+        downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+        window_samples=24_000,
+        window_shift_samples=12_000,
+        padding_policy_version="right-zero-pad-v1",
+        normalization_policy_version="int16-div-32768-l2-v1",
+        enrollment_aggregation_policy_version=(
+            "sample-centroid-equal-average-v1"
+        ),
+    )
+
+
 def patch_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(jobs, "generate_job_id", lambda: "7K3M9Q2W")
     monkeypatch.setattr(storage_module, "generate_job_id", lambda: "7K3M9Q2W")
@@ -64,13 +82,11 @@ def queue_and_claim(storage: Storage) -> jobs.DurableJob:
         input_ref,
         jobs.QueuedJobSpec(
             canonical_options_json=CANONICAL_OPTIONS_JSON,
-            selected_speaker_snapshot=b'{"speakers":[]}',
-            snapshot_sha256="1" * 64,
             effective_max_audio_samples=TOTAL_SAMPLES,
             effective_direct_max_audio_samples=16_000,
-            request_fingerprint="2" * 64,
             processor_fingerprint="3" * 64,
         ),
+        speaker_embedding_policy=speaker_policy(),
     )
     claimed = storage.claim_next_job("generation-1", STARTED_AT)
     assert claimed is not None

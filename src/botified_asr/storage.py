@@ -15,6 +15,7 @@ from typing import BinaryIO, Callable, Iterator
 
 from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
+from botified_asr.job_fingerprints import build_request_fingerprints
 from botified_asr.jobs import (
     DurableJob,
     JobPhase,
@@ -38,6 +39,11 @@ from botified_asr.speaker_profiles import (
     SpeakerProfile,
     SpeakerProfileUpdate,
 )
+from botified_asr.speaker_snapshot import (
+    resolve_selected_speaker_snapshot,
+    serialize_selected_speaker_snapshot,
+)
+from botified_asr.speakers import SpeakerEmbeddingPolicy
 
 SCHEMA_VERSION = 5
 MAX_SPEAKER_PROFILES = 256
@@ -1544,11 +1550,18 @@ class Storage:
         self,
         input_ref: JobInputRef,
         spec: QueuedJobSpec,
+        *,
+        speaker_embedding_policy: SpeakerEmbeddingPolicy,
     ) -> DurableJob:
         if type(input_ref) is not JobInputRef:
             raise TypeError("publish_job requires a JobInputRef")
         if type(spec) is not QueuedJobSpec:
             raise TypeError("publish_job requires a QueuedJobSpec")
+        if type(speaker_embedding_policy) is not SpeakerEmbeddingPolicy:
+            raise TypeError("publish_job requires a speaker embedding policy")
+        canonical_options = parse_canonical_options_json(
+            spec.canonical_options_json
+        )
         self._validate_job_handle_identity(input_ref, writing=False)
         if not self._sealed_job_file_matches(input_ref):
             raise RuntimeError("sealed job input file does not match reference")
@@ -1563,6 +1576,14 @@ class Storage:
                 """,
                 (input_ref.id,),
             ).fetchone()
+            if lease_row is None:
+                raise RuntimeError("sealed job input reference is stale")
+            input_sha256 = lease_row["content_sha256"]
+            if (
+                type(input_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", input_sha256) is None
+            ):
+                raise StorageSchemaError("sealed job input digest is invalid")
             if not self._job_lease_row_matches(
                 lease_row,
                 input_ref,
@@ -1594,6 +1615,22 @@ class Storage:
                     "too_many_queued_jobs",
                     "too many queued jobs",
                 )
+            selected_speaker_snapshot = resolve_selected_speaker_snapshot(
+                self,
+                canonical_options.known_speaker_ids,
+                speaker_embedding_policy,
+            )
+            selected_speaker_snapshot_wire = (
+                serialize_selected_speaker_snapshot(
+                    selected_speaker_snapshot,
+                    speaker_embedding_policy,
+                )
+            )
+            fingerprints = build_request_fingerprints(
+                spec.canonical_options_json,
+                input_sha256,
+                selected_speaker_snapshot_wire,
+            )
             changed = self._connection.execute(
                 """
                 UPDATE transcription_jobs SET
@@ -1613,12 +1650,12 @@ class Storage:
                 """,
                 (
                     spec.canonical_options_json,
-                    sqlite3.Binary(spec.selected_speaker_snapshot),
-                    spec.snapshot_sha256,
+                    sqlite3.Binary(selected_speaker_snapshot_wire),
+                    fingerprints.snapshot_sha256,
                     input_ref.actual_bytes,
                     spec.effective_max_audio_samples,
                     spec.effective_direct_max_audio_samples,
-                    spec.request_fingerprint,
+                    fingerprints.request_fingerprint,
                     spec.processor_fingerprint,
                     input_ref.id,
                     input_ref.id,
@@ -1633,9 +1670,10 @@ class Storage:
                 """,
                 (input_ref.id,),
             ).fetchone()
-        if row is None:
-            raise StorageSchemaError("published job row is missing")
-        return _decode_transcription_job(row)
+            if row is None:
+                raise StorageSchemaError("published job row is missing")
+            published = _decode_transcription_job(row)
+        return published
 
     def get_visible_job(self, job_id: str) -> DurableJob | None:
         validate_job_id(job_id)
@@ -2160,14 +2198,19 @@ class Storage:
         )
 
     def _sealed_job_file_matches(self, ref: JobInputRef) -> bool:
+        if (
+            type(ref.actual_bytes) is not int
+            or ref.actual_bytes < 0
+            or type(ref.content_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", ref.content_sha256) is None
+        ):
+            raise RuntimeError("job upload handle is invalid")
         try:
             stat_result = ref.path.stat(follow_symlinks=False)
             return (
                 not ref.path.is_symlink()
                 and ref.path.is_file()
                 and stat_result.st_size == ref.actual_bytes
-                and re.fullmatch(r"[0-9a-f]{64}", ref.content_sha256)
-                is not None
             )
         except OSError:
             return False

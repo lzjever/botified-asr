@@ -59,19 +59,14 @@ def generate_attempt_token() -> str:
 @dataclass(frozen=True, slots=True)
 class QueuedJobSpec:
     canonical_options_json: str
-    selected_speaker_snapshot: bytes
-    snapshot_sha256: str
     effective_max_audio_samples: int
     effective_direct_max_audio_samples: int
-    request_fingerprint: str
     processor_fingerprint: str
 
     def __post_init__(self) -> None:
         if type(self.canonical_options_json) is not str:
             raise TypeError("canonical job options must be a string")
         parse_canonical_options_json(self.canonical_options_json)
-        if type(self.selected_speaker_snapshot) is not bytes:
-            raise TypeError("selected speaker snapshot must be bytes")
         for name in (
             "effective_max_audio_samples",
             "effective_direct_max_audio_samples",
@@ -88,16 +83,10 @@ class QueuedJobSpec:
             DIRECT_MAX_SAMPLES,
         ):
             raise ValueError("job effective direct max audio samples is invalid")
-        for name in (
-            "snapshot_sha256",
-            "request_fingerprint",
-            "processor_fingerprint",
-        ):
-            value = getattr(self, name)
-            if type(value) is not str:
-                raise TypeError(f"job {name} must be a string")
-            if _LOWERCASE_SHA256.fullmatch(value) is None:
-                raise ValueError(f"job {name} is invalid")
+        if type(self.processor_fingerprint) is not str:
+            raise TypeError("job processor_fingerprint must be a string")
+        if _LOWERCASE_SHA256.fullmatch(self.processor_fingerprint) is None:
+            raise ValueError("job processor_fingerprint is invalid")
 
 
 @dataclass(frozen=True, slots=True)

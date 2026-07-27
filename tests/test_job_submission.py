@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -9,9 +9,15 @@ import threading
 import pytest
 
 import botified_asr.jobs as jobs
+import botified_asr.speaker_snapshot as speaker_snapshot
 import botified_asr.storage as storage_module
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
+from botified_asr.speaker_profiles import (
+    SpeakerEmbedding,
+    SpeakerProfile,
+)
+from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import Storage, StorageAdmissionError, StorageSchemaError
 
 
@@ -20,6 +26,43 @@ CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
 )
+KNOWN_OPTIONS_JSON = (
+    '{"chunking_strategy":"auto","include":[],"known_speaker_ids":'
+    '["00000001","00000002"],"language":"auto",'
+    '"model":"sensevoice-diarize","response_format":"diarized_json"}'
+)
+ONE_KNOWN_OPTIONS_JSON = (
+    '{"chunking_strategy":"auto","include":[],"known_speaker_ids":'
+    '["00000001"],"language":"auto","model":"sensevoice-diarize",'
+    '"response_format":"diarized_json"}'
+)
+INPUT_SHA256 = "6ed8919ce20490a5e3ad8630a4fab69475297abd07db73918dd5f36fcfaeb11b"
+EMPTY_SNAPSHOT = b'{"speakers":[],"version":1}'
+EMPTY_SNAPSHOT_SHA256 = (
+    "37e2de7a783aa3aa11e0b56dbf8faa5ac19217e3ae9c2e2ae228592823009e3f"
+)
+EMPTY_REQUEST_FINGERPRINT = (
+    "5eb4b7227e952d72211424f2f546fc6d0d9c9b31e6da42ff9241dcc129e13334"
+)
+KNOWN_SNAPSHOT = (
+    '{"speakers":['
+    '{"embedding":"AACAPwAAAAA=","id":"00000001","name":"艾丽丝"},'
+    '{"embedding":"AAAAAAAAgD8=","id":"00000002","name":"Bob"}'
+    '],"version":1}'
+).encode("utf-8")
+KNOWN_SNAPSHOT_SHA256 = (
+    "0e0dcec30d8878b3ed5ec43f3a391be54124b02b6a3d4b9ff6ff1fb28bcf2057"
+)
+KNOWN_REQUEST_FINGERPRINT = (
+    "20de60a0e282e43c2ae962cfbba9d129268b5b3636e38989b770df94d7e21593"
+)
+OLD_ONE_SNAPSHOT = (
+    '{"speakers":['
+    '{"embedding":"AACAPwAAAAA=","id":"00000001","name":"艾丽丝"}'
+    '],"version":1}'
+).encode("utf-8")
+
+
 def limits(**overrides: int) -> LimitsConfig:
     values = {
         "max_upload_bytes": RESERVATION_QUANTUM,
@@ -36,15 +79,97 @@ def limits(**overrides: int) -> LimitsConfig:
 def queued_spec(**overrides: object) -> object:
     values = {
         "canonical_options_json": CANONICAL_OPTIONS_JSON,
-        "selected_speaker_snapshot": b'{"speakers":[]}',
-        "snapshot_sha256": "1" * 64,
         "effective_max_audio_samples": 32_000,
         "effective_direct_max_audio_samples": 16_000,
-        "request_fingerprint": "2" * 64,
         "processor_fingerprint": "3" * 64,
     }
     values.update(overrides)
     return jobs.QueuedJobSpec(**values)
+
+
+def speaker_policy() -> SpeakerEmbeddingPolicy:
+    return SpeakerEmbeddingPolicy(
+        model_id="funasr/campplus",
+        model_revision="1" * 40,
+        embedding_dimension=2,
+        sample_rate=16_000,
+        downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+        window_samples=24_000,
+        window_shift_samples=12_000,
+        padding_policy_version="right-zero-pad-v1",
+        normalization_policy_version="int16-div-32768-l2-v1",
+        enrollment_aggregation_policy_version=(
+            "sample-centroid-equal-average-v1"
+        ),
+    )
+
+
+def speaker_embedding(axis: int) -> SpeakerEmbedding:
+    raw = (
+        b"\x00\x00\x80\x3f\x00\x00\x00\x00"
+        if axis == 0
+        else b"\x00\x00\x00\x00\x00\x00\x80\x3f"
+    )
+    return SpeakerEmbedding.from_bytes(raw, dimension=2)
+
+
+def speaker_profile(
+    profile_id: str,
+    name: str,
+    *,
+    axis: int,
+    compatible: bool = True,
+) -> SpeakerProfile:
+    policy = speaker_policy()
+    return SpeakerProfile(
+        id=profile_id,
+        name=name,
+        description=None,
+        embedding=speaker_embedding(axis),
+        embedding_model_id=policy.model_id,
+        embedding_model_revision=(
+            policy.model_revision if compatible else "2" * 40
+        ),
+        embedding_dimension=policy.embedding_dimension,
+        embedding_policy_fingerprint=policy.fingerprint,
+        sample_count=2,
+        created_at=CREATED_AT,
+        updated_at=CREATED_AT,
+    )
+
+
+def seal_job_input(storage: Storage) -> storage_module.JobInputRef:
+    upload = storage.begin_job_upload(CREATED_AT)
+    storage.append_job_upload(upload, b"audio")
+    return storage.seal_job_upload(upload)
+
+
+def assert_job_remains_receiving(
+    storage: Storage,
+    input_ref: storage_module.JobInputRef,
+) -> None:
+    row = storage._connection.execute(
+        """
+        SELECT phase, status, canonical_options_json,
+               selected_speaker_snapshot, snapshot_sha256,
+               input_size_bytes, effective_max_audio_samples,
+               effective_direct_max_audio_samples, total_samples,
+               request_fingerprint, processor_fingerprint
+        FROM transcription_jobs WHERE id = ?
+        """,
+        (input_ref.id,),
+    ).fetchone()
+    assert tuple(row[:2]) == ("receiving", None)
+    assert all(value is None for value in row[2:])
+    assert storage.get_visible_job(input_ref.id) is None
+    assert input_ref.path.is_file()
+    assert (
+        storage._connection.execute(
+            "SELECT phase FROM storage_leases WHERE id = ?",
+            (input_ref.id,),
+        ).fetchone()[0]
+        == "sealed"
+    )
 
 
 def patch_job_ids(
@@ -72,6 +197,12 @@ def patch_job_ids(
 
 def test_queued_job_spec_validation_and_generated_ids() -> None:
     spec = queued_spec()
+    assert tuple(field.name for field in fields(type(spec))) == (
+        "canonical_options_json",
+        "effective_max_audio_samples",
+        "effective_direct_max_audio_samples",
+        "processor_fingerprint",
+    )
     with pytest.raises(FrozenInstanceError):
         spec.effective_max_audio_samples = 1
 
@@ -87,7 +218,6 @@ def test_queued_job_spec_validation_and_generated_ids() -> None:
                 ":null", ": null"
             )
         },
-        {"selected_speaker_snapshot": '{"speakers":[]}'},
         {"total_samples": 1},
         {"effective_max_audio_samples": True},
         {"effective_max_audio_samples": 1.0},
@@ -104,8 +234,6 @@ def test_queued_job_spec_validation_and_generated_ids() -> None:
             "effective_max_audio_samples": DIRECT_MAX_SAMPLES + 1,
             "effective_direct_max_audio_samples": DIRECT_MAX_SAMPLES + 1,
         },
-        {"snapshot_sha256": "A" * 64},
-        {"request_fingerprint": "2" * 63},
         {"processor_fingerprint": "g" * 64},
     )
     for changes in invalid_changes:
@@ -182,7 +310,11 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
         lease = storage.begin_job_upload(CREATED_AT)
         spec = queued_spec()
         with pytest.raises(TypeError):
-            storage.publish_job(lease, spec)
+            storage.publish_job(
+                lease,
+                spec,
+                speaker_embedding_policy=speaker_policy(),
+            )
         with pytest.raises(TypeError):
             storage.append(lease, b"wrong-handle")
         with pytest.raises(TypeError):
@@ -196,6 +328,7 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
         assert isinstance(input_ref, storage_module.JobInputRef)
         assert input_ref.path == storage.staging_dir / "7K3M9Q2W.ready"
         assert input_ref.actual_bytes == 5
+        assert input_ref.content_sha256 == INPUT_SHA256
         assert storage.active_upload_count() == 0
         assert storage.total_reserved_bytes() == 5
         assert storage.get_visible_job(lease.id) is None
@@ -212,7 +345,11 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
         with pytest.raises(TypeError):
             storage.release_input(input_ref)
 
-        published = storage.publish_job(input_ref, spec)
+        published = storage.publish_job(
+            input_ref,
+            spec,
+            speaker_embedding_policy=speaker_policy(),
+        )
         assert published == storage.get_visible_job(lease.id)
         assert published.id == lease.id
         assert published.phase is jobs.JobPhase.VISIBLE
@@ -224,7 +361,9 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
         assert published.processed_samples == 0
         assert published.created_at == CREATED_AT
         assert published.canonical_options_json == spec.canonical_options_json
-        assert published.selected_speaker_snapshot == spec.selected_speaker_snapshot
+        assert published.selected_speaker_snapshot == EMPTY_SNAPSHOT
+        assert published.snapshot_sha256 == EMPTY_SNAPSHOT_SHA256
+        assert published.request_fingerprint == EMPTY_REQUEST_FINGERPRINT
         assert storage.get_visible_job("ABCDEFGH") is None
 
         with pytest.raises(ValueError):
@@ -239,9 +378,311 @@ def test_seal_then_publish_roundtrips_visible_job_and_rejects_stale_handles(
             )
 
         with pytest.raises(RuntimeError):
-            storage.publish_job(input_ref, spec)
+            storage.publish_job(
+                input_ref,
+                spec,
+                speaker_embedding_policy=speaker_policy(),
+            )
     finally:
         storage.close()
+
+
+def test_publish_reads_and_persists_a_sorted_known_speaker_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        storage.create_speaker_profile(
+            speaker_profile("00000002", "Bob", axis=1)
+        )
+        storage.create_speaker_profile(
+            speaker_profile("00000001", "艾丽丝", axis=0)
+        )
+        input_ref = seal_job_input(storage)
+
+        published = storage.publish_job(
+            input_ref,
+            queued_spec(canonical_options_json=KNOWN_OPTIONS_JSON),
+            speaker_embedding_policy=speaker_policy(),
+        )
+
+        assert published.selected_speaker_snapshot == KNOWN_SNAPSHOT
+        assert published.snapshot_sha256 == KNOWN_SNAPSHOT_SHA256
+        assert published.request_fingerprint == KNOWN_REQUEST_FINGERPRINT
+        assert published.processor_fingerprint == "3" * 64
+    finally:
+        storage.close()
+
+
+def test_publish_final_row_decode_failure_rolls_back_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        input_ref = seal_job_input(storage)
+
+        def reject_final_row(_row: sqlite3.Row) -> object:
+            raise StorageSchemaError("injected final job row decode failure")
+
+        monkeypatch.setattr(
+            storage_module,
+            "_decode_transcription_job",
+            reject_final_row,
+        )
+
+        with pytest.raises(
+            StorageSchemaError,
+            match="injected final job row decode failure",
+        ):
+            storage.publish_job(
+                input_ref,
+                queued_spec(),
+                speaker_embedding_policy=speaker_policy(),
+            )
+
+        assert_job_remains_receiving(storage, input_ref)
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("content_sha256", None),
+        ("content_sha256", 1),
+        ("content_sha256", b"not-a-digest"),
+        ("actual_bytes", True),
+        ("actual_bytes", -1),
+    ),
+)
+def test_publish_rejects_forged_exact_input_refs_before_database_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    invalid_value: object,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        input_ref = seal_job_input(storage)
+        forged = replace(input_ref, **{field: invalid_value})
+        statements: list[str] = []
+        storage._connection.set_trace_callback(statements.append)
+
+        with pytest.raises(
+            RuntimeError,
+            match="job upload handle is invalid",
+        ):
+            storage.publish_job(
+                forged,
+                queued_spec(),
+                speaker_embedding_policy=speaker_policy(),
+            )
+
+        assert statements == []
+        assert_job_remains_receiving(storage, input_ref)
+    finally:
+        storage._connection.set_trace_callback(None)
+        storage.close()
+
+
+@pytest.mark.parametrize("corrupt_digest", (None, "not-a-digest"))
+def test_publish_reports_corrupt_sealed_lease_digest_as_schema_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt_digest: str | None,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        input_ref = seal_job_input(storage)
+        with storage._transaction():
+            storage._connection.execute(
+                """
+                UPDATE storage_leases SET content_sha256 = ?
+                WHERE id = ?
+                """,
+                (corrupt_digest, input_ref.id),
+            )
+
+        with pytest.raises(StorageSchemaError):
+            storage.publish_job(
+                input_ref,
+                queued_spec(),
+                speaker_embedding_policy=speaker_policy(),
+            )
+
+        assert_job_remains_receiving(storage, input_ref)
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("failure", ("missing", "incompatible"))
+def test_publish_snapshot_failure_rolls_back_all_job_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        storage.create_speaker_profile(
+            speaker_profile("00000001", "艾丽丝", axis=0)
+        )
+        if failure == "incompatible":
+            storage.create_speaker_profile(
+                speaker_profile(
+                    "00000002",
+                    "Bob",
+                    axis=1,
+                    compatible=False,
+                )
+            )
+        input_ref = seal_job_input(storage)
+        error_type = (
+            speaker_snapshot.SelectedSpeakerNotFoundError
+            if failure == "missing"
+            else speaker_snapshot.SelectedSpeakerIncompatibleError
+        )
+
+        with pytest.raises(error_type):
+            storage.publish_job(
+                input_ref,
+                queued_spec(canonical_options_json=KNOWN_OPTIONS_JSON),
+                speaker_embedding_policy=speaker_policy(),
+            )
+
+        assert_job_remains_receiving(storage, input_ref)
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("mutation", ("update", "delete"))
+def test_publish_snapshot_and_profile_mutation_are_transactionally_ordered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    patch_job_ids(monkeypatch, "01234567")
+    publisher = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    mutator = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    publisher.create_speaker_profile(
+        speaker_profile("00000001", "艾丽丝", axis=0)
+    )
+    input_ref = seal_job_input(publisher)
+
+    profile_selected = threading.Event()
+    release_publish = threading.Event()
+    mutation_attempted = threading.Event()
+    published: list[object] = []
+    mutated: list[object] = []
+    original_decode = storage_module._decode_speaker_profile
+
+    def pause_after_profile_select(row: sqlite3.Row) -> SpeakerProfile:
+        profile = original_decode(row)
+        if not profile_selected.is_set():
+            profile_selected.set()
+            if not release_publish.wait(timeout=5):
+                raise AssertionError("publish transaction was not released")
+        return profile
+
+    monkeypatch.setattr(
+        storage_module,
+        "_decode_speaker_profile",
+        pause_after_profile_select,
+    )
+
+    def publish() -> None:
+        try:
+            published.append(
+                publisher.publish_job(
+                    input_ref,
+                    queued_spec(
+                        canonical_options_json=ONE_KNOWN_OPTIONS_JSON,
+                    ),
+                    speaker_embedding_policy=speaker_policy(),
+                )
+            )
+        except BaseException as error:
+            published.append(error)
+        finally:
+            profile_selected.set()
+
+    def trace_mutation(statement: str) -> None:
+        if statement.strip().upper().startswith("BEGIN IMMEDIATE"):
+            mutation_attempted.set()
+
+    mutator._connection.set_trace_callback(trace_mutation)
+
+    def mutate() -> None:
+        try:
+            with mutator._transaction():
+                if mutation == "update":
+                    mutator._connection.execute(
+                        """
+                        UPDATE speaker_profiles
+                        SET name = 'Updated Alice',
+                            name_key = 'updated alice'
+                        WHERE id = '00000001'
+                        """
+                    )
+                else:
+                    mutator._connection.execute(
+                        "DELETE FROM speaker_profiles "
+                        "WHERE id = '00000001'"
+                    )
+            mutated.append(mutator.get_visible_job(input_ref.id))
+        except BaseException as error:
+            mutated.append(error)
+
+    publish_thread = threading.Thread(target=publish)
+    mutation_thread = threading.Thread(target=mutate)
+    try:
+        publish_thread.start()
+        assert profile_selected.wait(timeout=2)
+
+        mutation_thread.start()
+        assert mutation_attempted.wait(timeout=2)
+        assert mutated == []
+
+        release_publish.set()
+        publish_thread.join(timeout=5)
+        mutation_thread.join(timeout=5)
+        assert not publish_thread.is_alive()
+        assert not mutation_thread.is_alive()
+        assert len(published) == 1
+        assert not isinstance(published[0], BaseException)
+        assert len(mutated) == 1
+        assert not isinstance(mutated[0], BaseException)
+
+        queued = published[0]
+        visible_after_mutation = mutated[0]
+        assert queued.selected_speaker_snapshot == OLD_ONE_SNAPSHOT
+        assert visible_after_mutation.status is jobs.JobStatus.QUEUED
+        assert (
+            visible_after_mutation.selected_speaker_snapshot
+            == OLD_ONE_SNAPSHOT
+        )
+        if mutation == "update":
+            assert (
+                mutator.get_speaker_profile("00000001").name
+                == "Updated Alice"
+            )
+        else:
+            assert mutator.get_speaker_profile("00000001") is None
+    finally:
+        release_publish.set()
+        if publish_thread.ident is not None:
+            publish_thread.join(timeout=5)
+        if mutation_thread.ident is not None:
+            mutation_thread.join(timeout=5)
+        mutator._connection.set_trace_callback(None)
+        publisher.close()
+        mutator.close()
 
 
 @pytest.mark.parametrize("sealed", (False, True))
@@ -372,7 +813,11 @@ def test_begin_job_upload_admission_and_fault_boundaries(
                             "ok",
                             storage,
                             ref,
-                            storage.publish_job(ref, queued_spec()),
+                            storage.publish_job(
+                                ref,
+                                queued_spec(),
+                                speaker_embedding_policy=speaker_policy(),
+                            ),
                         )
                     )
                 except StorageAdmissionError as error:
@@ -546,11 +991,15 @@ def test_seal_compensation_and_publish_do_not_leave_or_reread_input(
 
         monkeypatch.setattr(Path, "open", reject_large_input_read)
 
-        published = storage.publish_job(input_ref, queued_spec())
+        published = storage.publish_job(
+            input_ref,
+            queued_spec(),
+            speaker_embedding_policy=speaker_policy(),
+        )
 
         assert published.status is jobs.JobStatus.QUEUED
         assert published.input_size_bytes == input_ref.actual_bytes
-        assert published.request_fingerprint == "2" * 64
+        assert published.request_fingerprint == EMPTY_REQUEST_FINGERPRINT
     finally:
         storage.close()
 
@@ -807,7 +1256,11 @@ def test_startup_preserves_queued_input_and_cleans_unprotected_files(
     job_upload = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(job_upload, b"job-audio")
     job_ref = first.seal_job_upload(job_upload)
-    queued = first.publish_job(job_ref, queued_spec())
+    queued = first.publish_job(
+        job_ref,
+        queued_spec(),
+        speaker_embedding_policy=speaker_policy(),
+    )
 
     sync_writing = first.begin_upload("transcription")
     first.append(sync_writing, b"sync-writing")
@@ -870,7 +1323,11 @@ def test_startup_preflight_rejects_corruption_before_any_unlink(
     job_upload = first.begin_job_upload(CREATED_AT)
     first.append_job_upload(job_upload, b"job-audio")
     job_ref = first.seal_job_upload(job_upload)
-    first.publish_job(job_ref, queued_spec())
+    first.publish_job(
+        job_ref,
+        queued_spec(),
+        speaker_embedding_policy=speaker_policy(),
+    )
     sync = first.begin_upload("transcription")
     first.append(sync, b"sync-audio")
     strict_orphan = first.staging_dir / "JKMNPQRT.partial"
