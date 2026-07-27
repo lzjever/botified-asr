@@ -117,6 +117,15 @@ class RecordingAutoModelFactory:
         return model
 
 
+class RecordingInferenceLane:
+    def __init__(self) -> None:
+        self.operations: list[object] = []
+
+    def invoke(self, operation, /):
+        self.operations.append(operation)
+        return operation()
+
+
 def _snapshots(
     tmp_path: Path,
 ) -> dict[
@@ -281,6 +290,42 @@ def test_loader_resolves_both_pinned_specs_before_exact_distinct_construction_an
     assert vad_call[0]["cache"] == {}
     assert vad_call[0]["is_final"] is True
     assert vad_call[0]["chunk_size"] == 200
+
+
+def test_loader_shares_one_lane_across_warmup_and_later_asr_vad_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    lanes: list[RecordingInferenceLane] = []
+
+    def lane_factory() -> RecordingInferenceLane:
+        lane = RecordingInferenceLane()
+        lanes.append(lane)
+        return lane
+
+    monkeypatch.setattr(loader, "SerialInferenceLane", lane_factory)
+    factory = RecordingAutoModelFactory(events)
+    bundle = loader.load_funasr_model_bundle(
+        RecordingResolver(_snapshots(tmp_path), events),
+        device=DEVICE,
+        auto_model_factory=factory,
+    )
+
+    assert len(lanes) == 1
+    assert len(lanes[0].operations) == 2
+
+    bundle.asr.transcribe(np.zeros(16_000, dtype=np.int16))
+    bundle.vad.generate(
+        np.zeros(3_200, dtype=np.int16),
+        cache={},
+        is_final=True,
+    )
+
+    assert len(lanes[0].operations) == 4
+    assert len(factory.models[0].calls) == 2
+    assert len(factory.models[1].calls) == 2
 
 
 def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> None:

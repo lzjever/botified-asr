@@ -5,6 +5,7 @@ from typing import Protocol
 
 import numpy as np
 
+from botified_asr.inference import InferenceLane
 from botified_asr.pipeline import (
     DIRECT_MAX_SAMPLES,
     AsrResult,
@@ -51,8 +52,14 @@ class FunAsrAutoModel(Protocol):
 
 
 class FunAsrSenseVoiceBatchAdapter:
-    def __init__(self, model: FunAsrAutoModel) -> None:
+    def __init__(
+        self,
+        model: FunAsrAutoModel,
+        *,
+        inference_lane: InferenceLane,
+    ) -> None:
         self._model = model
+        self._inference_lane = inference_lane
 
     def transcribe(self, pcm: np.ndarray) -> AsrResult:
         return self.transcribe_batch((pcm,), language="auto")[0]
@@ -76,12 +83,14 @@ class FunAsrSenseVoiceBatchAdapter:
             item /= np.float32(32768.0)
             normalized.append(item)
 
-        raw_result = self._model.generate(
-            input=normalized,
-            language=language,
-            use_itn=True,
-            batch_size=len(normalized),
-            ban_emo_unk=False,
+        raw_result = self._inference_lane.invoke(
+            lambda: self._model.generate(
+                input=normalized,
+                language=language,
+                use_itn=True,
+                batch_size=len(normalized),
+                ban_emo_unk=False,
+            )
         )
         return _decode_sensevoice_batch(
             raw_result,
@@ -91,8 +100,14 @@ class FunAsrSenseVoiceBatchAdapter:
 
 
 class FunAsrStreamingVadAdapter:
-    def __init__(self, model: FunAsrAutoModel) -> None:
+    def __init__(
+        self,
+        model: FunAsrAutoModel,
+        *,
+        inference_lane: InferenceLane,
+    ) -> None:
         self._model = model
+        self._inference_lane = inference_lane
 
     def generate(
         self,
@@ -106,11 +121,13 @@ class FunAsrStreamingVadAdapter:
 
         normalized = pcm.astype(np.float32)
         normalized /= np.float32(32768.0)
-        result = self._model.generate(
-            input=normalized,
-            cache=cache,
-            is_final=is_final,
-            chunk_size=200,
+        result = self._inference_lane.invoke(
+            lambda: self._model.generate(
+                input=normalized,
+                cache=cache,
+                is_final=is_final,
+                chunk_size=200,
+            )
         )
         return _decode_markers(result)
 

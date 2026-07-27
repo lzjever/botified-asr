@@ -36,6 +36,15 @@ class FakeAutoModel:
         return self.raw_result
 
 
+class RecordingInferenceLane:
+    def __init__(self) -> None:
+        self.operations: list[object] = []
+
+    def invoke(self, operation, /):
+        self.operations.append(operation)
+        return operation()
+
+
 def _decode(
     raw_result: object,
     *,
@@ -50,7 +59,10 @@ def _decode(
 
 
 def _adapter(model: FakeAutoModel) -> object:
-    return funasr_adapter.FunAsrSenseVoiceBatchAdapter(model)  # type: ignore[attr-defined, no-any-return]
+    return funasr_adapter.FunAsrSenseVoiceBatchAdapter(  # type: ignore[attr-defined, no-any-return]
+        model,
+        inference_lane=RecordingInferenceLane(),
+    )
 
 
 def _raw_text(
@@ -590,7 +602,11 @@ def test_batch_adapter_accepts_480000_and_rejects_480001_before_upstream() -> No
 
 def test_batch_adapter_validates_every_item_before_calling_upstream() -> None:
     model = FakeAutoModel([CAPTURED_SPEECH_A, CAPTURED_SPEECH_B])
-    adapter = _adapter(model)
+    lane = RecordingInferenceLane()
+    adapter = funasr_adapter.FunAsrSenseVoiceBatchAdapter(
+        model,
+        inference_lane=lane,
+    )
     invalid = np.zeros(4, dtype=np.int16)[::2]
 
     with pytest.raises(PipelineError) as caught:
@@ -604,6 +620,7 @@ def test_batch_adapter_validates_every_item_before_calling_upstream() -> None:
 
     assert caught.value.code == "invalid_audio"
     assert model.calls == []
+    assert lane.operations == []
 
 
 def test_empty_batch_returns_empty_without_calling_upstream() -> None:

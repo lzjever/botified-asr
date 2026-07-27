@@ -11,6 +11,7 @@ from botified_asr.funasr_adapter import (
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
 )
+from botified_asr.inference import SerialInferenceLane
 from botified_asr.model_artifacts import (
     FSMN_VAD_SPEC,
     SENSEVOICE_SPEC,
@@ -78,8 +79,15 @@ def load_funasr_model_bundle(
             max_single_segment_time=29_790,
         )
 
-        asr = FunAsrSenseVoiceBatchAdapter(asr_model)
-        vad = FunAsrStreamingVadAdapter(vad_model)
+        inference_lane = SerialInferenceLane()
+        asr = FunAsrSenseVoiceBatchAdapter(
+            asr_model,
+            inference_lane=inference_lane,
+        )
+        vad = FunAsrStreamingVadAdapter(
+            vad_model,
+            inference_lane=inference_lane,
+        )
         silence = np.zeros(_WARMUP_SAMPLES, dtype=np.int16)
         asr.transcribe(silence)
         markers = vad.generate(silence, cache={}, is_final=True)

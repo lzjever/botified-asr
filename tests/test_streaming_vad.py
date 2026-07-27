@@ -17,6 +17,15 @@ class FakeAutoModel:
         return [{"key": "vad-fixture", "value": self.raw_markers}]
 
 
+class RecordingInferenceLane:
+    def __init__(self) -> None:
+        self.operations: list[object] = []
+
+    def invoke(self, operation, /):
+        self.operations.append(operation)
+        return operation()
+
+
 class FakeStreamingVadAdapter:
     def __init__(
         self,
@@ -69,7 +78,10 @@ def test_funasr_streaming_vad_adapter_maps_raw_envelope_to_typed_markers(
     original_pcm = pcm.copy()
     cache: dict[str, object] = {}
     model = FakeAutoModel(raw_markers)
-    adapter = FunAsrStreamingVadAdapter(model)
+    adapter = FunAsrStreamingVadAdapter(
+        model,
+        inference_lane=RecordingInferenceLane(),
+    )
 
     markers = adapter.generate(pcm, cache=cache, is_final=False)
 
@@ -104,7 +116,10 @@ def test_funasr_streaming_vad_adapter_rejects_impossible_markers(
 ) -> None:
     from botified_asr.funasr_adapter import FunAsrStreamingVadAdapter
 
-    adapter = FunAsrStreamingVadAdapter(FakeAutoModel(raw_markers))
+    adapter = FunAsrStreamingVadAdapter(
+        FakeAutoModel(raw_markers),
+        inference_lane=RecordingInferenceLane(),
+    )
 
     with pytest.raises(pipeline.PipelineError) as caught:
         adapter.generate(
@@ -114,6 +129,28 @@ def test_funasr_streaming_vad_adapter_rejects_impossible_markers(
         )
 
     assert caught.value.code == "invalid_model_output"
+
+
+def test_funasr_streaming_vad_adapter_rejects_invalid_input_before_lane() -> None:
+    from botified_asr.funasr_adapter import FunAsrStreamingVadAdapter
+
+    model = FakeAutoModel([])
+    lane = RecordingInferenceLane()
+    adapter = FunAsrStreamingVadAdapter(
+        model,
+        inference_lane=lane,
+    )
+
+    with pytest.raises(pipeline.PipelineError) as caught:
+        adapter.generate(
+            np.zeros(3_200, dtype=np.float32),
+            cache={},
+            is_final=False,
+        )
+
+    assert caught.value.code == "invalid_audio"
+    assert model.calls == []
+    assert lane.operations == []
 
 
 def test_streaming_vad_session_pairs_typed_cross_block_markers() -> None:
