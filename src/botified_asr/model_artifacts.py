@@ -36,12 +36,15 @@ class ModelArtifactIntegrityError(ModelArtifactError):
 class ModelArtifactFile:
     relative_path: str
     sha256: str
+    expected_bytes: int
 
     def __post_init__(self) -> None:
         if not _valid_relative_path(self.relative_path):
             raise ModelManifestError("Model artifact path is unsafe")
         if not isinstance(self.sha256, str) or _SHA256.fullmatch(self.sha256) is None:
             raise ModelManifestError("Model artifact SHA-256 is invalid")
+        if type(self.expected_bytes) is not int or self.expected_bytes <= 0:
+            raise ModelManifestError("Model artifact byte length is invalid")
 
 
 @dataclass(frozen=True)
@@ -221,7 +224,12 @@ class ModelArtifactResolver:
                 raise ModelArtifactIntegrityError(
                     "Model artifact is not a regular file"
                 )
-            if _file_sha256(path) != artifact.sha256:
+            if metadata.st_size != artifact.expected_bytes:
+                _raise_size_mismatch(missing_is_unavailable)
+            actual_bytes, actual_sha256 = _file_sha256(path)
+            if actual_bytes != artifact.expected_bytes:
+                _raise_size_mismatch(missing_is_unavailable)
+            if actual_sha256 != artifact.sha256:
                 raise ModelArtifactIntegrityError(
                     "Model artifact SHA-256 does not match its manifest"
                 )
@@ -280,15 +288,23 @@ def _raise_missing(missing_is_unavailable: bool) -> None:
     raise ModelArtifactIntegrityError("Existing model snapshot is incomplete")
 
 
-def _file_sha256(path: Path) -> str:
+def _raise_size_mismatch(missing_is_unavailable: bool) -> None:
+    if missing_is_unavailable:
+        raise ModelArtifactUnavailable("Fetched model artifact has an invalid size")
+    raise ModelArtifactIntegrityError("Existing model artifact has an invalid size")
+
+
+def _file_sha256(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
+    actual_bytes = 0
     try:
         with path.open("rb") as source:
             while chunk := source.read(_HASH_CHUNK_BYTES):
+                actual_bytes += len(chunk)
                 digest.update(chunk)
     except OSError as error:
         raise ModelArtifactIntegrityError("Model artifact could not be read") from error
-    return digest.hexdigest()
+    return actual_bytes, digest.hexdigest()
 
 
 def _remove_owned_staging(staging: Path) -> None:
@@ -315,22 +331,27 @@ SENSEVOICE_SPEC = ModelArtifactSpec(
         ModelArtifactFile(
             relative_path="model.pt",
             sha256="833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea",
+            expected_bytes=936_291_369,
         ),
         ModelArtifactFile(
             relative_path="configuration.json",
             sha256="02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e",
+            expected_bytes=396,
         ),
         ModelArtifactFile(
             relative_path="config.yaml",
             sha256="f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19",
+            expected_bytes=1_855,
         ),
         ModelArtifactFile(
             relative_path="am.mvn",
             sha256="29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5",
+            expected_bytes=11_203,
         ),
         ModelArtifactFile(
             relative_path="chn_jpn_yue_eng_ko_spectok.bpe.model",
             sha256="aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8",
+            expected_bytes=377_341,
         ),
     ),
 )
@@ -343,18 +364,22 @@ FSMN_VAD_SPEC = ModelArtifactSpec(
         ModelArtifactFile(
             relative_path="model.pt",
             sha256="b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5",
+            expected_bytes=1_721_366,
         ),
         ModelArtifactFile(
             relative_path="configuration.json",
             sha256="7bce8867e37d55c3dd8f672695ced18077a2be199ea529a5d432d5350fc0acba",
+            expected_bytes=365,
         ),
         ModelArtifactFile(
             relative_path="config.yaml",
             sha256="486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93",
+            expected_bytes=1_215,
         ),
         ModelArtifactFile(
             relative_path="am.mvn",
             sha256="df189fd5f4352df84a0fd464eeab4e450a5e645665d6b38f13c832492261a739",
+            expected_bytes=8_033,
         ),
     ),
 )

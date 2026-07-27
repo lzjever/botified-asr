@@ -11,29 +11,38 @@ from botified_asr import model_artifacts
 
 SENSEVOICE_REVISION = "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7"
 SENSEVOICE_SHA256 = "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea"
+SENSEVOICE_BYTES = 936_291_369
 SENSEVOICE_CONFIGURATION_SHA256 = (
     "02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e"
 )
+SENSEVOICE_CONFIGURATION_BYTES = 396
 SENSEVOICE_CONFIG_SHA256 = (
     "f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19"
 )
+SENSEVOICE_CONFIG_BYTES = 1_855
 SENSEVOICE_AM_MVN_SHA256 = (
     "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
 )
+SENSEVOICE_AM_MVN_BYTES = 11_203
 SENSEVOICE_BPE_SHA256 = (
     "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8"
 )
+SENSEVOICE_BPE_BYTES = 377_341
 FSMN_VAD_REVISION = "df20e6b30c653645fa4ff125cacfcabd1020a669"
 FSMN_VAD_SHA256 = "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5"
+FSMN_VAD_BYTES = 1_721_366
 FSMN_VAD_CONFIGURATION_SHA256 = (
     "7bce8867e37d55c3dd8f672695ced18077a2be199ea529a5d432d5350fc0acba"
 )
+FSMN_VAD_CONFIGURATION_BYTES = 365
 FSMN_VAD_CONFIG_SHA256 = (
     "486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93"
 )
+FSMN_VAD_CONFIG_BYTES = 1_215
 FSMN_VAD_AM_MVN_SHA256 = (
     "df189fd5f4352df84a0fd464eeab4e450a5e645665d6b38f13c832492261a739"
 )
+FSMN_VAD_AM_MVN_BYTES = 8_033
 
 
 def _sha256(payload: bytes) -> str:
@@ -56,6 +65,7 @@ def _spec(
             model_artifacts.ModelArtifactFile(
                 relative_path="model.bin",
                 sha256=_sha256(b"model"),
+                expected_bytes=len(b"model"),
             ),
         ),
     )
@@ -104,22 +114,27 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
             model_artifacts.ModelArtifactFile(
                 relative_path="model.pt",
                 sha256=SENSEVOICE_SHA256,
+                expected_bytes=SENSEVOICE_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="configuration.json",
                 sha256=SENSEVOICE_CONFIGURATION_SHA256,
+                expected_bytes=SENSEVOICE_CONFIGURATION_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="config.yaml",
                 sha256=SENSEVOICE_CONFIG_SHA256,
+                expected_bytes=SENSEVOICE_CONFIG_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="am.mvn",
                 sha256=SENSEVOICE_AM_MVN_SHA256,
+                expected_bytes=SENSEVOICE_AM_MVN_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="chn_jpn_yue_eng_ko_spectok.bpe.model",
                 sha256=SENSEVOICE_BPE_SHA256,
+                expected_bytes=SENSEVOICE_BPE_BYTES,
             ),
         ),
     )
@@ -131,18 +146,22 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
             model_artifacts.ModelArtifactFile(
                 relative_path="model.pt",
                 sha256=FSMN_VAD_SHA256,
+                expected_bytes=FSMN_VAD_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="configuration.json",
                 sha256=FSMN_VAD_CONFIGURATION_SHA256,
+                expected_bytes=FSMN_VAD_CONFIGURATION_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="config.yaml",
                 sha256=FSMN_VAD_CONFIG_SHA256,
+                expected_bytes=FSMN_VAD_CONFIG_BYTES,
             ),
             model_artifacts.ModelArtifactFile(
                 relative_path="am.mvn",
                 sha256=FSMN_VAD_AM_MVN_SHA256,
+                expected_bytes=FSMN_VAD_AM_MVN_BYTES,
             ),
         ),
     )
@@ -163,7 +182,35 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
             files=(
                 model_artifacts.ModelArtifactFile(
                     relative_path="model.bin",
+                    sha256=_sha256(b"model"),
+                    expected_bytes=0,
+                ),
+            )
+        ),
+        lambda: _spec(
+            files=(
+                model_artifacts.ModelArtifactFile(
+                    relative_path="model.bin",
+                    sha256=_sha256(b"model"),
+                    expected_bytes=-1,
+                ),
+            )
+        ),
+        lambda: _spec(
+            files=(
+                model_artifacts.ModelArtifactFile(
+                    relative_path="model.bin",
+                    sha256=_sha256(b"model"),
+                    expected_bytes=True,
+                ),
+            )
+        ),
+        lambda: _spec(
+            files=(
+                model_artifacts.ModelArtifactFile(
+                    relative_path="model.bin",
                     sha256="z" * 64,
+                    expected_bytes=len(b"model"),
                 ),
             )
         ),
@@ -172,6 +219,7 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
                 model_artifacts.ModelArtifactFile(
                     relative_path="/model.bin",
                     sha256=_sha256(b"model"),
+                    expected_bytes=len(b"model"),
                 ),
             )
         ),
@@ -180,6 +228,7 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
                 model_artifacts.ModelArtifactFile(
                     relative_path="../model.bin",
                     sha256=_sha256(b"model"),
+                    expected_bytes=len(b"model"),
                 ),
             )
         ),
@@ -188,10 +237,12 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
                 model_artifacts.ModelArtifactFile(
                     relative_path="config",
                     sha256=_sha256(b"config"),
+                    expected_bytes=len(b"config"),
                 ),
                 model_artifacts.ModelArtifactFile(
                     relative_path="config/x.json",
                     sha256=_sha256(b"nested"),
+                    expected_bytes=len(b"nested"),
                 ),
             )
         ),
@@ -201,6 +252,9 @@ def test_pinned_model_manifests_are_exact_and_immutable() -> None:
         "short_revision",
         "modelscope_provider",
         "empty_provider",
+        "zero_expected_bytes",
+        "negative_expected_bytes",
+        "bool_expected_bytes",
         "invalid_sha256",
         "absolute_artifact",
         "parent_traversal",
@@ -223,8 +277,9 @@ def test_revision_is_part_of_the_isolated_snapshot_path(tmp_path: Path) -> None:
         revision="1111111111111111111111111111111111111111",
         files=(
             model_artifacts.ModelArtifactFile(
-                "model.bin",
-                _sha256(first_payload),
+                relative_path="model.bin",
+                sha256=_sha256(first_payload),
+                expected_bytes=len(first_payload),
             ),
         ),
     )
@@ -232,8 +287,9 @@ def test_revision_is_part_of_the_isolated_snapshot_path(tmp_path: Path) -> None:
         revision="2222222222222222222222222222222222222222",
         files=(
             model_artifacts.ModelArtifactFile(
-                "model.bin",
-                _sha256(second_payload),
+                relative_path="model.bin",
+                sha256=_sha256(second_payload),
+                expected_bytes=len(second_payload),
             ),
         ),
     )
@@ -271,7 +327,11 @@ def test_invalid_existing_cache_is_integrity_error_without_fetch_or_repair(
     }
     spec = _spec(
         files=tuple(
-            model_artifacts.ModelArtifactFile(path, _sha256(payload))
+            model_artifacts.ModelArtifactFile(
+                relative_path=path,
+                sha256=_sha256(payload),
+                expected_bytes=len(payload),
+            )
             for path, payload in payloads.items()
         )
     )
@@ -310,13 +370,22 @@ def test_invalid_existing_cache_is_integrity_error_without_fetch_or_repair(
     assert fetcher.calls == []
     assert not config_path.exists()
 
-    config_path.write_bytes(b"wrong")
+    config_path.write_bytes(b"x")
+    with pytest.raises(model_artifacts.ModelArtifactIntegrityError) as wrong_size:
+        resolver.resolve(spec)
+
+    assert type(wrong_size.value) is model_artifacts.ModelArtifactIntegrityError
+    assert fetcher.calls == []
+    assert config_path.read_bytes() == b"x"
+
+    wrong_hash = b"x" * len(payloads["config/config.json"])
+    config_path.write_bytes(wrong_hash)
     with pytest.raises(model_artifacts.ModelArtifactIntegrityError) as mismatch:
         resolver.resolve(spec)
 
     assert type(mismatch.value) is model_artifacts.ModelArtifactIntegrityError
     assert fetcher.calls == []
-    assert config_path.read_bytes() == b"wrong"
+    assert config_path.read_bytes() == wrong_hash
 
 
 def test_miss_fetches_to_same_parent_partial_then_atomically_publishes(
@@ -354,6 +423,8 @@ def test_miss_fetches_to_same_parent_partial_then_atomically_publishes(
     (
         ("missing", model_artifacts.ModelArtifactUnavailable),
         ("hash_mismatch", model_artifacts.ModelArtifactIntegrityError),
+        ("size_short", model_artifacts.ModelArtifactUnavailable),
+        ("size_long", model_artifacts.ModelArtifactUnavailable),
         ("removed_root", model_artifacts.ModelArtifactUnavailable),
     ),
 )
@@ -372,6 +443,10 @@ def test_invalid_fetch_cleans_partial_and_never_publishes(
         destination.mkdir(parents=True, exist_ok=True)
         if mode == "hash_mismatch":
             (destination / "model.bin").write_bytes(b"wrong")
+        elif mode == "size_short":
+            (destination / "model.bin").write_bytes(b"x")
+        elif mode == "size_long":
+            (destination / "model.bin").write_bytes(b"model!")
         elif mode == "removed_root":
             destination.rmdir()
 
