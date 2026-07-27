@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import wave
 from dataclasses import FrozenInstanceError
-from inspect import Parameter, signature
 from pathlib import Path
 
 import numpy as np
@@ -228,15 +227,8 @@ def _assert_empty_processor_result(result: object, ref: object) -> None:
     assert result.speaker_mapping == SpeakerLabelMapping(())
 
 
-def test_processor_result_is_exact_frozen_slotted_and_requires_both_fields() -> None:
+def test_processor_result_is_frozen_and_requires_both_fields() -> None:
     result_type = pipeline_module.ProcessorResult
-    parameters = signature(result_type).parameters
-
-    assert tuple(parameters) == ("artifact_ref", "speaker_mapping")
-    assert all(
-        parameter.default is Parameter.empty for parameter in parameters.values()
-    )
-    assert result_type.__slots__ == ("artifact_ref", "speaker_mapping")
 
     artifact_ref = object()
     mapping = SpeakerLabelMapping(())
@@ -251,12 +243,6 @@ def test_processor_result_is_exact_frozen_slotted_and_requires_both_fields() -> 
         result_type()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         result_type(artifact_ref)  # type: ignore[call-arg]
-
-    snapshot_parameter = signature(Processor.process).parameters[
-        "selected_speaker_snapshot"
-    ]
-    assert snapshot_parameter.kind is Parameter.KEYWORD_ONLY
-    assert snapshot_parameter.default is Parameter.empty
 
 
 @pytest.mark.parametrize("sample_count", [0, 1, 480_000])

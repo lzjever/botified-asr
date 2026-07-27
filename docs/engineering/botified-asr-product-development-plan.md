@@ -1,6 +1,4 @@
 # Botified ASR 产品开发计划
-
-> 状态：Team Review 通过，可交付开发
 > 目标仓库：`botified-asr`
 > 研究基线：2026-07-26
 > 上游基线：FunASR `1.3.29`（`8a34247d`）、SenseVoiceSmall、FSMN-VAD、CAM++
@@ -120,28 +118,28 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 
 ### 4.3 版本固定
 
-- Python 固定为 `3.11.13`。FunASR 的上游源码审计基线固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`；运行时只安装官方 PyPI `funasr==1.3.29` wheel `https://files.pythonhosted.org/packages/9c/10/0a43f6233db074e263c025718afff7e7960976ef5e545c40c92c5f59f1c9/funasr-1.3.29-py3-none-any.whl`，其 SHA-256 固定为 `bc022d3f80cab635227841a401cc872e5b863a207f8fa01262f15c42ed630137`，大小固定为 `956044` bytes；不得在运行时改从 Git tree、sdist 或其他同版本 artifact 安装。
-- 三方供应链审计确认该 wheel 发布的 425 个 `funasr/**` 文件与上述 commit 中的同路径文件逐字节一致；commit-only 的 28 个文件不属于当前 SenseVoice、FSMN-VAD、CAM++ 支持路径。未来启用 `EnglishTextNormalizer`、RWKV 或这些省略文件承载的其他能力前必须重新审计并更新 runtime artifact gate。该一致性结论是本项目的审计证据，不是发布者对 wheel 来源的加密证明；commit 只固定源码审计基线，wheel URL、hash 和 size 才固定实际安装物，二者不得相互替代。
+- Python 固定为 `3.11.13`。FunASR 的上游源码基线固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`；运行时只安装官方 PyPI `funasr==1.3.29` wheel `https://files.pythonhosted.org/packages/9c/10/0a43f6233db074e263c025718afff7e7960976ef5e545c40c92c5f59f1c9/funasr-1.3.29-py3-none-any.whl`，其 SHA-256 固定为 `bc022d3f80cab635227841a401cc872e5b863a207f8fa01262f15c42ed630137`，大小固定为 `956044` bytes；不得在运行时改从 Git tree、sdist 或其他同版本 artifact 安装。
+- 该 wheel 发布的 425 个 `funasr/**` 文件与上述 commit 中的同路径文件逐字节一致；commit-only 的 28 个文件不属于当前 SenseVoice、FSMN-VAD、CAM++ 支持路径。启用 `EnglishTextNormalizer`、RWKV 或这些省略文件承载的其他能力前必须重新核对并更新 runtime artifact manifest。commit 固定源码基线，wheel URL、hash 和 size 固定实际安装物，二者不得相互替代。
 - CPU release 的 `torch` 和 `torchaudio` 均固定为 `2.11.0+cpu`，只从 PyTorch 官方 CPU index `https://download.pytorch.org/whl/cpu` 解析和安装；不得让通用 PyPI 或其他额外 index 覆盖这两个 artifact。
 - CUDA runtime、对应的 PyTorch artifact 和模型必须在各自 release 构建前精确固定；CPU pin 不自动成为 CUDA pin。
 - 发布镜像不得在启动时执行 `pip install -U`。
 - SenseVoice、FSMN-VAD、CAM++ 固定到下列 Hugging Face immutable commit；禁止解析 alias/master 后再记录“实际 revision”：
 
-| 模型 | Hugging Face immutable revision | primary weight artifact | primary weight 预期 SHA-256 | 校验状态 |
-|---|---|---|---|---|
-| SenseVoiceSmall | `FunAudioLLM/SenseVoiceSmall@3847d57b6bdf2dd8875cb1508d2af43d80a16bf7` | `model.pt` | `833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea` | 当前来自 Hugging Face LFS 元数据；release 前必须本地隔离下载复算 |
-| FSMN-VAD | `funasr/fsmn-vad@df20e6b30c653645fa4ff125cacfcabd1020a669` | `model.pt` | `b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5` | 已本地复算 |
-| CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` | 已本地复算 |
+| 模型 | Hugging Face immutable revision | primary weight artifact | primary weight 预期 SHA-256 |
+|---|---|---|---|
+| SenseVoiceSmall | `FunAudioLLM/SenseVoiceSmall@3847d57b6bdf2dd8875cb1508d2af43d80a16bf7` | `model.pt` | `833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea` |
+| FSMN-VAD | `funasr/fsmn-vad@df20e6b30c653645fa4ff125cacfcabd1020a669` | `model.pt` | `b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5` |
+| CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` |
 
-- 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 在 Phase 3 接入 loader 前必须建立同等完整的 runtime manifest。
+- 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 接入 loader 前必须建立同等完整的 runtime manifest。
 - 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
 - SenseVoice、FSMN-VAD、CAM++ 各加载一个单例 adapter；所有 model call 共用唯一串行 inference lane。
 - 仓库代码采用 MIT license；每个 release 提供 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
 - SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由 installer 按固定来源/hash下载，不以技术便利替代许可判断。
 - SenseVoice 的预期 artifact hash 在 release 前必须由本地隔离下载重新计算并与 manifest 比较，不能只抄远端元数据。
-- aarch64 CPU artifact 必须通过原生 aarch64 runner 的 fresh-install、模型加载和固定 smoke gate；x86_64 上的交叉构建不能替代该 gate。
-- CUDA artifact 使用独立依赖锁、image digest 和真实 NVIDIA/CUDA runner gate；未经该审查不得沿用 CPU 结论或标记 CUDA 受支持。
+- aarch64 CPU artifact 必须在原生 aarch64 runner 完成 fresh-install、模型加载和固定 smoke；x86_64 上的交叉构建不能替代。
+- CUDA artifact 使用独立依赖锁、image digest，并在真实 NVIDIA/CUDA runner 验证；未经验证不得沿用 CPU 结论或标记 CUDA 受支持。
 
 ### 4.4 可复现 fingerprint
 
@@ -682,7 +680,7 @@ bounded upload
 - ffmpeg 只把 bounded PCM block 交给 FSMN-VAD `generate` 的 request-local cache，消费边界后立即丢弃已确认历史；
 - 只有不超过 30 秒的 segment ndarray 可交给 SenseVoice 和 CAM++；
 - adapter 不接受原始上传路径，不允许上游入口再次加载完整媒体；
-- 12 小时验收记录 request-local VAD cache 的 tensor bytes；首个 10 分钟 warmup 后到结束增长不得超过 1 MiB，且 cache 中不得出现 confirmed-segment 历史列表。
+- 12 小时测试采集 request-local VAD cache 的 tensor bytes；首个 10 分钟 warmup 后到结束增长不得超过 1 MiB，且 cache 中不得出现 confirmed-segment 历史列表。
 
 公开入口只调用一个 mode-neutral processor：
 
@@ -852,7 +850,7 @@ anonymous clustering
 
 - threshold 和 top-two margin 是服务级固定模型策略，不由每个客户端随意调整。
 - 阈值必须通过真实设备、普通话/英语和不同麦克风样本校准。
-- enrollment threshold、anonymous-cluster threshold、match threshold 和 top-two margin 与 embedding policy fingerprint 一起固定；变更任一值需要重新跑同一 identity acceptance。
+- enrollment threshold、anonymous-cluster threshold、match threshold 和 top-two margin 与 embedding policy fingerprint 一起固定；变更任一值需要重新跑同一 identity 测试。
 - 相似度达到阈值但与第二名区分不足时保持 Unknown。
 - 多个 anonymous cluster 可以匹配同一已知人物，以容忍长会议 cluster fragmentation。
 - 匹配只使用声音；name 和 description 不进入模型。
@@ -1079,44 +1077,7 @@ storage_leases(
 - 已进入底层 CPU/GPU 推理的单次调用不承诺可抢占；超过 grace 由 systemd 在 `TimeoutStopSec=120` 后终止进程，启动恢复依据 shutdown marker 从头重排 job 且不计为 crash retry。
 - 成功到达安全点的 running job 在退出事务中回到 queued；sync 请求在 grace 内未完成则断开并清理，不转换为 async。
 
-## 13. 仓库结构
-
-首版结构：
-
-```text
-botified-asr/
-├── pyproject.toml
-├── uv.lock
-├── src/botified_asr/
-│   ├── main.py
-│   ├── config.py
-│   ├── api.py
-│   ├── audio.py
-│   ├── pipeline.py
-│   ├── jobs.py
-│   ├── speakers.py
-│   └── storage.py
-├── tests/
-│   ├── test_api_contract.py
-│   ├── test_jobs.py
-│   ├── test_speakers.py
-│   ├── test_pipeline_projection.py
-│   └── live/
-├── skills/botified-asr/
-├── deploy/
-│   ├── Containerfile.cpu
-│   ├── Containerfile.cuda
-│   └── botified-asr.service
-├── scripts/
-│   ├── release
-│   └── live-acceptance
-└── docs/
-    ├── engineering/
-    ├── api.md
-    └── deployment.md
-```
-
-约束：
+## 13. 代码组织
 
 - 不先拆成多个 Python package。
 - 不创建通用 repository/service/use-case 分层。
@@ -1134,8 +1095,7 @@ botified-asr/
 - `botified-asr-skill.tar.gz`；
 - `botified-asr-smoke.flac` 固定短转写音频；
 - 版本和 image digest manifest；
-- 离线生成的 OpenAPI JSON；
-- release smoke 结果。
+- 离线生成的 OpenAPI JSON。
 
 `botified-releases` 公开：
 
@@ -1167,7 +1127,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 2. 检测 Linux x86_64/aarch64；不支持的平台在下载大资产前失败。
 3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
 4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
-5. 只依据已验证的 runtime/image matrix 选择 device 和 image；CPU artifact 中 `device=auto` 与 `device=cpu` 都 canonicalize 为 CPU，只有 manifest 含目标平台 CUDA digest 且 NVIDIA runtime gate 通过时才可选择 CUDA artifact。
+5. 只依据已验证的 runtime/image matrix 选择 device 和 image；CPU artifact 中 `device=auto` 与 `device=cpu` 都 canonicalize 为 CPU，只有 manifest 含目标平台 CUDA digest 且 NVIDIA runtime 验证通过时才可选择 CUDA artifact。
 6. 按选定的 manifest digest 拉取对应 OCI image。
 7. 创建配置、credential、data 和 model cache 目录；data 与 model cache 使用互不相等、互不嵌套的独立持久 mount。
 8. 未提供 API Key 时生成安全随机 token，分别写入 mode `0600` 的 `service.env` 和 §10.3 `client.env`；不得回显。
@@ -1210,24 +1170,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - `BOTIFIED_ASR_VERSION=vX.Y.Z` 由安装器解析为 `asr-vX.Y.Z` release，并拉取 `ghcr.io/lzjever/botified-asr:vX.Y.Z` 的固定 digest。
 - Botified Core、Gateway 和 ASR 不要求同版本发布。
 - `botified-releases` README 说明各组件独立安装，避免“全家桶”心智。
-
-### 14.4 发布门
-
-一次正式发布必须证明：
-
-- manifest 声明的每个平台/device image 均能按 digest 拉取；
-- CPU 安装路径完成 health 和短音频 smoke；
-- Linux x86_64 与 aarch64 的 CPU artifact 分别完成 fresh-install smoke；
-- 发布 CUDA artifact 前必须在真实 NVIDIA/CUDA runner 完成同一 smoke；当次无法验证时不发布 CUDA image，也不得标记 CUDA 受支持；
-- installer checksum failure 会在执行资产前阻断；
-- 重复安装不丢配置、speaker database 或未过期 job；
-- 模拟新版本 smoke 失败后旧版本继续 ready，且数据未丢失；
-- 默认 uninstall 后重新安装可复用数据，`--purge` 才删除；
-- Skill 可独立安装；
-- 新主机依次运行服务和 Skill 安装器后，不做额外配置即可由 helper 完成 health 和短音频转写；远程模式使用同一 `client.env` 完成相同验收；
-- release manifest、image label、`botified-asr --version` 一致。
-
-不为安装脚本再写第二套 installer framework；扩展 `botified-releases` 已有 checksum 测试 harness。
+- release manifest、image label 和 `botified-asr --version` 必须一致。
 
 ## 15. 通用 Agent Skill
 
@@ -1314,170 +1257,17 @@ speaker-delete
 - 本地服务安装后的 Skill 自动使用既有 `client.env`；远程模式只把显式 URL/Key 写入同一文件。
 - 不把服务 URL 或 token 写入 Skill 内容。
 
-## 16. 实施阶段
+## 16. 测试策略
 
-开发团队应连续完成以下阶段，不把某一阶段当作可发布的半成品。
-
-### Phase 1：仓库、依赖和基础 API
-
-交付：
-
-- Python/uv 项目；
-- 固定依赖和必需 CPU image；CUDA 仅在本 release manifest 声明支持时交付；
-- config loader；
-- Bearer auth；
-- `/health/live`、`/health/ready`；
-- OpenAI error envelope；
-- bounded multipart upload；
-- transcription sync/async 与 speaker enrollment 共用的 SQLite storage lease、原子 storage reservation、受控 staging 和 writing lease cleanup 最小底座；
-- `/v1/models`。
-
-完成条件：
-
-- 无模型时契约测试可运行；
-- 模型未 ready 时不会接收转写；
-- 1 GiB 之外的流式上传在应用层有界拒绝。
-- 上传拒绝、断连或启动恢复后，Phase 1 共用底座不会遗留 staging 文件或 reservation。
-
-### Phase 2：Canonical 音频 pipeline
-
-首批交付：
-
-- single generic storage ledger、typed lease/artifact handles 和带 reservation 的 byte writer；
-- ffprobe/ffmpeg wrapper 与 §8.2 的 9,600-sample streaming PCM decode contract；
-- direct path 的 0/480,000/480,001 sample 边界；
-- 注入 fake structured SenseVoice adapter 的唯一 processor、sample-based canonical JSONL `SegmentSink` 和 opaque artifact ref；
-- 共用 canonical text join helper；
-- 一个 runtime-generated representative WAV ffmpeg direct fixture 的 `json`、`text`、`verbose_json` projection。
-
-首批完成条件：
-
-- 0 sample 成功空结果且模型零调用，480,001 sample 失败且 model/sink 无成功记录或残留 reservation；
-- decoder block 的 dtype、shape、sample offset、odd-byte/cancellation/ffmpeg failure 行为有边界测试；
-- artifact begin/expand、sealed/release、fault 和启动 orphan cleanup 不突破总 reservation，artifact 不占 `max_active_uploads`；
-- sync API 只装配并调用该 processor，没有第二套 transcriber；
-- JSONL escaping、截断 fail-closed、sample-to-second projection 和 §8.4 join golden 由同一组 helper tests 拥有。
-
-下一批在不改写上述 processor、adapter、SegmentSink 或 artifact 接口的前提下增加 streaming FSMN-VAD、SenseVoice batching、真实模型 smoke、clean text、语言/timestamp 聚合和 emotion/event raw parser。30 秒强切阈值固定；首批只暂缓尚未通过真实 spike 的强切后 padding、continuation 和 cache-reset 细节，不预先冻结 rich control-token 细节。
-
-Phase 2 整体完成条件：
-
-- 短音频和长音频 VAD 复用同一路径；
-- 进程 RSS 不随 decoded duration 线性增长；
-- 控制 token 不泄漏到正文；
-- 真实模型兼容性由 Phase 2 的固定 real-model smoke 唯一拥有，clean/rich 行为由本 Phase 的 parser tests 唯一拥有；后续阶段只引用同一结果，不复制测试套件或另建 gate report。
-
-### Phase 3：Diarization 和人物注册
-
-交付：
-
-- CAM++ embedding；
-- 有界 anonymous speaker state；
-- `diarized_json`；
-- `/v1/speakers` CRUD；
-- profile snapshot；
-- threshold + margin known-speaker mapping。
-
-完成条件：
-
-- 同一会议 speaker label 稳定；
-- 未达到判据时保持 Unknown；
-- 原始注册音频在成功或失败后均删除；
-- 删除/更新 profile 不改变运行中 job snapshot。
-
-### Phase 4：Durable long jobs
-
-交付：
-
-- `Prefer: respond-async`；
-- 8-char job IDs；
-- SQLite job state；
-- executor、progress、cancel/delete；
-- crash recovery；
-- bounded batch yielding；
-- 在 Phase 1 共用上传底座上扩展完整 job artifact accounting、retention 和 job admission。
-
-完成条件：
-
-- sync/async 使用同一个 processor；
-- 服务重启不会产生假 succeeded 或遗失 queued job；
-- 500 MiB acceptance 不 OOM；
-- 长 job 运行期间短请求仍能在 batch 间执行。
-
-### Phase 5：安装、发布和 Skill
-
-交付：
-
-- 必需 CPU OCI image，以及本 release manifest 可选声明的 CUDA image；
-- `install-asr.sh`；
-- systemd unit/wrapper；
-- release manifest/digests/checksums；
-- Agent Skill 和 helper；
-- `install-asr-skill.sh`；
-- API、部署、隐私文档。
-
-完成条件：
-
-- 新 Linux 主机一条安装命令可得到 ready 服务；
-- Skill 不依赖服务安装器，可单独安装；
-- Codex、OpenClaw、Botified 各完成一次 discovery 和真实调用。
-
-### Phase 6：真实环境验收和收口
-
-交付：
-
-- 短语音 Botified Gateway e2e；
-- 五种目标语言的代表性 smoke；
-- 500 MiB 长会议 acceptance；
-- 两位已注册人物 + 至少一位 Unknown 的会议验收；
-- manifest 声明平台/device 的基准记录；
-- release candidate 安装/升级/卸载检查。
-
-完成条件：
-
-- 所有验收项通过；
-- 不存在未定的 P0 产品语义；
-- 不以 TODO 代替 error、cleanup、restart 或 privacy 行为。
-
-## 17. 测试策略
-
-### 17.1 测试原则
+### 16.1 测试原则
 
 - 测本服务拥有的契约，不复制 FunASR 单元测试。
-- 一个行为在最接近 owner 的层级测试一次。
+- 一个行为在最接近实现的层级测试一次。
 - API contract 用轻量 fake model adapter；真实模型路径用少量 integration/live smoke。
 - 不将几百 MB fixture 提交进 Git。
-- 性能和模型质量不放进每次普通 unit gate。
-- Phase 完成条件、发布门和总体验收引用同一组带 ID 的 test result；五语言、installer、Skill 和长文件各只有一个 owner，不因文档多处引用而重复实现。
-- 公开 release smoke 只保存版本、结构、耗时和 redacted pass/fail，不保存 transcript、speaker 名称或声音样本。
+- 性能和模型质量不放进每次普通 unit test。
 
-### 17.2 默认 CI
-
-必须覆盖：
-
-- config 解析、未知字段和边界；
-- auth；
-- multipart 实际字节限制和临时文件清理；
-- OpenAI request/response/error contract；
-- `text/plain`；
-- include parser；
-- job 状态机、原子提交、restart recovery、cancel；
-- 8-char ID collision retry；
-- speaker CRUD、唯一 name、snapshot；
-- threshold + margin 匹配；
-- storage admission 和 retention；
-- Skill frontmatter/helper 静态验证；
-- 生成 manifest/artifact 的结构和 checksum 字段；installer shell 行为只由 `botified-releases/tests/installers.sh` 验证，本仓库消费其发布门结果。
-- 固定一个受支持的 OpenAI Python SDK 版本，运行一条基础同步 `{text}` smoke，验证本服务的 wire contract。
-
-不需要：
-
-- mock FunASR 的每个内部函数；
-- 为同一 error 在 unit、API、e2e 重复穷举；
-- 在 CI 下载全部模型；
-- 穷举测试第三方 OpenAI SDK 自身解析器；只保留上一条单 smoke，不复制 SDK 测试。
-
-### 17.3 Real model integration
+### 16.2 Real model integration
 
 使用固定小样本覆盖：
 
@@ -1492,9 +1282,9 @@ Phase 2 整体完成条件：
 
 只验证服务集成和输出结构，不把单句逐字结果写成脆弱 snapshot。
 
-### 17.4 长音频和恢复验收
+### 16.3 长音频和恢复测试
 
-仓库只保存一个 checksum 固定、许可清晰的约 60 秒双人非静音 fixture。验收机使用固定命令重复编码：
+仓库只保存一个 checksum 固定、许可清晰的约 60 秒双人非静音 fixture。测试机使用固定命令重复编码：
 
 ```bash
 ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
@@ -1503,7 +1293,7 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 
 脚本断言输出可完整解码、duration 为 `16384 ± 0.1` 秒且文件大小在 500–501 MiB；生成文件不提交 Git。另用同一 source 生成恰好 12 小时、低于 1 GiB 的固定 codec 压缩媒体，并断言实际 PCM sample count 为 12 小时。
 
-模型 cache 预热后，在测试开始前从版本化 `acceptance.yaml` 读取并记录硬预算。首版默认发布门为：
+模型 cache 预热后使用以下固定资源上限：
 
 - CPU container memory limit 8 GiB；
 - CUDA runner GPU memory budget 8 GiB，host container memory limit 8 GiB；
@@ -1511,19 +1301,15 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 - 按 `processed_audio_secs` 分桶：首个音频小时后任一 30 分钟音频窗口的 RSS median 不得比首个音频小时 median 高 256 MiB，不依赖任务实际 wall time；
 - 不含预热 model cache 的 job data 磁盘增量不超过 2 GiB。
 
-低于这些预算的受支持硬件可以另行记录，发布不得在测试开始后放宽预算。
+以下五个场景分别覆盖对应边界：
 
-按风险使用恰当大小的独立 owner 场景：
-
-1. **500 MiB**：一个 job 完成 upload、decode 和 transcription，验证 byte/storage reservation、RSS/GPU/disk 硬门，不注入状态机 fault。
+1. **500 MiB**：一个 job 完成 upload、decode 和 transcription，验证 byte/storage reservation、RSS/GPU/disk 上限，不注入状态机 fault。
 2. **12 小时**：一个压缩媒体 job 只验证实际 PCM duration cap、VAD cache plateau、有界资源和最终结果；不重复承担 crash 测试。
-3. **Crash/CAS 唯一 owner**：1–5 分钟 fixture 使用 fake/fast adapter 精确覆盖 `.complete` rename 前后、cancel-vs-success、receiving/deleting、shutdown marker 生命周期；另用跨越至少五个 inference unit 的中型真实模型任务做一次进程 `SIGKILL` 和从头恢复。两者属于同一 recovery acceptance，不在巨型任务复测。
+3. **Crash/CAS**：1–5 分钟 fixture 使用 fake/fast adapter 精确覆盖 `.complete` rename 前后、cancel-vs-success、receiving/deleting、shutdown marker 生命周期；另用跨越至少五个 inference unit 的中型真实模型任务做一次进程 `SIGKILL` 和从头恢复。
 4. **取消**：中型任务运行后 DELETE；五分钟内进入 cancelled，ffmpeg、partial、attempt artifact 和 reservation 清零，随后第二次 DELETE 删除 job。
 5. **公平性**：足够跨越至少五个 inference unit 的中型 job；先用 20 次预热短请求建立 idle p95，再在 long job running 时提交固定 10 秒同步请求，要求在 long job terminal 前完成且延迟不超过 idle p95 三倍加 5 秒。
 
-live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision、各 pipeline 时间和 cleanup 结果。身份误匹配由 §17.6 唯一拥有。
-
-### 17.5 Skill acceptance
+### 16.4 Skill 测试
 
 同一 skill artifact：
 
@@ -1533,44 +1319,30 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 
 三次 smoke 验证的是不同 runtime discovery 边界，不复制 async/speaker API 测试，也不维护三份 Skill 内容。
 
-### 17.6 已知人物质量门
+### 16.5 已知人物质量指标
 
 - 使用未参与阈值拟合和 enrollment 的 held-out 中英文 fixture；至少两位已知人物、三位未知人物、两类录音设备。
 - 每位已知人物使用 2–5 个 enrollment 样本，另有至少 10 个 held-out utterance；未知人物合计至少 30 个 utterance。
 - 已知人物正确命名率至少 90%，未知 utterance 的 false-known assignment 必须为 0；低 margin 保持 `Unknown`。
-- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 VAD -> window embedding -> clustering -> centroid matching -> response projection；该结果同时是 Phase 6 的人物会议验收，不另建第二份。
-- synthetic vector 只单测 threshold/margin 数学边界；真实 fixture 只在 model policy/revision 变化和 release candidate 运行，不在每次普通 CI 重复。
+- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 VAD -> window embedding -> clustering -> centroid matching -> response projection。
+- synthetic vector 只单测 threshold/margin 数学边界；真实 fixture 在 model policy/revision 变化时运行，不在每次普通 CI 重复。
 
-## 18. 性能和可靠性验收
+## 17. 性能指标
 
-### 18.1 必须满足
-
-- 无 VAD 当前 segment 之外没有无界 PCM 内存。
-- 有 VAD 当前 segment buffer 有硬上限。
-- Job queue、upload、decode channel、inference admission 全部有界。
-- 一个 GPU 默认只加载一套 SenseVoice、FSMN-VAD 和 CAM++。
-- 中型真实模型 job 可在进程重启后从头恢复；12 小时 job 验证 duration/VAD cache，500 MiB job 验证 upload/disk/RSS。
-- 长 job 每个 bounded batch 释放 inference admission。
-- 模型失败不会留下 succeeded 状态。
-- API client 断开不会留下 orphan ffmpeg。
-- speaker 样本和 job 音频按生命周期删除。
-
-### 18.2 基准而非臆测
-
-发布记录以下指标，不在没有指定硬件时写死吞吐数字：
+基准覆盖以下指标，不在没有指定硬件时写死吞吐数字：
 
 - cold start / warm start；
 - 10 秒短音频 p50/p95；
 - 1 小时会议 RTF；
-- 500 MiB acceptance total time；
+- 500 MiB 测试总耗时；
 - manifest 声明 device 的 peak host/device memory；
 - diarization 开关前后成本；
 - 1、2、4 并发短请求；
 - 长 job 并行时短请求 p95。
 
-首版只记录单 lane 下的排队和吞吐，不用基准结果临时打开共享模型并发。
+首版只测量单 lane 下的排队和吞吐，不用基准数据临时打开共享模型并发。
 
-## 19. 安全和隐私边界
+## 18. 安全和隐私边界
 
 - 默认只监听 loopback。
 - 公网部署由反向代理提供 TLS；安装器不自动签发证书。
@@ -1585,7 +1357,7 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 - description 是不可信文本，只作为 metadata，不进入 prompt 或模型。
 - 发行运行时始终不注册 `/docs` 和 `/openapi.json`；release 离线 OpenAPI artifact 不包含 speaker 数据或其他实例数据。
 
-## 20. 明确非目标
+## 19. 明确非目标
 
 - 修改 Botified Core/Gateway；
 - 修改第三方 channel plugin；
@@ -1609,7 +1381,7 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 - 自动摘要或会议行动项生成；
 - 数据标注和质量管理平台。
 
-## 21. 风险和处理
+## 20. 风险和处理
 
 | 风险 | 处理 |
 |---|---|
@@ -1624,60 +1396,3 @@ live 场景记录 input、duration、RSS/GPU/disk peak、model/device/revision�
 | 磁盘占满 | SQLite 原子 reservation + free-space floor + terminal retention |
 | Skill 三平台漂移 | 单一 tarball 和共同 SKILL.md |
 | 安装器破坏宿主环境 | OCI image，不安装 driver/runtime |
-
-## 22. 总体验收标准
-
-开发完成必须同时满足：
-
-- [ ] `botified-asr` 是独立仓库，不 import Botified。
-- [ ] OpenAI Python SDK 可完成基础 `{text}` 转写。
-- [ ] Gateway 当前 `file + model + Bearer` 请求无需修改即可使用。
-- [ ] VAD、diarization、emotion 和 events 有单一明确请求语义。
-- [ ] 标点不加载第二模型且无虚假关闭开关。
-- [ ] 1 GiB / 12 小时发布硬上限完成验证，配置只能收紧。
-- [ ] 500 MiB 文件通过 async 模式完成且内存有界。
-- [ ] sync 和 async 复用同一 processor。
-- [ ] Job crash recovery、cancel、retention 和 storage admission 可验证。
-- [ ] Speaker CRUD 可用，原始样本不持久保存。
-- [ ] Profile model fingerprint、一致性检查和 held-out identity quality gate 通过。
-- [ ] 已知人物按 cluster centroid 命名，低区分度保持 Unknown。
-- [ ] 默认日志不包含 transcript、speaker metadata 或原始文件名。
-- [ ] 必需 CPU image 及 manifest 声明的条件 CUDA image均固定依赖和模型 revision。
-- [ ] `install-asr.sh` 在新主机完成 ready + smoke。
-- [ ] 本机与远程 Skill 都通过唯一 `client.env` 形成可调用闭环。
-- [ ] `botified-releases` 发布 installer、manifest、checksums 和 Skill。
-- [ ] Skill 可分别被 Codex、OpenClaw、Botified discovery 和调用。
-- [ ] 文档明确当前 OpenAI 兼容子集和不支持项。
-- [ ] 没有 Redis、Celery、多租户、Web UI 或其他范围扩张。
-
-## 23. 开发交接顺序
-
-推荐开发团队按以下纵向切片推进：
-
-1. 先锁定 OpenAI contract、配置、错误和 bounded upload。
-2. 打通一条 streaming decoder -> VAD -> SenseVoice 真实路径。
-3. 在同一路径增加 CAM++ 和 speaker projection。
-4. 增加 speaker profile，并先用真实双人样本校准命名。
-5. 将已验证 processor 放入 durable job executor。
-6. 用 500 MiB acceptance 修正内存、取消、恢复和公平性。
-7. 最后完成镜像、安装器、Skill 和公开发布。
-
-不要先建设通用平台，再回头寻找实际语音路径。
-
-## 24. Team Review 记录
-
-评审日期：2026-07-26。
-
-| 轮次 | 角色 | 初始结论 | 主要收敛项 | 最终结论 |
-|---|---|---|---|---|
-| 1–3 | 产品 | NO-GO | OpenAI 子集定位、匿名/已知人物语义、唯一 client target、安装闭环、CPU/CUDA 条件范围 | GO |
-| 1–3 | 工程 | NO-GO | 唯一在线 centroid、单 processor/串行 adapter、fingerprint、流式结果、模型复现与媒体边界 | GO |
-| 1–3 | 质量 | NO-GO | receiving/deleting/CAS、reservation、取消竞态、恢复与清理、right-sized acceptance、升级回滚 | GO |
-
-最终判定：
-
-- 无未关闭 blocker、major 或 minor finding。
-- 产品边界保持独立 ASR 服务、安装发布和通用 Skill，不修改 Botified Core/Gateway。
-- 首版没有并存的 speaker 算法、processor、客户端配置格式或长任务 API。
-- 测试按 owner 分层；大文件、12 小时、恢复、身份和三 runtime discovery 不互相重复代测。
-- 开发团队应连续完成 Phase 1–6 后再发布，不把中间 Phase 单独标记为可用产品。

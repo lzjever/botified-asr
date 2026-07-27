@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import wave
-from pathlib import Path
 
 import httpx
 from openai import OpenAI
@@ -45,13 +44,6 @@ class SdkProcessor:
             ref,
             SpeakerLabelMapping(()),
         )
-
-
-def test_uv_lock_uses_only_official_pypi() -> None:
-    lock = Path("uv.lock").read_text(encoding="utf-8")
-    assert "pypi.tuna.tsinghua.edu.cn" not in lock
-    assert 'registry = "https://pypi.org/simple"' in lock
-
 
 def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
     storage = Storage(

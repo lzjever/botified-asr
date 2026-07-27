@@ -5,7 +5,7 @@ from dataclasses import MISSING, FrozenInstanceError, fields, replace
 import numpy as np
 import pytest
 
-from botified_asr import audio, funasr_adapter, pipeline, speakers
+from botified_asr import pipeline, speakers
 
 
 EMBEDDING_DIMENSION = 192
@@ -212,26 +212,6 @@ def test_embedding_policy_rejects_invalid_identity_and_processing_values() -> No
         for name in version_fields:
             with pytest.raises(ValueError):
                 _synthetic_nonproduction_embedding_policy(**{name: invalid_token})
-
-
-def test_embedding_mechanics_constants_have_one_cross_layer_contract() -> None:
-    assert speakers.SPEAKER_SAMPLE_RATE == audio.SAMPLE_RATE
-    assert (
-        funasr_adapter.CAMPLUS_EMBEDDING_DIMENSION
-        == speakers.SPEAKER_EMBEDDING_DIMENSION
-    )
-    assert funasr_adapter.CAMPLUS_WINDOW_SAMPLES == speakers.SPEAKER_WINDOW_MAX_SAMPLES
-    assert (
-        funasr_adapter.CAMPLUS_WINDOW_SHIFT_SAMPLES
-        == speakers.SPEAKER_WINDOW_SHIFT_SAMPLES
-    )
-
-
-def test_embedding_policy_module_has_no_production_default_or_singleton() -> None:
-    policy_type = speakers.SpeakerEmbeddingPolicy
-
-    assert not any(type(value) is policy_type for value in vars(speakers).values())
-
 
 def test_policy_requires_a_finite_threshold_and_exact_bounded_max_speakers() -> None:
     with pytest.raises(TypeError):

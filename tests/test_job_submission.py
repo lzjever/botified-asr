@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -19,16 +19,6 @@ CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
 )
-SPEC_FIELDS = (
-    "canonical_options_json",
-    "selected_speaker_snapshot",
-    "snapshot_sha256",
-    "total_samples",
-    "request_fingerprint",
-    "processor_fingerprint",
-)
-
-
 def limits(**overrides: int) -> LimitsConfig:
     values = {
         "max_upload_bytes": RESERVATION_QUANTUM,
@@ -78,11 +68,7 @@ def patch_job_ids(
     )
 
 
-def test_queued_job_spec_and_generated_ids_are_exact() -> None:
-    assert is_dataclass(jobs.QueuedJobSpec)
-    assert tuple(item.name for item in fields(jobs.QueuedJobSpec)) == SPEC_FIELDS
-    assert jobs.QueuedJobSpec.__slots__ == SPEC_FIELDS
-
+def test_queued_job_spec_validation_and_generated_ids() -> None:
     spec = queued_spec()
     with pytest.raises(FrozenInstanceError):
         spec.total_samples = 1

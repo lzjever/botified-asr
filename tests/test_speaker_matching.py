@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import MISSING, FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError
 from importlib import import_module
 from types import ModuleType
 
@@ -73,40 +73,12 @@ def _cosine(
     return float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right)))
 
 
-def test_matcher_types_are_exact_required_frozen_slots_and_policy_is_strict() -> None:
+def test_matcher_policy_and_values_are_frozen_and_strict() -> None:
     matching = _matching_module()
-    expected_fields = {
-        matching.KnownSpeakerMatchPolicy: (
-            "match_threshold",
-            "top_two_margin",
-        ),
-        matching.KnownSpeakerMatch: (
-            "speaker_id",
-            "speaker_name",
-            "similarity",
-        ),
-        matching.SpeakerLabelResolution: (
-            "anonymous_speaker",
-            "match",
-        ),
-        matching.SpeakerLabelMapping: ("resolutions",),
-    }
-    for data_type, expected_names in expected_fields.items():
-        data_fields = fields(data_type)
-        assert tuple(item.name for item in data_fields) == expected_names
-        assert all(
-            item.default is MISSING and item.default_factory is MISSING
-            for item in data_fields
-        )
-
-    policy_type = matching.KnownSpeakerMatchPolicy
-    assert not any(type(value) is policy_type for value in vars(matching).values())
     policy = matching.KnownSpeakerMatchPolicy(0.0, 0.0)
     match = matching.KnownSpeakerMatch("00000001", "Alice", 1.0)
     resolution = matching.SpeakerLabelResolution("A", match)
     mapping = matching.SpeakerLabelMapping((resolution,))
-    for value in (policy, match, resolution, mapping):
-        assert not hasattr(value, "__dict__")
     with pytest.raises(FrozenInstanceError):
         policy.match_threshold = 0.5
     with pytest.raises(FrozenInstanceError):

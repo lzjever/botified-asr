@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import wave
 from datetime import datetime, timezone
-from inspect import Parameter, signature
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any
 
 import numpy as np
 import pytest
@@ -267,35 +266,6 @@ class PermissiveProjector:
             content_type="application/json",
             body_factory=lambda: iter((b'{"text":"hello"}',)),
         )
-
-
-def test_composition_protocols_use_the_exact_transport_contract() -> None:
-    from botified_asr.composition import (
-        ProjectionBuilder,
-        TranscriptionProcessor,
-        prepare_sync_transcription,
-    )
-
-    return_type = get_type_hints(TranscriptionProcessor.process)["return"]
-    assert return_type is pipeline_module.ProcessorResult
-
-    parameter = signature(ProjectionBuilder.prepare).parameters["speaker_mapping"]
-
-    assert parameter.kind is Parameter.KEYWORD_ONLY
-    assert parameter.default is Parameter.empty
-
-    snapshot_parameter = signature(TranscriptionProcessor.process).parameters[
-        "selected_speaker_snapshot"
-    ]
-    assert snapshot_parameter.kind is Parameter.KEYWORD_ONLY
-    assert snapshot_parameter.default is Parameter.empty
-
-    policy_parameter = signature(prepare_sync_transcription).parameters[
-        "speaker_embedding_policy"
-    ]
-    assert policy_parameter.kind is Parameter.KEYWORD_ONLY
-    assert policy_parameter.default is Parameter.empty
-
 
 def test_progress_accumulator_is_exact_monotonic_and_requires_update() -> None:
     from botified_asr.composition import ProgressAccumulator

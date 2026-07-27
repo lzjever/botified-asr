@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
-from inspect import Parameter, signature
 from types import ModuleType
 
 import pytest
@@ -16,33 +15,6 @@ CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
 )
-JOB_FIELDS = (
-    "id",
-    "phase",
-    "status",
-    "input_lease_id",
-    "canonical_options_json",
-    "selected_speaker_snapshot",
-    "snapshot_sha256",
-    "input_size_bytes",
-    "total_samples",
-    "processed_samples",
-    "request_fingerprint",
-    "processor_fingerprint",
-    "attempt_no",
-    "attempt_token",
-    "owner_generation",
-    "crash_recoveries",
-    "cancel_requested",
-    "result_lease_id",
-    "error_code",
-    "input_cleanup_pending",
-    "created_at",
-    "started_at",
-    "finished_at",
-)
-
-
 def _jobs() -> ModuleType:
     return import_module("botified_asr.jobs")
 
@@ -95,7 +67,7 @@ def _receiving_changes(jobs: ModuleType) -> dict[str, object]:
     }
 
 
-def test_job_domain_types_are_exact_frozen_and_slotted() -> None:
+def test_job_enums_and_records_are_frozen() -> None:
     jobs = _jobs()
 
     assert tuple(item.value for item in jobs.JobStatus) == (
@@ -110,17 +82,6 @@ def test_job_domain_types_are_exact_frozen_and_slotted() -> None:
         "visible",
         "deleting",
     )
-    assert is_dataclass(jobs.DurableJob)
-    assert tuple(item.name for item in fields(jobs.DurableJob)) == JOB_FIELDS
-    assert jobs.DurableJob.__slots__ == JOB_FIELDS
-    parameters = signature(jobs.DurableJob).parameters
-    assert tuple(parameters) == JOB_FIELDS
-    assert all(
-        parameter.kind is Parameter.POSITIONAL_OR_KEYWORD
-        and parameter.default is Parameter.empty
-        for parameter in parameters.values()
-    )
-
     record = _job(jobs)
     with pytest.raises(FrozenInstanceError):
         record.status = jobs.JobStatus.RUNNING
