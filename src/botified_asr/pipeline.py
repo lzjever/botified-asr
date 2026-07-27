@@ -15,7 +15,11 @@ from botified_asr.audio import (
     DecodedBlock,
     MediaProbe,
 )
-from botified_asr.contracts import CanonicalOptions
+from botified_asr.contracts import (
+    CANONICAL_JSONL_MAX_RECORD_BYTES,
+    MAX_AUDIO_SAMPLES,
+    CanonicalOptions,
+)
 
 DIRECT_MAX_SAMPLES = 480_000
 HAN_HIRAGANA_KATAKANA_RANGES = (
@@ -196,8 +200,13 @@ class CanonicalJsonlSegmentSink:
             )
         ):
             raise TypeError("segment index and bounds must be integers")
-        if record.index < 0 or record.start_sample < 0 or record.end_sample < 0:
-            raise ValueError("segment sample bounds must be non-negative")
+        if (
+            record.index < 0
+            or record.start_sample < 0
+            or record.end_sample < 0
+            or record.end_sample > MAX_AUDIO_SAMPLES
+        ):
+            raise ValueError("segment sample bounds exceed the allowed range")
         if record.index != self._next_index:
             raise ValueError("segment index must be contiguous")
         if (
@@ -220,17 +229,10 @@ class CanonicalJsonlSegmentSink:
             )
         ):
             raise TypeError("rich annotation values must be strings or None")
-        payload = (
-            json.dumps(
-                asdict(record),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            + b"\n"
-        )
-        self._writer.write(payload)
+        payload = serialize_canonical_record(record)
+        if len(payload) > CANONICAL_JSONL_MAX_RECORD_BYTES:
+            raise ValueError("canonical result record exceeds byte limit")
+        self._writer.write(payload + b"\n")
         self._next_index += 1
         self._last_end_sample = record.end_sample
 
@@ -382,16 +384,30 @@ class Processor:
         )
 
 
-def canonical_join(parts: Iterable[str]) -> str:
-    result = ""
+def serialize_canonical_record(record: SegmentRecord) -> bytes:
+    return json.dumps(
+        asdict(record),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def iter_canonical_join(parts: Iterable[str]) -> Iterator[str]:
+    previous_last: str | None = None
     for raw_part in parts:
         part = raw_part.strip()
         if not part:
             continue
-        if result and _needs_join_space(result[-1], part[0]):
-            result += " "
-        result += part
-    return result
+        if previous_last is not None and _needs_join_space(previous_last, part[0]):
+            yield " "
+        yield part
+        previous_last = part[-1]
+
+
+def canonical_join(parts: Iterable[str]) -> str:
+    return "".join(iter_canonical_join(parts))
 
 
 def _needs_join_space(left: str, right: str) -> bool:
@@ -401,9 +417,7 @@ def _needs_join_space(left: str, right: str) -> bool:
         return False
     if _is_han_hiragana_or_katakana(left):
         return False
-    if _is_han_hiragana_or_katakana(right):
-        return False
-    return True
+    return not _is_han_hiragana_or_katakana(right)
 
 
 def _is_han_hiragana_or_katakana(character: str) -> bool:
