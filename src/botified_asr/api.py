@@ -6,19 +6,29 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Mapping, Sequence
 
+import anyio
 from python_multipart import MultipartParser
 from python_multipart.multipart import parse_options_header
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from botified_asr.audio import AudioError, Cancellation
+from botified_asr.composition import (
+    PreparedSyncResponse,
+    TranscriptionProcessor,
+    prepare_sync_transcription,
+)
 from botified_asr.contracts import CanonicalOptions
+from botified_asr.pipeline import PipelineError, PipelineNotReady
+from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.storage import (
     Storage,
     StorageAdmissionError,
@@ -70,9 +80,6 @@ class Readiness:
     @property
     def ready(self) -> bool:
         return self.database and self.models and self.executor
-
-
-Transcriber = Callable[[Path, CanonicalOptions], Mapping[str, object]]
 
 
 def canonicalize_options(
@@ -207,7 +214,7 @@ def create_app(
     api_key: str,
     readiness: Readiness,
     storage: Storage,
-    transcriber: Transcriber,
+    processor: TranscriptionProcessor,
     close_storage_on_shutdown: bool = True,
 ) -> Starlette:
     if not api_key:
@@ -279,12 +286,15 @@ def create_app(
         authenticate(request)
         require_ready()
         prefer_async = _prefers_async(request.headers)
+        prepared: PreparedSyncResponse | None = None
+        response_owns_artifact = False
         try:
             lease = storage.begin_upload("transcription")
         except StorageAdmissionError as exc:
             raise _storage_admission_error(exc) from exc
 
         input_ref = None
+        input_cleanup_complete = False
         try:
             fields = await _ingest_multipart(
                 request, storage, lease, prefer_async=prefer_async
@@ -299,19 +309,49 @@ def create_app(
                     "Async job executor is not ready",
                     error_type="server_error",
                 )
-            result = dict(
-                await run_in_threadpool(transcriber, input_path, options)
-            )
-            if options.response_format == "text":
-                return PlainTextResponse(str(result.get("text", "")))
-            return JSONResponse(result)
+            cancellation = Cancellation()
+            try:
+                prepared = await _prepare_while_watching_disconnect(
+                    request,
+                    storage,
+                    processor,
+                    input_path,
+                    input_ref.id,
+                    options,
+                    cancellation,
+                )
+            except StorageAdmissionError:
+                raise
+            except (
+                AudioError,
+                PipelineError,
+                CanonicalArtifactError,
+            ) as exc:
+                raise _processing_api_error(exc) from exc
+            except Exception as exc:
+                raise ApiError(
+                    500,
+                    "internal_error",
+                    "Internal server error",
+                    error_type="server_error",
+                ) from exc
+            storage.release_input(input_ref)
+            input_cleanup_complete = True
+            response = _PreparedStreamingResponse(prepared)
+            response_owns_artifact = True
+            return response
         except StorageAdmissionError as exc:
             raise _storage_admission_error(exc) from exc
         finally:
-            if input_ref is None:
-                storage.abort_upload(lease)
-            else:
-                storage.release_input(input_ref)
+            try:
+                if not input_cleanup_complete:
+                    if input_ref is None:
+                        storage.abort_upload(lease)
+                    else:
+                        storage.release_input(input_ref)
+            finally:
+                if prepared is not None and not response_owns_artifact:
+                    _close_prepared(prepared)
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
@@ -342,6 +382,200 @@ def create_app(
         lifespan=lifespan,
     )
     return app
+
+
+class _PreparedStreamingResponse(StreamingResponse):
+    def __init__(self, prepared: PreparedSyncResponse) -> None:
+        self._prepared = prepared
+        super().__init__(
+            prepared.iter_body(),
+            headers={"Content-Type": prepared.content_type},
+            background=BackgroundTask(prepared.close),
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            _close_prepared(self._prepared)
+
+
+def _close_prepared(prepared: PreparedSyncResponse) -> None:
+    for attempt in range(2):
+        try:
+            prepared.close()
+            return
+        except Exception:
+            if attempt == 1:
+                raise
+
+
+async def _prepare_while_watching_disconnect(
+    request: Request,
+    storage: Storage,
+    processor: TranscriptionProcessor,
+    input_path: Path,
+    owner_id: str,
+    options: CanonicalOptions,
+    cancellation: Cancellation,
+) -> PreparedSyncResponse:
+    prepared: PreparedSyncResponse | None = None
+    worker_errors: list[BaseException] = []
+    propagated_cancellation: BaseException | None = None
+    disconnected = False
+    preparation_finished = False
+    ownership_transferred = False
+    worker_result: list[PreparedSyncResponse] = []
+    worker_finished = anyio.Event()
+
+    def prepare_in_worker() -> PreparedSyncResponse:
+        result = prepare_sync_transcription(
+            storage,
+            processor,
+            input_path,
+            owner_id,
+            options,
+            cancellation,
+        )
+        worker_result.append(result)
+        return result
+
+    async def run_worker() -> None:
+        try:
+            await run_in_threadpool(prepare_in_worker)
+        except BaseException as exc:
+            worker_errors.append(exc)
+        finally:
+            worker_finished.set()
+
+    async def watch_disconnect() -> None:
+        nonlocal disconnected
+        try:
+            while True:
+                message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    disconnected = True
+                    cancellation.cancel()
+                    return
+        finally:
+            if not preparation_finished:
+                cancellation.cancel()
+
+    try:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(watch_disconnect)
+            task_group.start_soon(run_worker)
+            try:
+                await worker_finished.wait()
+            except anyio.get_cancelled_exc_class() as exc:
+                propagated_cancellation = exc
+                cancellation.cancel()
+                with anyio.CancelScope(shield=True):
+                    await worker_finished.wait()
+            finally:
+                if worker_result:
+                    prepared = worker_result[0]
+                preparation_finished = True
+                task_group.cancel_scope.cancel()
+                if disconnected and propagated_cancellation is None:
+                    try:
+                        await anyio.lowlevel.checkpoint()
+                    except anyio.get_cancelled_exc_class() as exc:
+                        propagated_cancellation = exc
+
+        if propagated_cancellation is not None:
+            raise propagated_cancellation
+        if disconnected:
+            raise RuntimeError(
+                "disconnect cancellation was not propagated"
+            )
+        if worker_errors:
+            raise worker_errors[0]
+        if prepared is None:
+            raise RuntimeError(
+                "transcription preparation returned no response"
+            )
+        try:
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        except anyio.get_cancelled_exc_class():
+            cancellation.cancel()
+            raise
+        ownership_transferred = True
+        return prepared
+    finally:
+        if not worker_finished.is_set():
+            cancellation.cancel()
+            with anyio.CancelScope(shield=True):
+                await worker_finished.wait()
+        if prepared is None and worker_result:
+            prepared = worker_result[0]
+        if prepared is not None and not ownership_transferred:
+            _close_prepared(prepared)
+
+
+def _processing_api_error(
+    exc: AudioError | PipelineError | CanonicalArtifactError,
+) -> ApiError:
+    if isinstance(exc, PipelineNotReady):
+        return ApiError(
+            503,
+            "pipeline_not_ready",
+            "The requested audio pipeline is not ready",
+            error_type="server_error",
+        )
+    if isinstance(exc, CanonicalArtifactError):
+        return ApiError(
+            500,
+            "invalid_result_artifact",
+            "The transcription result artifact is invalid",
+            error_type="server_error",
+        )
+    if isinstance(exc, PipelineError):
+        if exc.code == "long_audio_requires_vad":
+            return ApiError(
+                422,
+                exc.code,
+                "chunking_strategy=auto is required for long audio",
+                param="chunking_strategy",
+            )
+        if exc.code == "invalid_audio":
+            return ApiError(
+                400,
+                exc.code,
+                "The uploaded file is not valid audio",
+                param="file",
+            )
+        return ApiError(
+            500,
+            "internal_error",
+            "Internal server error",
+            error_type="server_error",
+        )
+    if exc.code == "invalid_audio":
+        return ApiError(
+            400,
+            exc.code,
+            "The uploaded file is not valid audio",
+            param="file",
+        )
+    unavailable_messages = {
+        "audio_tool_unavailable": "Audio processing is unavailable",
+        "audio_probe_timeout": "Audio probing timed out",
+        "audio_decode_timeout": "Audio decoding timed out",
+    }
+    if exc.code in unavailable_messages:
+        return ApiError(
+            503,
+            exc.code,
+            unavailable_messages[exc.code],
+            error_type="server_error",
+        )
+    return ApiError(
+        500,
+        "internal_error",
+        "Internal server error",
+        error_type="server_error",
+    )
 
 
 async def _ingest_multipart(

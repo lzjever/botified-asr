@@ -4,9 +4,9 @@ import asyncio
 import json
 import threading
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
-import httpx
+import anyio
 import pytest
 from starlette.testclient import TestClient
 
@@ -17,12 +17,48 @@ from botified_asr.api import (
     canonicalize_options,
     create_app,
 )
-from botified_asr.config import LimitsConfig
+from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import CanonicalOptions
+from botified_asr.pipeline import RichAnnotations, SegmentRecord
 from botified_asr.storage import Storage
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
+
+
+class FakeProcessor:
+    def __init__(
+        self,
+        callback: Callable[[Path, CanonicalOptions], str] | None = None,
+    ) -> None:
+        self.callback = callback or (lambda _path, _options: "ok")
+
+    def process(
+        self,
+        input_path,
+        options,
+        _cancellation,
+        progress,
+        sink,
+    ):
+        text = self.callback(input_path, options)
+        processed_samples = 1 if text else 0
+        if text:
+            sink.append(
+                SegmentRecord(
+                    0,
+                    0,
+                    1,
+                    text,
+                    "en",
+                    RichAnnotations(),
+                )
+            )
+        progress.update(
+            processed_samples=processed_samples,
+            total_samples=None,
+        )
+        return sink.finalize()
 
 
 @pytest.fixture
@@ -32,7 +68,7 @@ def storage(tmp_path: Path) -> Storage:
         LimitsConfig(
             max_upload_bytes=16,
             sync_max_upload_bytes=8,
-            max_job_storage_bytes=8 * 1024 * 1024,
+            max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
         free_bytes=lambda _: 1 << 40,
@@ -45,13 +81,13 @@ def app_client(
     storage: Storage,
     *,
     readiness: Readiness | None = None,
-    transcriber=None,
+    processor=None,
 ) -> TestClient:
     app = create_app(
         api_key="test-secret",
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
-        transcriber=transcriber or (lambda _path, _options: {"text": "ok"}),
+        processor=processor or FakeProcessor(),
         close_storage_on_shutdown=False,
     )
     return TestClient(app, raise_server_exceptions=False)
@@ -81,7 +117,9 @@ def test_malformed_authorization_is_stable_and_redacted(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
 
@@ -131,7 +169,9 @@ def test_auth_and_not_ready_do_not_receive_body_or_create_lease(
         api_key="test-secret",
         readiness=readiness,
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
     headers = (
@@ -175,10 +215,10 @@ def test_models_are_fixed_and_created_is_build_constant(storage: Storage) -> Non
 def test_errors_use_openai_envelope_without_internal_exception(
     storage: Storage,
 ) -> None:
-    def explode(_path: Path, _options: CanonicalOptions) -> dict[str, str]:
+    def explode(_path: Path, _options: CanonicalOptions) -> str:
         raise RuntimeError("host path /secret and traceback")
 
-    with app_client(storage, transcriber=explode) as client:
+    with app_client(storage, processor=FakeProcessor(explode)) as client:
         response = client.post(
             "/v1/audio/transcriptions",
             headers=AUTH,
@@ -270,12 +310,15 @@ def test_arrays_have_stable_canonicalization() -> None:
 def test_basic_multipart_returns_text_and_cleans_staging(storage: Storage) -> None:
     captured: dict[str, object] = {}
 
-    def transcribe(path: Path, options: CanonicalOptions) -> dict[str, str]:
+    def transcribe(path: Path, options: CanonicalOptions) -> str:
         captured["bytes"] = path.read_bytes()
         captured["options"] = options
-        return {"text": "hello"}
+        return "hello"
 
-    with app_client(storage, transcriber=transcribe) as client:
+    with app_client(
+        storage,
+        processor=FakeProcessor(transcribe),
+    ) as client:
         response = client.post(
             "/v1/audio/transcriptions",
             headers=AUTH,
@@ -291,7 +334,10 @@ def test_basic_multipart_returns_text_and_cleans_staging(storage: Storage) -> No
 
 def test_text_response_is_plain_text(storage: Storage) -> None:
     with app_client(
-        storage, transcriber=lambda _path, _options: {"text": "plain"}
+        storage,
+        processor=FakeProcessor(
+            lambda _path, _options: "plain"
+        ),
     ) as client:
         response = client.post(
             "/v1/audio/transcriptions",
@@ -445,7 +491,9 @@ def test_same_byte_stream_is_independent_of_asgi_chunking(storage: Storage) -> N
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
     )
 
     one_chunk = invoke_asgi(app, body, [len(body)], boundary)
@@ -465,8 +513,10 @@ def test_success_is_independent_of_every_byte_boundary(storage: Storage) -> None
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda path, options: (
-            seen.append((path.read_bytes(), options)) or {"text": "same"}
+        processor=FakeProcessor(
+            lambda path, options: (
+                seen.append((path.read_bytes(), options)) or "same"
+            )
         ),
         close_storage_on_shutdown=False,
     )
@@ -486,7 +536,9 @@ def test_hard_limit_is_independent_of_asgi_chunking(storage: Storage) -> None:
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
     )
 
     one_chunk = invoke_asgi(
@@ -520,7 +572,9 @@ def test_joint_raw_limit_exact_is_accepted_and_plus_one_is_chunk_stable(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
 
@@ -548,7 +602,9 @@ def test_overhead_limit_plus_one_is_rejected_by_final_exact_check(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
 
@@ -576,7 +632,9 @@ def test_joint_raw_rejection_stops_receiving_more_body(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
 
@@ -618,7 +676,9 @@ def test_joint_cap_wins_when_file_limit_crosses_after_full_overhead_budget(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
         close_storage_on_shutdown=False,
     )
     headers = [
@@ -661,7 +721,7 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
     limits = LimitsConfig(
         max_upload_bytes=10 * 1024 * 1024,
         sync_max_upload_bytes=10 * 1024 * 1024,
-        max_job_storage_bytes=16 * 1024 * 1024,
+        max_job_storage_bytes=3 * RESERVATION_QUANTUM,
         min_filesystem_free_bytes=1,
     )
     storage = Storage(tmp_path, limits, free_bytes=lambda _: 1 << 40)
@@ -679,7 +739,9 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "ok"},
+        processor=FakeProcessor(
+            lambda _path, _options: "ok"
+        ),
         close_storage_on_shutdown=False,
     )
     try:
@@ -703,7 +765,9 @@ def test_client_disconnect_cleans_receiving_upload(storage: Storage) -> None:
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "unexpected"},
+        processor=FakeProcessor(
+            lambda _path, _options: "unexpected"
+        ),
     )
 
     status, body = invoke_asgi(
@@ -816,6 +880,8 @@ def invoke_asgi(
         sent: list[dict] = []
 
         async def receive() -> dict:
+            if not events:
+                await anyio.sleep_forever()
             return events.pop(0)
 
         async def send(message: dict) -> None:
@@ -910,17 +976,20 @@ def invoke_raw_asgi(
     return asyncio.run(run())
 
 
-def test_transcriber_runs_once_outside_event_loop(storage: Storage) -> None:
+def test_processor_runs_once_outside_event_loop(storage: Storage) -> None:
     calls = 0
 
-    def transcriber(_path: Path, _options: CanonicalOptions) -> dict[str, str]:
+    def process(_path: Path, _options: CanonicalOptions) -> str:
         nonlocal calls
         calls += 1
         with pytest.raises(RuntimeError, match="no running event loop"):
             asyncio.get_running_loop()
-        return {"text": threading.current_thread().name}
+        return threading.current_thread().name
 
-    with app_client(storage, transcriber=transcriber) as client:
+    with app_client(
+        storage,
+        processor=FakeProcessor(process),
+    ) as client:
         response = client.post(
             "/v1/audio/transcriptions",
             headers=AUTH,
@@ -946,7 +1015,9 @@ def test_app_composition_closes_owned_storage(tmp_path: Path) -> None:
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "ok"},
+        processor=FakeProcessor(
+            lambda _path, _options: "ok"
+        ),
     )
 
     with TestClient(app) as client:

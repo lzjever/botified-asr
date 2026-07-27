@@ -1,13 +1,40 @@
 from __future__ import annotations
 
+import io
+import wave
+from pathlib import Path
+
 import httpx
 from openai import OpenAI
-from pathlib import Path
 from starlette.testclient import TestClient
 
 from botified_asr.api import Readiness, create_app
-from botified_asr.config import LimitsConfig
+from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.pipeline import RichAnnotations, SegmentRecord
 from botified_asr.storage import Storage
+
+
+class SdkProcessor:
+    def process(
+        self,
+        _input_path,
+        _options,
+        _cancellation,
+        progress,
+        sink,
+    ):
+        sink.append(
+            SegmentRecord(
+                0,
+                0,
+                1,
+                "SDK works",
+                "en",
+                RichAnnotations(),
+            )
+        )
+        progress.update(processed_samples=1, total_samples=None)
+        return sink.finalize()
 
 
 def test_uv_lock_uses_only_official_pypi() -> None:
@@ -22,7 +49,7 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         LimitsConfig(
             max_upload_bytes=1024,
             sync_max_upload_bytes=1024,
-            max_job_storage_bytes=8 * 1024 * 1024,
+            max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
         free_bytes=lambda _: 1 << 40,
@@ -31,7 +58,7 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         api_key="sdk-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
-        transcriber=lambda _path, _options: {"text": "SDK works"},
+        processor=SdkProcessor(),
         close_storage_on_shutdown=False,
     )
     service = TestClient(app)
@@ -54,10 +81,16 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         base_url="http://testserver/v1",
         http_client=httpx.Client(transport=httpx.MockTransport(forward)),
     )
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\x00\x00" * 16)
     try:
         result = sdk.audio.transcriptions.create(
             model="sensevoice",
-            file=("audio.wav", b"1234", "audio/wav"),
+            file=("audio.wav", wav_buffer.getvalue(), "audio/wav"),
         )
         assert result.text == "SDK works"
     finally:
