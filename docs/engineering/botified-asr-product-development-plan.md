@@ -120,7 +120,8 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 
 ### 4.3 版本固定
 
-- Python 固定为 `3.11.13`，FunASR 固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`。
+- Python 固定为 `3.11.13`。FunASR 的上游源码审计基线固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`；运行时只安装官方 PyPI `funasr==1.3.29` wheel `https://files.pythonhosted.org/packages/9c/10/0a43f6233db074e263c025718afff7e7960976ef5e545c40c92c5f59f1c9/funasr-1.3.29-py3-none-any.whl`，其 SHA-256 固定为 `bc022d3f80cab635227841a401cc872e5b863a207f8fa01262f15c42ed630137`，大小固定为 `956044` bytes；不得在运行时改从 Git tree、sdist 或其他同版本 artifact 安装。
+- 三方供应链审计确认该 wheel 发布的 425 个 `funasr/**` 文件与上述 commit 中的同路径文件逐字节一致；commit-only 的 28 个文件不属于当前 SenseVoice、FSMN-VAD、CAM++ 支持路径。未来启用 `EnglishTextNormalizer`、RWKV 或这些省略文件承载的其他能力前必须重新审计并更新 runtime artifact gate。该一致性结论是本项目的审计证据，不是发布者对 wheel 来源的加密证明；commit 只固定源码审计基线，wheel URL、hash 和 size 才固定实际安装物，二者不得相互替代。
 - CPU release 的 `torch` 和 `torchaudio` 均固定为 `2.11.0+cpu`，只从 PyTorch 官方 CPU index `https://download.pytorch.org/whl/cpu` 解析和安装；不得让通用 PyPI 或其他额外 index 覆盖这两个 artifact。
 - CUDA runtime、对应的 PyTorch artifact 和模型必须在各自 release 构建前精确固定；CPU pin 不自动成为 CUDA pin。
 - 发布镜像不得在启动时执行 `pip install -U`。
