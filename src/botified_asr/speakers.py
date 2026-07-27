@@ -36,6 +36,26 @@ _MODEL_REVISION = re.compile(r"\A[0-9a-f]{40}\Z")
 _POLICY_VERSION_TOKEN = re.compile(r"\A[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*\Z")
 
 
+def validate_speaker_model_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("speaker embedding model ID must be a string")
+    model_id_parts = value.split("/")
+    if len(model_id_parts) != 2 or any(
+        part in {"", ".", ".."} or _MODEL_ID_PART.fullmatch(part) is None
+        for part in model_id_parts
+    ):
+        raise ValueError("speaker embedding model ID is invalid")
+    return value
+
+
+def validate_speaker_model_revision(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("speaker embedding model revision must be a string")
+    if _MODEL_REVISION.fullmatch(value) is None:
+        raise ValueError("speaker embedding model revision is invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class SpeakerEmbeddingPolicy:
     model_id: str
@@ -50,18 +70,8 @@ class SpeakerEmbeddingPolicy:
     enrollment_aggregation_policy_version: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.model_id, str):
-            raise TypeError("speaker embedding model ID must be a string")
-        model_id_parts = self.model_id.split("/")
-        if len(model_id_parts) != 2 or any(
-            part in {"", ".", ".."} or _MODEL_ID_PART.fullmatch(part) is None
-            for part in model_id_parts
-        ):
-            raise ValueError("speaker embedding model ID is invalid")
-        if not isinstance(self.model_revision, str):
-            raise TypeError("speaker embedding model revision must be a string")
-        if _MODEL_REVISION.fullmatch(self.model_revision) is None:
-            raise ValueError("speaker embedding model revision is invalid")
+        validate_speaker_model_id(self.model_id)
+        validate_speaker_model_revision(self.model_revision)
 
         for name in (
             "embedding_dimension",
