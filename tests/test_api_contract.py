@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -10,7 +11,7 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
-from botified_asr import pipeline as pipeline_module
+from botified_asr import pipeline as pipeline_module, speakers
 import botified_asr.api as api_module
 from botified_asr.api import (
     ApiError,
@@ -22,10 +23,26 @@ from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
 from botified_asr.storage import Storage
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
+
+
+def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
+    return speakers.SpeakerEmbeddingPolicy(
+        model_id="funasr/campplus",
+        model_revision="1" * 40,
+        embedding_dimension=2,
+        sample_rate=16_000,
+        downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+        window_samples=24_000,
+        window_shift_samples=12_000,
+        padding_policy_version="right-zero-pad-v1",
+        normalization_policy_version="int16-div-32768-l2-v1",
+        enrollment_aggregation_policy_version=("sample-centroid-equal-average-v1"),
+    )
 
 
 class FakeProcessor:
@@ -42,7 +59,10 @@ class FakeProcessor:
         _cancellation,
         progress,
         sink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
     ):
+        del selected_speaker_snapshot
         text = self.callback(input_path, options)
         processed_samples = 1 if text else 0
         if text:
@@ -94,9 +114,17 @@ def app_client(
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
         processor=processor or FakeProcessor(),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
     return TestClient(app, raise_server_exceptions=False)
+
+
+def test_create_app_requires_explicit_speaker_embedding_policy() -> None:
+    parameter = signature(create_app).parameters["speaker_embedding_policy"]
+
+    assert parameter.kind is Parameter.KEYWORD_ONLY
+    assert parameter.default is Parameter.empty
 
 
 def test_live_is_the_only_unauthenticated_route(storage: Storage) -> None:
@@ -126,6 +154,7 @@ def test_malformed_authorization_is_stable_and_redacted(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -178,6 +207,7 @@ def test_auth_and_not_ready_do_not_receive_body_or_create_lease(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
     headers = (
@@ -500,6 +530,7 @@ def test_same_byte_stream_is_independent_of_asgi_chunking(storage: Storage) -> N
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
     one_chunk = invoke_asgi(app, body, [len(body)], boundary)
@@ -524,6 +555,7 @@ def test_success_is_independent_of_every_byte_boundary(storage: Storage) -> None
                 seen.append((path.read_bytes(), options)) or "same"
             )
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -545,6 +577,7 @@ def test_hard_limit_is_independent_of_asgi_chunking(storage: Storage) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
     one_chunk = invoke_asgi(
@@ -581,6 +614,7 @@ def test_joint_raw_limit_exact_is_accepted_and_plus_one_is_chunk_stable(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -611,6 +645,7 @@ def test_overhead_limit_plus_one_is_rejected_by_final_exact_check(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -641,6 +676,7 @@ def test_joint_raw_rejection_stops_receiving_more_body(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -685,6 +721,7 @@ def test_joint_cap_wins_when_file_limit_crosses_after_full_overhead_budget(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
     headers = [
@@ -748,6 +785,7 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
         processor=FakeProcessor(
             lambda _path, _options: "ok"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
     try:
@@ -774,6 +812,7 @@ def test_client_disconnect_cleans_receiving_upload(storage: Storage) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
     status, body = invoke_asgi(
@@ -1024,6 +1063,7 @@ def test_app_composition_closes_owned_storage(tmp_path: Path) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "ok"
         ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
     with TestClient(app) as client:

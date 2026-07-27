@@ -40,6 +40,7 @@ def main() -> None:
             frontend,
             bundle.asr,
             vad_adapter=bundle.vad,
+            known_speaker_policy=None,
         )
         readiness = Readiness(
             database=True,
@@ -51,6 +52,7 @@ def main() -> None:
             readiness=readiness,
             storage=storage,
             processor=processor,
+            speaker_embedding_policy=bundle.speaker_embedding_policy,
             close_storage_on_shutdown=False,
         )
         uvicorn.run(app, host=host, port=port, workers=1)

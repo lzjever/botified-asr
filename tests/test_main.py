@@ -31,7 +31,14 @@ def install_fakes(
     frontend = object()
     asr = object()
     vad = object()
-    bundle = SimpleNamespace(asr=asr, vad=vad)
+    speaker = object()
+    speaker_embedding_policy = object()
+    bundle = SimpleNamespace(
+        asr=asr,
+        vad=vad,
+        speaker=speaker,
+        speaker_embedding_policy=speaker_embedding_policy,
+    )
     processor = object()
     readiness = SimpleNamespace(
         database=True,
@@ -141,6 +148,8 @@ def install_fakes(
         frontend=frontend,
         asr=asr,
         vad=vad,
+        speaker=speaker,
+        speaker_embedding_policy=speaker_embedding_policy,
         processor=processor,
         readiness=readiness,
         app=app,
@@ -169,7 +178,10 @@ def expected_success_events(
         (
             "Processor",
             (scenario.frontend, scenario.asr),
-            {"vad_adapter": scenario.vad},
+            {
+                "vad_adapter": scenario.vad,
+                "known_speaker_policy": None,
+            },
         ),
         (
             "Readiness",
@@ -184,6 +196,7 @@ def expected_success_events(
                 "readiness": scenario.readiness,
                 "storage": scenario.storage,
                 "processor": scenario.processor,
+                "speaker_embedding_policy": (scenario.speaker_embedding_policy),
                 "close_storage_on_shutdown": False,
             },
         ),

@@ -19,6 +19,11 @@ from botified_asr.result_artifact import (
     ResultProjector,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import (
+    SelectedSpeakerSnapshot,
+    resolve_selected_speaker_snapshot,
+)
+from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import ArtifactRef, ReservedByteWriter, Storage
 
 
@@ -30,6 +35,8 @@ class TranscriptionProcessor(Protocol):
         cancellation: Cancellation,
         progress_sink: ProgressSink,
         segment_sink: SegmentSink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
     ) -> ProcessorResult: ...
 
 
@@ -194,7 +201,14 @@ def prepare_sync_transcription(
     options: CanonicalOptions,
     cancellation: Cancellation,
     projector: ProjectionBuilder | None = None,
+    *,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
 ) -> PreparedSyncResponse:
+    selected_speaker_snapshot = resolve_selected_speaker_snapshot(
+        storage,
+        options.known_speaker_ids,
+        speaker_embedding_policy,
+    )
     reserved_writer = storage.begin_artifact(
         "segment_jsonl",
         owner_kind="sync",
@@ -211,6 +225,7 @@ def prepare_sync_transcription(
             cancellation,
             progress,
             sink,
+            selected_speaker_snapshot=selected_speaker_snapshot,
         )
         if type(result) is not ProcessorResult:
             raise RuntimeError("processor returned an invalid result")

@@ -22,7 +22,15 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError, PipelineNotReady
-from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_matching import (
+    KnownSpeakerMatchPolicy,
+    SpeakerLabelMapping,
+    match_selected_speakers,
+)
+from botified_asr.speaker_snapshot import (
+    SelectedSpeaker,
+    SelectedSpeakerSnapshot,
+)
 from botified_asr.speakers import (
     AnonymousSpeakerPolicy,
     AnonymousSpeakerState,
@@ -771,16 +779,25 @@ class Processor:
         vad_adapter: StreamingVadAdapter | None = None,
         speaker_adapter: SpeakerEmbeddingAdapter | None = None,
         speaker_policy: AnonymousSpeakerPolicy | None = None,
+        known_speaker_policy: KnownSpeakerMatchPolicy | None,
     ) -> None:
         if (speaker_adapter is None) != (speaker_policy is None):
             raise ValueError(
                 "speaker adapter and speaker policy must be configured together"
             )
+        if known_speaker_policy is not None:
+            if (
+                type(known_speaker_policy) is not KnownSpeakerMatchPolicy
+                or speaker_adapter is None
+                or speaker_policy is None
+            ):
+                raise ValueError("known speaker policy requires speaker dependencies")
         self._frontend = frontend
         self._adapter = adapter
         self._vad_adapter = vad_adapter
         self._speaker_adapter = speaker_adapter
         self._speaker_policy = speaker_policy
+        self._known_speaker_policy = known_speaker_policy
 
     def process(
         self,
@@ -789,10 +806,13 @@ class Processor:
         cancellation: Cancellation,
         progress_sink: ProgressSink,
         segment_sink: SegmentSink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
     ) -> ProcessorResult:
         failed = True
         blocks: DecodedBlocks | None = None
         decoder_close_attempted = False
+        speaker_state: AnonymousSpeakerState | None = None
 
         def close_decoder() -> None:
             nonlocal decoder_close_attempted
@@ -802,6 +822,17 @@ class Processor:
             blocks.close()
 
         try:
+            if (
+                type(selected_speaker_snapshot) is not SelectedSpeakerSnapshot
+                or type(selected_speaker_snapshot.speakers) is not tuple
+                or any(
+                    type(speaker) is not SelectedSpeaker
+                    for speaker in selected_speaker_snapshot.speakers
+                )
+                or tuple(speaker.id for speaker in selected_speaker_snapshot.speakers)
+                != canonical_options.known_speaker_ids
+            ):
+                raise RuntimeError("selected speaker snapshot does not match options")
             is_direct = (
                 canonical_options.model == "sensevoice"
                 and canonical_options.chunking_strategy is None
@@ -815,10 +846,11 @@ class Processor:
                 and canonical_options.chunking_strategy == "auto"
             )
             if is_diarize and (
-                canonical_options.known_speaker_ids
-                or self._vad_adapter is None
+                self._vad_adapter is None
                 or self._speaker_adapter is None
                 or self._speaker_policy is None
+                or selected_speaker_snapshot.speakers
+                and self._known_speaker_policy is None
             ):
                 raise PipelineNotReady()
             if is_vad and not is_diarize and self._vad_adapter is None:
@@ -861,11 +893,27 @@ class Processor:
                     language=canonical_options.language,
                 )
             close_decoder()
+            speaker_mapping = SpeakerLabelMapping(())
+            if is_diarize:
+                if speaker_state is None:
+                    raise PipelineNotReady()
+                clusters = speaker_state.finalize_clusters()
+                if clusters and selected_speaker_snapshot.speakers:
+                    known_speaker_policy = self._known_speaker_policy
+                    if known_speaker_policy is None:
+                        raise PipelineNotReady()
+                    speaker_mapping = match_selected_speakers(
+                        clusters,
+                        selected_speaker_snapshot,
+                        known_speaker_policy,
+                    )
+            if cancellation.cancelled:
+                raise PipelineError("cancelled", "Audio processing was cancelled")
             artifact_ref = segment_sink.finalize()
             failed = False
             return ProcessorResult(
                 artifact_ref,
-                SpeakerLabelMapping(()),
+                speaker_mapping,
             )
         finally:
             try:

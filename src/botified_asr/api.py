@@ -29,6 +29,11 @@ from botified_asr.composition import (
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
+from botified_asr.speaker_snapshot import (
+    SelectedSpeakerIncompatibleError,
+    SelectedSpeakerNotFoundError,
+)
+from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import (
     Storage,
     StorageAdmissionError,
@@ -215,10 +220,13 @@ def create_app(
     readiness: Readiness,
     storage: Storage,
     processor: TranscriptionProcessor,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
     close_storage_on_shutdown: bool = True,
 ) -> Starlette:
     if not api_key:
         raise ValueError("api_key must not be empty")
+    if type(speaker_embedding_policy) is not SpeakerEmbeddingPolicy:
+        raise TypeError("speaker embedding policy is invalid")
     expected_api_key_digest = hashlib.sha256(api_key.encode("utf-8")).digest()
 
     def authenticate(request: Request) -> None:
@@ -319,9 +327,24 @@ def create_app(
                     input_ref.id,
                     options,
                     cancellation,
+                    speaker_embedding_policy,
                 )
             except StorageAdmissionError:
                 raise
+            except SelectedSpeakerNotFoundError as exc:
+                raise ApiError(
+                    404,
+                    "speaker_not_found",
+                    "One or more known speakers were not found",
+                    param="known_speaker_ids[]",
+                ) from exc
+            except SelectedSpeakerIncompatibleError as exc:
+                raise ApiError(
+                    409,
+                    "speaker_profile_incompatible",
+                    "One or more known speakers are incompatible",
+                    param="known_speaker_ids[]",
+                ) from exc
             except (
                 AudioError,
                 PipelineError,
@@ -418,6 +441,7 @@ async def _prepare_while_watching_disconnect(
     owner_id: str,
     options: CanonicalOptions,
     cancellation: Cancellation,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
 ) -> PreparedSyncResponse:
     prepared: PreparedSyncResponse | None = None
     worker_errors: list[BaseException] = []
@@ -436,6 +460,7 @@ async def _prepare_while_watching_disconnect(
             owner_id,
             options,
             cancellation,
+            speaker_embedding_policy=speaker_embedding_policy,
         )
         worker_result.append(result)
         return result

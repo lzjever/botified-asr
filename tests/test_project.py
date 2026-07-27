@@ -8,11 +8,12 @@ import httpx
 from openai import OpenAI
 from starlette.testclient import TestClient
 
-from botified_asr import pipeline as pipeline_module
+from botified_asr import pipeline as pipeline_module, speakers
 from botified_asr.api import Readiness, create_app
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
 from botified_asr.storage import Storage
 
 
@@ -24,7 +25,10 @@ class SdkProcessor:
         _cancellation,
         progress,
         sink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
     ):
+        del selected_speaker_snapshot
         sink.append(
             SegmentRecord(
                 0,
@@ -65,6 +69,18 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=SdkProcessor(),
+        speaker_embedding_policy=speakers.SpeakerEmbeddingPolicy(
+            model_id="funasr/campplus",
+            model_revision="1" * 40,
+            embedding_dimension=2,
+            sample_rate=16_000,
+            downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+            window_samples=24_000,
+            window_shift_samples=12_000,
+            padding_policy_version="right-zero-pad-v1",
+            normalization_policy_version="int16-div-32768-l2-v1",
+            enrollment_aggregation_policy_version=("sample-centroid-equal-average-v1"),
+        ),
         close_storage_on_shutdown=False,
     )
     service = TestClient(app)

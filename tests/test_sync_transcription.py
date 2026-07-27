@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import anyio
+import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
 from botified_asr import pipeline as pipeline_module
+from botified_asr import speaker_profiles, speakers
 from botified_asr.api import Readiness, create_app
 from botified_asr.audio import AudioError
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
@@ -20,10 +23,48 @@ from botified_asr.pipeline import (
     SegmentRecord,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
 from botified_asr.storage import ArtifactRef, Storage
 
 
 AUTHORIZATION = (b"authorization", b"Bearer test-secret")
+
+
+def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
+    return speakers.SpeakerEmbeddingPolicy(
+        model_id="funasr/campplus",
+        model_revision="1" * 40,
+        embedding_dimension=2,
+        sample_rate=16_000,
+        downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+        window_samples=24_000,
+        window_shift_samples=12_000,
+        padding_policy_version="right-zero-pad-v1",
+        normalization_policy_version="int16-div-32768-l2-v1",
+        enrollment_aggregation_policy_version=("sample-centroid-equal-average-v1"),
+    )
+
+
+def _speaker_profile(*, compatible: bool) -> speaker_profiles.SpeakerProfile:
+    policy = _speaker_embedding_policy()
+    embedding = speaker_profiles.SpeakerEmbedding.from_numpy(
+        np.array([1.0, 0.0], dtype=np.float32),
+        dimension=2,
+    )
+    created_at = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    return speaker_profiles.SpeakerProfile(
+        id="00000001",
+        name="Alice",
+        description=None,
+        embedding=embedding,
+        embedding_model_id=policy.model_id,
+        embedding_model_revision=policy.model_revision,
+        embedding_dimension=policy.embedding_dimension,
+        embedding_policy_fingerprint=(policy.fingerprint if compatible else "0" * 64),
+        sample_count=2,
+        created_at=created_at,
+        updated_at=created_at,
+    )
 
 
 class SpyProcessor:
@@ -47,7 +88,10 @@ class SpyProcessor:
         cancellation,
         progress,
         sink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
     ):
+        del selected_speaker_snapshot
         self.calls += 1
         self.started.set()
         self.cancellation = cancellation
@@ -149,6 +193,7 @@ def _app(storage: Storage, processor: Any):
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=processor,
+        speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
 
@@ -158,6 +203,16 @@ def _files(response_format: str = "json") -> dict[str, tuple]:
         "file": ("audio.wav", b"stored-input", "audio/wav"),
         "model": (None, "sensevoice"),
         "response_format": (None, response_format),
+    }
+
+
+def _known_files() -> dict[str, tuple]:
+    return {
+        "file": ("audio.wav", b"stored-input", "audio/wav"),
+        "model": (None, "sensevoice-diarize"),
+        "response_format": (None, "diarized_json"),
+        "chunking_strategy": (None, "auto"),
+        "known_speaker_ids[]": (None, "00000001"),
     }
 
 
@@ -248,6 +303,37 @@ def test_processing_and_prepare_errors_are_stable_redacted_and_clean(
     assert response.json()["error"]["param"] == param
     assert "/private" not in response.text
     assert "/usr/bin" not in response.text
+    _assert_no_resources(storage)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "status", "code"),
+    (
+        ("missing", 404, "speaker_not_found"),
+        ("incompatible", 409, "speaker_profile_incompatible"),
+    ),
+)
+def test_selected_speaker_snapshot_errors_are_exact_and_clean(
+    storage: Storage,
+    failure_kind: str,
+    status: int,
+    code: str,
+) -> None:
+    if failure_kind == "incompatible":
+        storage.create_speaker_profile(_speaker_profile(compatible=False))
+    processor = SpyProcessor()
+
+    with TestClient(_app(storage, processor)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=_known_files(),
+        )
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["param"] == "known_speaker_ids[]"
+    assert processor.calls == 0
     _assert_no_resources(storage)
 
 

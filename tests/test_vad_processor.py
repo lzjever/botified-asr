@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from inspect import Parameter, signature
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from botified_asr import pipeline, speakers
+from botified_asr import pipeline, speaker_matching, speakers
 from botified_asr.audio import BLOCK_SAMPLES, Cancellation, DecodedBlock, MediaProbe
 from botified_asr.contracts import CanonicalOptions
+from botified_asr.speaker_profiles import SpeakerEmbedding
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import SelectedSpeaker, SelectedSpeakerSnapshot
+
+
+EMPTY_SELECTED_SNAPSHOT = SelectedSpeakerSnapshot(())
 
 
 class FakeDecoder:
@@ -91,6 +97,8 @@ class RecordingSink:
         self.records.append(record)
 
     def finalize(self) -> object:
+        if self.events is not None:
+            self.events.append("sink_finalize")
         self.finalized += 1
         return self.ref
 
@@ -215,6 +223,31 @@ def _policy() -> speakers.AnonymousSpeakerPolicy:
     )
 
 
+def _match_policy() -> speaker_matching.KnownSpeakerMatchPolicy:
+    return speaker_matching.KnownSpeakerMatchPolicy(
+        match_threshold=0.5,
+        top_two_margin=0.1,
+    )
+
+
+def _selected_snapshot(
+    profile_ids: tuple[str, ...] = ("00000001",),
+) -> SelectedSpeakerSnapshot:
+    return SelectedSpeakerSnapshot(
+        tuple(
+            SelectedSpeaker(
+                profile_id,
+                f"Speaker {profile_id}",
+                SpeakerEmbedding.from_numpy(
+                    _unit(1.0, 0.0),
+                    dimension=speakers.SPEAKER_EMBEDDING_DIMENSION,
+                ),
+            )
+            for profile_id in profile_ids
+        )
+    )
+
+
 def _options(
     *,
     model: str = "sensevoice",
@@ -236,6 +269,7 @@ def _process(
     processor: pipeline.Processor,
     sink: RecordingSink,
     *,
+    selected_speaker_snapshot: SelectedSpeakerSnapshot,
     language: str = "auto",
     progress: RecordingProgress | None = None,
     canonical_options: CanonicalOptions | None = None,
@@ -246,6 +280,7 @@ def _process(
         Cancellation(),
         progress or RecordingProgress(),
         sink,
+        selected_speaker_snapshot=selected_speaker_snapshot,
     )
 
 
@@ -261,7 +296,15 @@ def test_auto_without_vad_fails_before_probe() -> None:
     sink = RecordingSink()
 
     with pytest.raises(pipeline.PipelineNotReady):
-        _process(pipeline.Processor(frontend, FakeAsrAdapter()), sink)
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        )
 
     assert frontend.probe_calls == 0
     assert frontend.decode_calls == 0
@@ -284,8 +327,10 @@ def test_empty_auto_succeeds_without_vad_or_asr_calls(
             FakeFrontend(decoder),
             asr,
             vad_adapter=object(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         progress=progress,
     )
 
@@ -314,8 +359,10 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
             FakeFrontend(decoder),
             asr,
             vad_adapter=object(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         language="ja",
         progress=progress,
     )
@@ -387,8 +434,10 @@ def test_auto_preflushes_before_a_candidate_exceeds_each_inclusive_batch_cap(
             FakeFrontend(FakeDecoder(_blocks(1))),
             asr,
             vad_adapter=object(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
     )
 
     assert [len(pcms) for pcms, _language in asr.calls] == expected_batch_sizes
@@ -423,8 +472,10 @@ def test_auto_rejects_invalid_batch_atomically_and_aborts(
                 FakeFrontend(decoder),
                 asr,
                 vad_adapter=object(),
+                known_speaker_policy=None,
             ),
             sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
 
     assert caught.value.code == "invalid_model_output"
@@ -465,8 +516,10 @@ def test_auto_skips_empty_results_positionally_with_dense_record_indices(
             FakeFrontend(decoder),
             asr,
             vad_adapter=object(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         language="zh",
     )
 
@@ -494,13 +547,25 @@ def test_speaker_constructor_dependencies_must_be_configured_together() -> None:
             frontend,
             asr,
             speaker_adapter=cam,
+            known_speaker_policy=None,
         )
     with pytest.raises(ValueError):
         pipeline.Processor(
             frontend,
             asr,
             speaker_policy=_policy(),
+            known_speaker_policy=None,
         )
+    with pytest.raises(ValueError):
+        pipeline.Processor(
+            frontend,
+            asr,
+            known_speaker_policy=_match_policy(),
+        )
+
+    policy_parameter = signature(pipeline.Processor).parameters["known_speaker_policy"]
+    assert policy_parameter.kind is Parameter.KEYWORD_ONLY
+    assert policy_parameter.default is Parameter.empty
 
     assert frontend.probe_calls == 0
     assert frontend.decode_calls == 0
@@ -519,9 +584,8 @@ def test_speaker_embedding_adapter_is_a_structural_window_protocol() -> None:
     (
         (None, FakeSpeakerAdapter(), _policy(), ()),
         (object(), None, None, ()),
-        (object(), FakeSpeakerAdapter(), _policy(), ("known-alice",)),
     ),
-    ids=("missing_vad", "missing_speaker_dependencies", "known_ids_not_ready"),
+    ids=("missing_vad", "missing_speaker_dependencies"),
 )
 def test_diarize_readiness_fails_before_probe(
     vad_adapter: object | None,
@@ -541,8 +605,10 @@ def test_diarize_readiness_fails_before_probe(
                 vad_adapter=vad_adapter,
                 speaker_adapter=speaker_adapter,
                 speaker_policy=speaker_policy,
+                known_speaker_policy=None,
             ),
             sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
             canonical_options=_options(
                 model="sensevoice-diarize",
                 known_speaker_ids=known_speaker_ids,
@@ -559,6 +625,141 @@ def test_diarize_readiness_fails_before_probe(
         assert speaker_adapter.calls == []
 
 
+def test_known_matching_snapshot_requires_policy_before_probe() -> None:
+    decoder = FakeDecoder(_blocks(1))
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+    speaker_adapter = FakeSpeakerAdapter()
+
+    with pytest.raises(pipeline.PipelineNotReady):
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_policy=_policy(),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=_selected_snapshot(),
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001",),
+            ),
+        )
+
+    assert frontend.probe_calls == 0
+    assert frontend.decode_calls == 0
+    assert decoder.closed == 0
+    assert speaker_adapter.calls == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    (
+        _selected_snapshot(("00000002", "00000001")),
+        _selected_snapshot(("00000001", "00000003")),
+    ),
+    ids=("order_mismatch", "set_mismatch"),
+)
+def test_known_snapshot_ids_must_exactly_match_options_before_probe(
+    snapshot: SelectedSpeakerSnapshot,
+) -> None:
+    decoder = FakeDecoder(_blocks(1))
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+    speaker_adapter = FakeSpeakerAdapter()
+
+    with pytest.raises(RuntimeError):
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_policy=_policy(),
+                known_speaker_policy=_match_policy(),
+            ),
+            sink,
+            selected_speaker_snapshot=snapshot,
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001", "00000002"),
+            ),
+        )
+
+    assert frontend.probe_calls == 0
+    assert frontend.decode_calls == 0
+    assert decoder.closed == 0
+    assert speaker_adapter.calls == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_known_options_reject_empty_snapshot_before_probe() -> None:
+    decoder = FakeDecoder(_blocks(1))
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+    speaker_adapter = FakeSpeakerAdapter()
+
+    with pytest.raises(RuntimeError):
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_policy=_policy(),
+                known_speaker_policy=_match_policy(),
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001",),
+            ),
+        )
+
+    assert frontend.probe_calls == 0
+    assert frontend.decode_calls == 0
+    assert decoder.closed == 0
+    assert speaker_adapter.calls == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_anonymous_options_reject_nonempty_snapshot_before_probe() -> None:
+    decoder = FakeDecoder(_blocks(1))
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+    speaker_adapter = FakeSpeakerAdapter()
+
+    with pytest.raises(RuntimeError):
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_policy=_policy(),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=_selected_snapshot(),
+            canonical_options=_options(model="sensevoice-diarize"),
+        )
+
+    assert frontend.probe_calls == 0
+    assert frontend.decode_calls == 0
+    assert decoder.closed == 0
+    assert speaker_adapter.calls == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
 def test_normal_modes_never_call_injected_speaker_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -573,8 +774,10 @@ def test_normal_modes_never_call_injected_speaker_adapter(
             FakeAsrAdapter(lambda _pcms: (_result("direct"),)),
             speaker_adapter=cam,
             speaker_policy=_policy(),
+            known_speaker_policy=None,
         ),
         direct_sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         canonical_options=_options(chunking_strategy=None),
     )
 
@@ -586,8 +789,10 @@ def test_normal_modes_never_call_injected_speaker_adapter(
             vad_adapter=object(),
             speaker_adapter=cam,
             speaker_policy=_policy(),
+            known_speaker_policy=None,
         ),
         auto_sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
     )
 
     assert [record.text for record in direct_sink.records] == ["direct"]
@@ -618,8 +823,10 @@ def test_diarize_dispatches_through_the_existing_vad_processor(
             vad_adapter=vad_adapter,
             speaker_adapter=FakeSpeakerAdapter(),
             speaker_policy=_policy(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         canonical_options=_options(model="sensevoice-diarize"),
     )
 
@@ -659,6 +866,47 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
         "A",
     ]
     sink = RecordingSink(events)
+    selected_snapshot = _selected_snapshot()
+    match_policy = _match_policy()
+    sentinel_mapping = SpeakerLabelMapping(
+        (
+            speaker_matching.SpeakerLabelResolution("A", None),
+            speaker_matching.SpeakerLabelResolution("B", None),
+        )
+    )
+    original_finalize = speakers.AnonymousSpeakerState.finalize_clusters
+    finalized_clusters: list[tuple[speakers.AnonymousSpeakerCluster, ...]] = []
+
+    def finalize_clusters(
+        state: speakers.AnonymousSpeakerState,
+    ) -> tuple[speakers.AnonymousSpeakerCluster, ...]:
+        events.append("finalize_clusters")
+        clusters = original_finalize(state)
+        finalized_clusters.append(clusters)
+        return clusters
+
+    matcher_calls: list[tuple[object, object, object]] = []
+
+    def match_selected_speakers(
+        clusters: object,
+        snapshot: object,
+        policy: object,
+    ) -> SpeakerLabelMapping:
+        events.append("matcher")
+        matcher_calls.append((clusters, snapshot, policy))
+        return sentinel_mapping
+
+    monkeypatch.setattr(
+        speakers.AnonymousSpeakerState,
+        "finalize_clusters",
+        finalize_clusters,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "match_selected_speakers",
+        match_selected_speakers,
+        raising=False,
+    )
 
     result = _process(
         pipeline.Processor(
@@ -667,12 +915,22 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
             vad_adapter=object(),
             speaker_adapter=cam,
             speaker_policy=_policy(),
+            known_speaker_policy=match_policy,
         ),
         sink,
-        canonical_options=_options(model="sensevoice-diarize"),
+        selected_speaker_snapshot=selected_snapshot,
+        canonical_options=_options(
+            model="sensevoice-diarize",
+            known_speaker_ids=("00000001",),
+        ),
     )
 
-    _assert_empty_processor_result(result, sink.ref)
+    assert type(result) is pipeline.ProcessorResult
+    assert result.artifact_ref is sink.ref
+    assert result.speaker_mapping is sentinel_mapping
+    assert len(finalized_clusters) == 1
+    assert tuple(cluster.label for cluster in finalized_clusters[0]) == ("A", "B")
+    assert matcher_calls == [(finalized_clusters[0], selected_snapshot, match_policy)]
     assert len(cam.calls) == 3
     for call, segment in zip(cam.calls, segments, strict=True):
         canonical_start = segment.span.start_sample - segment.pcm_start_sample
@@ -681,7 +939,16 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
             call,
             segment.pcm[canonical_start:canonical_end],
         )
-    assert events == ["cam", "cam", "cam", "append", "append"]
+    assert events == [
+        "cam",
+        "cam",
+        "cam",
+        "append",
+        "append",
+        "finalize_clusters",
+        "matcher",
+        "sink_finalize",
+    ]
     assert sink.records == [
         pipeline.SegmentRecord(
             index=0,
@@ -730,8 +997,10 @@ def test_diarize_cam_failure_is_batch_atomic_and_cleans_up(
                 vad_adapter=object(),
                 speaker_adapter=cam,
                 speaker_policy=_policy(),
+                known_speaker_policy=None,
             ),
             sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
             canonical_options=_options(model="sensevoice-diarize"),
         )
 
@@ -761,8 +1030,10 @@ def test_empty_diarize_never_calls_asr_or_cam(
             vad_adapter=object(),
             speaker_adapter=cam,
             speaker_policy=_policy(),
+            known_speaker_policy=None,
         ),
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         canonical_options=_options(model="sensevoice-diarize"),
     )
 
@@ -772,6 +1043,99 @@ def test_empty_diarize_never_calls_asr_or_cam(
     assert sink.records == []
     assert sink.finalized == 1
     assert sink.aborted == 0
+    assert decoder.closed == 1
+
+
+def test_known_empty_clusters_finalize_once_without_calling_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_segmenter(monkeypatch, ((),))
+    original_finalize = speakers.AnonymousSpeakerState.finalize_clusters
+    finalize_calls = 0
+
+    def finalize_clusters(
+        state: speakers.AnonymousSpeakerState,
+    ) -> tuple[speakers.AnonymousSpeakerCluster, ...]:
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return original_finalize(state)
+
+    monkeypatch.setattr(
+        speakers.AnonymousSpeakerState,
+        "finalize_clusters",
+        finalize_clusters,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "match_selected_speakers",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("empty clusters must not call matcher")
+        ),
+        raising=False,
+    )
+    decoder = FakeDecoder(_blocks(1))
+    sink = RecordingSink()
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(decoder),
+            FakeAsrAdapter(),
+            vad_adapter=object(),
+            speaker_adapter=FakeSpeakerAdapter(),
+            speaker_policy=_policy(),
+            known_speaker_policy=_match_policy(),
+        ),
+        sink,
+        selected_speaker_snapshot=_selected_snapshot(),
+        canonical_options=_options(
+            model="sensevoice-diarize",
+            known_speaker_ids=("00000001",),
+        ),
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert finalize_calls == 1
+    assert sink.finalized == 1
+    assert sink.aborted == 0
+    assert decoder.closed == 1
+
+
+def test_known_match_failure_aborts_before_sink_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segment = _segment(100, 200, pcm_start_sample=90)
+    _install_segmenter(monkeypatch, ((segment,),))
+    expected = speaker_matching.SpeakerMatchInputError()
+    monkeypatch.setattr(
+        pipeline,
+        "match_selected_speakers",
+        lambda *_args: (_ for _ in ()).throw(expected),
+        raising=False,
+    )
+    decoder = FakeDecoder(_blocks(1))
+    sink = RecordingSink()
+
+    with pytest.raises(speaker_matching.SpeakerMatchInputError) as caught:
+        _process(
+            pipeline.Processor(
+                FakeFrontend(decoder),
+                FakeAsrAdapter(lambda _pcms: (_result("known"),)),
+                vad_adapter=object(),
+                speaker_adapter=FakeSpeakerAdapter((_window(_unit(1.0, 0.0)),)),
+                speaker_policy=_policy(),
+                known_speaker_policy=_match_policy(),
+            ),
+            sink,
+            selected_speaker_snapshot=_selected_snapshot(),
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001",),
+            ),
+        )
+
+    assert caught.value is expected
+    assert sink.finalized == 0
+    assert sink.aborted == 1
     assert decoder.closed == 1
 
 
@@ -792,6 +1156,7 @@ def test_diarize_state_is_request_local_on_reused_processor(
         vad_adapter=object(),
         speaker_adapter=cam,
         speaker_policy=_policy(),
+        known_speaker_policy=None,
     )
     sinks = (RecordingSink(), RecordingSink())
 
@@ -799,6 +1164,7 @@ def test_diarize_state_is_request_local_on_reused_processor(
         _process(
             processor,
             sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
             canonical_options=_options(model="sensevoice-diarize"),
         )
 

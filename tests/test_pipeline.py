@@ -28,6 +28,10 @@ from botified_asr.pipeline import (
     canonical_join,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
+
+
+EMPTY_SELECTED_SNAPSHOT = SelectedSpeakerSnapshot(())
 
 
 class FakeDecoder:
@@ -199,16 +203,22 @@ def run_processor(
     adapter: FakeAdapter,
     sink: RecordingSink | CanonicalJsonlSegmentSink,
     *,
+    selected_speaker_snapshot: SelectedSpeakerSnapshot,
     canonical_options: CanonicalOptions | None = None,
     progress: RecordingProgress | None = None,
 ) -> object:
     frontend = FakeFrontend(decoder)
-    return Processor(frontend, adapter).process(
+    return Processor(
+        frontend,
+        adapter,
+        known_speaker_policy=None,
+    ).process(
         Path("/internal/input.ready"),
         canonical_options or options(),
         Cancellation(),
         progress or RecordingProgress(),
         sink,
+        selected_speaker_snapshot=selected_speaker_snapshot,
     )
 
 
@@ -242,6 +252,12 @@ def test_processor_result_is_exact_frozen_slotted_and_requires_both_fields() -> 
     with pytest.raises(TypeError):
         result_type(artifact_ref)  # type: ignore[call-arg]
 
+    snapshot_parameter = signature(Processor.process).parameters[
+        "selected_speaker_snapshot"
+    ]
+    assert snapshot_parameter.kind is Parameter.KEYWORD_ONLY
+    assert snapshot_parameter.default is Parameter.empty
+
 
 @pytest.mark.parametrize("sample_count", [0, 1, 480_000])
 def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
@@ -261,6 +277,7 @@ def test_direct_processor_has_exact_empty_and_max_sample_boundaries(
         decoder,
         adapter,
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         progress=progress,
     )
 
@@ -323,6 +340,7 @@ def test_direct_processor_passes_explicit_language_to_one_item_batch(
         ),
         adapter,
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         canonical_options=options(language=language),
     )
 
@@ -355,7 +373,12 @@ def test_direct_processor_rejects_invalid_typed_batch_results_atomically(
     decoder = FakeDecoder([DecodedBlock(0, np.ones(4, dtype=np.int16))])
 
     with pytest.raises(PipelineError) as caught:
-        run_processor(decoder, adapter, sink)
+        run_processor(
+            decoder,
+            adapter,
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        )
 
     assert caught.value.code == "invalid_model_output"
     assert len(adapter.calls) == 1
@@ -388,6 +411,7 @@ def test_direct_processor_skips_empty_model_text_and_finalizes_successfully() ->
         ),
         adapter,
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         canonical_options=options(language="zh"),
         progress=progress,
     )
@@ -413,7 +437,12 @@ def test_direct_480001_closes_decoder_and_aborts_without_success() -> None:
     )
 
     with pytest.raises(PipelineError) as caught:
-        run_processor(decoder, adapter, sink)
+        run_processor(
+            decoder,
+            adapter,
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        )
 
     assert getattr(caught.value, "code", None) == "long_audio_requires_vad"
     assert decoder.closed == 1
@@ -434,12 +463,17 @@ def test_unimplemented_branches_are_typed_not_ready_and_never_run_direct() -> No
         frontend = FakeFrontend(decoder)
 
         with pytest.raises(PipelineNotReady) as caught:
-            Processor(frontend, adapter).process(
+            Processor(
+                frontend,
+                adapter,
+                known_speaker_policy=None,
+            ).process(
                 Path("/internal/input.ready"),
                 canonical_options,
                 Cancellation(),
                 RecordingProgress(),
                 sink,
+                selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
             )
 
         assert caught.value.code == "pipeline_not_ready"
@@ -554,6 +588,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             FakeDecoder([DecodedBlock(0, np.ones(1, dtype=np.int16))]),
             FakeAdapter(),
             failing_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert failing_writer.sealed == 0
     assert failing_writer.aborted == 1
@@ -565,6 +600,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             FakeDecoder([]),
             FakeAdapter(),
             seal_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert seal_writer.sealed == 0
     assert seal_writer.aborted == 1
@@ -579,6 +615,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             FakeDecoder([DecodedBlock(9_600, np.ones(1, dtype=np.int16))]),
             FakeAdapter(),
             discontinuous_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert getattr(discontinuous.value, "code", None) == "invalid_audio"
     assert discontinuous_sink.aborted == 1
@@ -594,6 +631,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             ),
             FakeAdapter(),
             short_nonfinal_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert short_nonfinal.value.code == "invalid_audio"
     assert short_nonfinal_sink.aborted == 1
@@ -604,6 +642,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             FakeDecoder([], fail_close=True),
             FakeAdapter(),
             close_fault_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert close_fault_sink.finalized == 0
     assert close_fault_sink.aborted == 1
@@ -618,6 +657,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
             iteration_fault_decoder,
             FakeAdapter(),
             iteration_fault_sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
         )
     assert iteration_fault_decoder.closed == 1
     assert iteration_fault_sink.aborted == 1
@@ -682,12 +722,14 @@ def test_runtime_generated_wav_runs_through_public_processor(
     result = Processor(
         FfmpegAudioFrontend(),
         NormalizingAsrAdapter(model),
+        known_speaker_policy=None,
     ).process(
         path,
         options(),
         Cancellation(),
         progress,
         sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
     )
 
     _assert_empty_processor_result(result, sink.ref)

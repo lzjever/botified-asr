@@ -20,6 +20,17 @@ from botified_asr.model_artifacts import (
     ModelArtifactSpec,
     ResolvedModelSnapshot,
 )
+from botified_asr.speakers import (
+    SPEAKER_DOWNMIX_POLICY_VERSION,
+    SPEAKER_EMBEDDING_DIMENSION,
+    SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION,
+    SPEAKER_NORMALIZATION_POLICY_VERSION,
+    SPEAKER_PADDING_POLICY_VERSION,
+    SPEAKER_SAMPLE_RATE,
+    SPEAKER_WINDOW_MAX_SAMPLES,
+    SPEAKER_WINDOW_SHIFT_SAMPLES,
+    SpeakerEmbeddingPolicy,
+)
 
 _LOAD_ERROR_MESSAGE = "FunASR model bundle could not be loaded"
 _WARMUP_SAMPLES = 16_000
@@ -41,6 +52,7 @@ class FunAsrModelBundle:
     asr: FunAsrSenseVoiceBatchAdapter
     vad: FunAsrStreamingVadAdapter
     speaker: FunAsrCampPlusAdapter
+    speaker_embedding_policy: SpeakerEmbeddingPolicy
 
 
 def load_funasr_model_bundle(
@@ -119,4 +131,23 @@ def load_funasr_model_bundle(
         speaker.embed_windows(np.zeros(24_000, dtype=np.int16))
     except Exception as error:
         raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE) from error
-    return FunAsrModelBundle(asr=asr, vad=vad, speaker=speaker)
+    speaker_embedding_policy = SpeakerEmbeddingPolicy(
+        model_id=speaker_snapshot.spec.model_id,
+        model_revision=speaker_snapshot.spec.revision,
+        embedding_dimension=SPEAKER_EMBEDDING_DIMENSION,
+        sample_rate=SPEAKER_SAMPLE_RATE,
+        downmix_policy_version=SPEAKER_DOWNMIX_POLICY_VERSION,
+        window_samples=SPEAKER_WINDOW_MAX_SAMPLES,
+        window_shift_samples=SPEAKER_WINDOW_SHIFT_SAMPLES,
+        padding_policy_version=SPEAKER_PADDING_POLICY_VERSION,
+        normalization_policy_version=SPEAKER_NORMALIZATION_POLICY_VERSION,
+        enrollment_aggregation_policy_version=(
+            SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION
+        ),
+    )
+    return FunAsrModelBundle(
+        asr=asr,
+        vad=vad,
+        speaker=speaker,
+        speaker_embedding_policy=speaker_embedding_policy,
+    )

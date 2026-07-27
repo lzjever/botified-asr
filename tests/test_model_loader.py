@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from botified_asr import funasr_adapter, model_artifacts
+from botified_asr import funasr_adapter, model_artifacts, speakers
 from botified_asr.funasr_adapter import (
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
@@ -274,6 +274,24 @@ def test_loader_resolves_three_pinned_specs_before_exact_distinct_construction_a
     assert isinstance(bundle.vad, FunAsrStreamingVadAdapter)
     assert isinstance(bundle.speaker, funasr_adapter.FunAsrCampPlusAdapter)
     assert len({id(bundle.asr), id(bundle.vad), id(bundle.speaker)}) == 3
+    expected_speaker_policy = speakers.SpeakerEmbeddingPolicy(
+        model_id=snapshots[CAMPLUS_SPEC].spec.model_id,
+        model_revision=snapshots[CAMPLUS_SPEC].spec.revision,
+        embedding_dimension=speakers.SPEAKER_EMBEDDING_DIMENSION,
+        sample_rate=16_000,
+        downmix_policy_version=speakers.SPEAKER_DOWNMIX_POLICY_VERSION,
+        window_samples=speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+        window_shift_samples=speakers.SPEAKER_WINDOW_SHIFT_SAMPLES,
+        padding_policy_version=speakers.SPEAKER_PADDING_POLICY_VERSION,
+        normalization_policy_version=(speakers.SPEAKER_NORMALIZATION_POLICY_VERSION),
+        enrollment_aggregation_policy_version=(
+            speakers.SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION
+        ),
+    )
+    assert bundle.speaker_embedding_policy == expected_speaker_policy
+    assert bundle.speaker_embedding_policy is not expected_speaker_policy
+    assert not hasattr(bundle.speaker_embedding_policy, "threshold")
+    assert not hasattr(bundle.speaker_embedding_policy, "top_two_margin")
     with pytest.raises(FrozenInstanceError):
         bundle.asr = bundle.asr
 
