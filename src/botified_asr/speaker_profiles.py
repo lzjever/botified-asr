@@ -4,6 +4,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 
 import numpy as np
 
@@ -116,24 +117,14 @@ class SpeakerProfile:
                 "speaker profile description must not exceed 500 characters"
             )
 
-        if not isinstance(self.embedding, SpeakerEmbedding):
-            raise TypeError("speaker profile embedding is invalid")
-        validate_speaker_model_id(self.embedding_model_id)
-        validate_speaker_model_revision(self.embedding_model_revision)
-        _validate_dimension(self.embedding_dimension)
-        if self.embedding.dimension != self.embedding_dimension:
-            raise ValueError("speaker profile embedding dimension is inconsistent")
-
-        fingerprint = self.embedding_policy_fingerprint
-        if not isinstance(fingerprint, str):
-            raise TypeError("speaker embedding policy fingerprint must be a string")
-        if _LOWERCASE_SHA256.fullmatch(fingerprint) is None:
-            raise ValueError("speaker embedding policy fingerprint is invalid")
-
-        if type(self.sample_count) is not int:
-            raise TypeError("speaker profile sample count must be an integer")
-        if not 2 <= self.sample_count <= 5:
-            raise ValueError("speaker profile sample count must be between 2 and 5")
+        _validate_profile_embedding_fields(
+            embedding=self.embedding,
+            embedding_model_id=self.embedding_model_id,
+            embedding_model_revision=self.embedding_model_revision,
+            embedding_dimension=self.embedding_dimension,
+            embedding_policy_fingerprint=self.embedding_policy_fingerprint,
+            sample_count=self.sample_count,
+        )
 
         created_at = _canonical_utc(self.created_at, name="created_at")
         updated_at = _canonical_utc(self.updated_at, name="updated_at")
@@ -154,6 +145,41 @@ class SpeakerProfile:
         return self.name.casefold()
 
 
+class KeepExisting(Enum):
+    VALUE = "keep_existing"
+
+
+KEEP_EXISTING = KeepExisting.VALUE
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerEmbeddingReplacement:
+    embedding: SpeakerEmbedding
+    embedding_model_id: str
+    embedding_model_revision: str
+    embedding_dimension: int
+    embedding_policy_fingerprint: str
+    sample_count: int
+
+    def __post_init__(self) -> None:
+        _validate_profile_embedding_fields(
+            embedding=self.embedding,
+            embedding_model_id=self.embedding_model_id,
+            embedding_model_revision=self.embedding_model_revision,
+            embedding_dimension=self.embedding_dimension,
+            embedding_policy_fingerprint=self.embedding_policy_fingerprint,
+            sample_count=self.sample_count,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerProfileUpdate:
+    name: str
+    description: KeepExisting | str | None
+    embedding: KeepExisting | SpeakerEmbeddingReplacement
+    updated_at: datetime
+
+
 def is_speaker_profile_compatible(
     profile: SpeakerProfile,
     policy: SpeakerEmbeddingPolicy,
@@ -168,6 +194,32 @@ def is_speaker_profile_compatible(
         and profile.embedding_dimension == policy.embedding_dimension
         and profile.embedding_policy_fingerprint == policy.fingerprint
     )
+
+
+def _validate_profile_embedding_fields(
+    *,
+    embedding: object,
+    embedding_model_id: object,
+    embedding_model_revision: object,
+    embedding_dimension: object,
+    embedding_policy_fingerprint: object,
+    sample_count: object,
+) -> None:
+    if not isinstance(embedding, SpeakerEmbedding):
+        raise TypeError("speaker profile embedding is invalid")
+    validate_speaker_model_id(embedding_model_id)
+    validate_speaker_model_revision(embedding_model_revision)
+    _validate_dimension(embedding_dimension)
+    if embedding.dimension != embedding_dimension:
+        raise ValueError("speaker profile embedding dimension is inconsistent")
+    if not isinstance(embedding_policy_fingerprint, str):
+        raise TypeError("speaker embedding policy fingerprint must be a string")
+    if _LOWERCASE_SHA256.fullmatch(embedding_policy_fingerprint) is None:
+        raise ValueError("speaker embedding policy fingerprint is invalid")
+    if type(sample_count) is not int:
+        raise TypeError("speaker profile sample count must be an integer")
+    if not 2 <= sample_count <= 5:
+        raise ValueError("speaker profile sample count must be between 2 and 5")
 
 
 def _validate_dimension(value: object) -> None:

@@ -8,13 +8,22 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable
 
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.speaker_profiles import (
+    KEEP_EXISTING,
+    SpeakerEmbedding,
+    SpeakerEmbeddingReplacement,
+    SpeakerProfile,
+    SpeakerProfileUpdate,
+)
 
 
 SCHEMA_VERSION = 3
+MAX_SPEAKER_PROFILES = 256
 LEASE_ID_PATTERN = re.compile(
     r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})$"
 )
@@ -26,6 +35,12 @@ ARTIFACT_NAME_PATTERN = re.compile(
 )
 LEASE_TYPES = {"upload", "artifact"}
 ARTIFACT_KINDS = {"segment_jsonl", "result_complete"}
+_SPEAKER_PROFILE_COLUMNS = """
+    id, name, name_key, description, embedding,
+    embedding_model_id, embedding_model_revision,
+    embedding_dimension, embedding_policy_fingerprint,
+    sample_count, created_at, updated_at
+"""
 
 
 class StorageSchemaError(RuntimeError):
@@ -36,6 +51,25 @@ class StorageAdmissionError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class SpeakerProfileStorageError(RuntimeError):
+    pass
+
+
+class SpeakerProfileNameConflictError(SpeakerProfileStorageError):
+    def __init__(self) -> None:
+        super().__init__("speaker profile name already exists")
+
+
+class SpeakerProfileLimitReachedError(SpeakerProfileStorageError):
+    def __init__(self) -> None:
+        super().__init__("speaker profile limit reached")
+
+
+class SpeakerProfileIdCollisionError(SpeakerProfileStorageError):
+    def __init__(self) -> None:
+        super().__init__("speaker profile ID already exists")
 
 
 @dataclass
@@ -487,6 +521,241 @@ class Storage:
                     "storage schema version changed during migration"
                 )
             self._verify_v3_schema()
+
+    def create_speaker_profile(
+        self,
+        profile: SpeakerProfile,
+    ) -> SpeakerProfile:
+        if not isinstance(profile, SpeakerProfile):
+            raise TypeError("create_speaker_profile requires a SpeakerProfile")
+        values = _encode_speaker_profile(profile)
+        with self._transaction():
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM speaker_profiles WHERE id = ?",
+                    (profile.id,),
+                ).fetchone()
+                is not None
+            ):
+                raise SpeakerProfileIdCollisionError
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM speaker_profiles WHERE name_key = ?",
+                    (profile.name_key,),
+                ).fetchone()
+                is not None
+            ):
+                raise SpeakerProfileNameConflictError
+            count = self._connection.execute(
+                "SELECT COUNT(*) FROM speaker_profiles"
+            ).fetchone()[0]
+            if count >= MAX_SPEAKER_PROFILES:
+                raise SpeakerProfileLimitReachedError
+            try:
+                self._connection.execute(
+                    f"""
+                    INSERT INTO speaker_profiles({_SPEAKER_PROFILE_COLUMNS})
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            except sqlite3.IntegrityError as error:
+                raise StorageSchemaError(
+                    "speaker profile insert violated storage schema"
+                ) from error
+        return profile
+
+    def get_speaker_profile(
+        self,
+        profile_id: str,
+    ) -> SpeakerProfile | None:
+        if not isinstance(profile_id, str):
+            raise TypeError("speaker profile ID must be a string")
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT {_SPEAKER_PROFILE_COLUMNS}
+                FROM speaker_profiles
+                WHERE id = ?
+                """,
+                (profile_id,),
+            ).fetchone()
+        return None if row is None else _decode_speaker_profile(row)
+
+    def list_speaker_profiles(self) -> tuple[SpeakerProfile, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT {_SPEAKER_PROFILE_COLUMNS}
+                FROM speaker_profiles
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        return tuple(_decode_speaker_profile(row) for row in rows)
+
+    def update_speaker_profile(
+        self,
+        profile_id: str,
+        update: SpeakerProfileUpdate,
+    ) -> SpeakerProfile | None:
+        if not isinstance(profile_id, str):
+            raise TypeError("speaker profile ID must be a string")
+        if type(update) is not SpeakerProfileUpdate:
+            raise TypeError(
+                "update_speaker_profile requires a SpeakerProfileUpdate"
+            )
+        with self._transaction():
+            row = self._connection.execute(
+                f"""
+                SELECT {_SPEAKER_PROFILE_COLUMNS}
+                FROM speaker_profiles
+                WHERE id = ?
+                """,
+                (profile_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = _decode_speaker_profile(row)
+
+            description = (
+                current.description
+                if update.description is KEEP_EXISTING
+                else update.description
+            )
+            if update.embedding is KEEP_EXISTING:
+                embedding = current.embedding
+                embedding_model_id = current.embedding_model_id
+                embedding_model_revision = current.embedding_model_revision
+                embedding_dimension = current.embedding_dimension
+                embedding_policy_fingerprint = (
+                    current.embedding_policy_fingerprint
+                )
+                sample_count = current.sample_count
+            elif type(update.embedding) is SpeakerEmbeddingReplacement:
+                replacement = update.embedding
+                embedding = replacement.embedding
+                embedding_model_id = replacement.embedding_model_id
+                embedding_model_revision = replacement.embedding_model_revision
+                embedding_dimension = replacement.embedding_dimension
+                embedding_policy_fingerprint = (
+                    replacement.embedding_policy_fingerprint
+                )
+                sample_count = replacement.sample_count
+            else:
+                raise TypeError(
+                    "speaker profile embedding update is invalid"
+                )
+
+            changed = SpeakerProfile(
+                id=current.id,
+                name=update.name,
+                description=description,
+                embedding=embedding,
+                embedding_model_id=embedding_model_id,
+                embedding_model_revision=embedding_model_revision,
+                embedding_dimension=embedding_dimension,
+                embedding_policy_fingerprint=embedding_policy_fingerprint,
+                sample_count=sample_count,
+                created_at=current.created_at,
+                updated_at=update.updated_at,
+            )
+            if changed.updated_at < current.updated_at:
+                raise ValueError(
+                    "speaker profile updated_at must not move backwards"
+                )
+            if (
+                self._connection.execute(
+                    """
+                    SELECT 1 FROM speaker_profiles
+                    WHERE name_key = ? AND id <> ?
+                    """,
+                    (changed.name_key, changed.id),
+                ).fetchone()
+                is not None
+            ):
+                raise SpeakerProfileNameConflictError
+            values = _encode_speaker_profile(changed)
+            try:
+                rowcount = self._connection.execute(
+                    """
+                    UPDATE speaker_profiles SET
+                        name = ?,
+                        name_key = ?,
+                        description = ?,
+                        embedding = ?,
+                        embedding_model_id = ?,
+                        embedding_model_revision = ?,
+                        embedding_dimension = ?,
+                        embedding_policy_fingerprint = ?,
+                        sample_count = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        values[1],
+                        values[2],
+                        values[3],
+                        values[4],
+                        values[5],
+                        values[6],
+                        values[7],
+                        values[8],
+                        values[9],
+                        values[11],
+                        changed.id,
+                    ),
+                ).rowcount
+            except sqlite3.IntegrityError as error:
+                raise StorageSchemaError(
+                    "speaker profile update violated storage schema"
+                ) from error
+            if rowcount != 1:
+                raise StorageSchemaError(
+                    "speaker profile changed during update"
+                )
+        return changed
+
+    def delete_speaker_profile(self, profile_id: str) -> bool:
+        if not isinstance(profile_id, str):
+            raise TypeError("speaker profile ID must be a string")
+        with self._transaction():
+            try:
+                rowcount = self._connection.execute(
+                    "DELETE FROM speaker_profiles WHERE id = ?",
+                    (profile_id,),
+                ).rowcount
+            except sqlite3.IntegrityError as error:
+                raise StorageSchemaError(
+                    "speaker profile delete violated storage schema"
+                ) from error
+            if rowcount not in {0, 1}:
+                raise StorageSchemaError(
+                    "speaker profile delete affected unexpected rows"
+                )
+        return rowcount == 1
+
+    def get_speaker_profiles_by_ids(
+        self,
+        profile_ids: tuple[str, ...],
+    ) -> tuple[SpeakerProfile, ...]:
+        if not isinstance(profile_ids, tuple) or any(
+            not isinstance(profile_id, str) for profile_id in profile_ids
+        ):
+            raise TypeError("speaker profile IDs must be a tuple of strings")
+        if not profile_ids:
+            return ()
+        placeholders = ", ".join("?" for _ in profile_ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT {_SPEAKER_PROFILE_COLUMNS}
+                FROM speaker_profiles
+                WHERE id IN ({placeholders})
+                ORDER BY id
+                """,
+                profile_ids,
+            ).fetchall()
+        return tuple(_decode_speaker_profile(row) for row in rows)
 
     def begin_upload(
         self,
@@ -1299,6 +1568,77 @@ class Storage:
 
     def _transaction(self) -> _Transaction:
         return _Transaction(self)
+
+
+def _encode_speaker_profile(profile: SpeakerProfile) -> tuple[object, ...]:
+    return (
+        profile.id,
+        profile.name,
+        profile.name_key,
+        profile.description,
+        sqlite3.Binary(profile.embedding.to_bytes()),
+        profile.embedding_model_id,
+        profile.embedding_model_revision,
+        profile.embedding_dimension,
+        profile.embedding_policy_fingerprint,
+        profile.sample_count,
+        _encode_profile_timestamp(profile.created_at),
+        _encode_profile_timestamp(profile.updated_at),
+    )
+
+
+def _decode_speaker_profile(row: sqlite3.Row) -> SpeakerProfile:
+    try:
+        dimension = row["embedding_dimension"]
+        profile = SpeakerProfile(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"],
+            embedding=SpeakerEmbedding.from_bytes(
+                row["embedding"],
+                dimension=dimension,
+            ),
+            embedding_model_id=row["embedding_model_id"],
+            embedding_model_revision=row["embedding_model_revision"],
+            embedding_dimension=dimension,
+            embedding_policy_fingerprint=row[
+                "embedding_policy_fingerprint"
+            ],
+            sample_count=row["sample_count"],
+            created_at=_decode_profile_timestamp(row["created_at"]),
+            updated_at=_decode_profile_timestamp(row["updated_at"]),
+        )
+        if (
+            row["name"] != profile.name
+            or row["name_key"] != profile.name_key
+            or row["description"] != profile.description
+        ):
+            raise ValueError("speaker profile text fields are inconsistent")
+    except (IndexError, TypeError, ValueError) as error:
+        raise StorageSchemaError("speaker profile row is corrupt") from error
+    return profile
+
+
+def _encode_profile_timestamp(value: datetime) -> str:
+    if value.tzinfo is not timezone.utc:
+        raise ValueError("speaker profile timestamp is not canonical UTC")
+    return (
+        f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+        f"T{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+        f".{value.microsecond:06d}Z"
+    )
+
+
+def _decode_profile_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError("speaker profile timestamp must be text")
+    parsed = datetime.strptime(
+        value,
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ).replace(tzinfo=timezone.utc)
+    if _encode_profile_timestamp(parsed) != value:
+        raise ValueError("speaker profile timestamp is not canonical")
+    return parsed
 
 
 class _Transaction:
