@@ -14,7 +14,12 @@ from botified_asr.pipeline import (
     RichAnnotations,
     VadMarker,
 )
-from botified_asr.speakers import SpeakerEmbeddingWindow
+from botified_asr.speakers import (
+    SPEAKER_EMBEDDING_DIMENSION as CAMPLUS_EMBEDDING_DIMENSION,
+    SPEAKER_WINDOW_MAX_SAMPLES as CAMPLUS_WINDOW_SAMPLES,
+    SPEAKER_WINDOW_SHIFT_SAMPLES as CAMPLUS_WINDOW_SHIFT_SAMPLES,
+    SpeakerEmbeddingWindow,
+)
 
 _LANGUAGES = frozenset({"auto", "zh", "en", "yue", "ja", "ko"})
 _OUTPUT_LANGUAGES = _LANGUAGES - {"auto"}
@@ -47,9 +52,6 @@ _CONTROL_PREFIX = re.compile(
     r"<\|([^|<>]{1,64})\|>"
 )
 _UNKNOWN_TAG = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,63}\Z")
-CAMPLUS_WINDOW_SAMPLES = 24_000
-CAMPLUS_WINDOW_SHIFT_SAMPLES = 12_000
-CAMPLUS_EMBEDDING_DIMENSION = 192
 
 
 class FunAsrAutoModel(Protocol):

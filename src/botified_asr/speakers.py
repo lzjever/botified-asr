@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import asdict, dataclass
 from numbers import Real
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from botified_asr import audio
 from botified_asr.errors import PipelineError
 
+SPEAKER_SAMPLE_RATE = audio.SAMPLE_RATE
 SPEAKER_EMBEDDING_DIMENSION = 192
 SPEAKER_WINDOW_MAX_SAMPLES = 24_000
+SPEAKER_WINDOW_SHIFT_SAMPLES = 12_000
 SPEAKER_EMBEDDING_NORM_TOLERANCE = 1e-5
+SPEAKER_DOWNMIX_POLICY_VERSION = "ffmpeg-first-audio-stream-ac1-v1"
+SPEAKER_PADDING_POLICY_VERSION = "right-zero-pad-v1"
+SPEAKER_NORMALIZATION_POLICY_VERSION = "int16-div-32768-l2-v1"
+SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION = "sample-centroid-equal-average-v1"
 ANONYMOUS_SPEAKER_LABELS = tuple(chr(ord("A") + ordinal) for ordinal in range(26)) + (
     "AA",
     "AB",
@@ -21,6 +31,77 @@ ANONYMOUS_SPEAKER_LABELS = tuple(chr(ord("A") + ordinal) for ordinal in range(26
     "AF",
 )
 _ANONYMOUS_SPEAKER_LABEL_SET = frozenset(ANONYMOUS_SPEAKER_LABELS)
+_MODEL_ID_PART = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_MODEL_REVISION = re.compile(r"\A[0-9a-f]{40}\Z")
+_POLICY_VERSION_TOKEN = re.compile(r"\A[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*\Z")
+
+
+@dataclass(frozen=True)
+class SpeakerEmbeddingPolicy:
+    model_id: str
+    model_revision: str
+    embedding_dimension: int
+    sample_rate: int
+    downmix_policy_version: str
+    window_samples: int
+    window_shift_samples: int
+    padding_policy_version: str
+    normalization_policy_version: str
+    enrollment_aggregation_policy_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_id, str):
+            raise TypeError("speaker embedding model ID must be a string")
+        model_id_parts = self.model_id.split("/")
+        if len(model_id_parts) != 2 or any(
+            part in {"", ".", ".."} or _MODEL_ID_PART.fullmatch(part) is None
+            for part in model_id_parts
+        ):
+            raise ValueError("speaker embedding model ID is invalid")
+        if not isinstance(self.model_revision, str):
+            raise TypeError("speaker embedding model revision must be a string")
+        if _MODEL_REVISION.fullmatch(self.model_revision) is None:
+            raise ValueError("speaker embedding model revision is invalid")
+
+        for name in (
+            "embedding_dimension",
+            "sample_rate",
+            "window_samples",
+            "window_shift_samples",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.window_shift_samples > self.window_samples:
+            raise ValueError("speaker window shift must not exceed window size")
+
+        for name in (
+            "downmix_policy_version",
+            "padding_policy_version",
+            "normalization_policy_version",
+            "enrollment_aggregation_policy_version",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f"{name} must be a string")
+            if _POLICY_VERSION_TOKEN.fullmatch(value) is None:
+                raise ValueError(f"{name} is invalid")
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            asdict(self),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.canonical_bytes).hexdigest()
 
 
 @dataclass(frozen=True)
