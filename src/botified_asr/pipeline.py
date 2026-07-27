@@ -23,6 +23,9 @@ from botified_asr.contracts import (
 )
 
 DIRECT_MAX_SAMPLES = 480_000
+ASR_BATCH_MAX_SEGMENTS = 32
+ASR_BATCH_MAX_PCM_SAMPLES = 960_000
+ASR_BATCH_MAX_WALL_SAMPLES = 4_800_000
 VAD_FRONTEND_CONTEXT_SAMPLES = 640
 VAD_BACKTRACK_SAMPLES = 6_400
 VAD_PREPADDING_SAMPLES = 3_200
@@ -758,9 +761,12 @@ class Processor:
         self,
         frontend: AudioFrontend,
         adapter: AsrAdapter,
+        *,
+        vad_adapter: StreamingVadAdapter | None = None,
     ) -> None:
         self._frontend = frontend
         self._adapter = adapter
+        self._vad_adapter = vad_adapter
 
     def process(
         self,
@@ -782,15 +788,19 @@ class Processor:
             blocks.close()
 
         try:
-            if (
-                canonical_options.chunking_strategy == "auto"
-                or canonical_options.model == "sensevoice-diarize"
-            ):
+            if canonical_options.model == "sensevoice-diarize":
                 raise PipelineNotReady()
-            if not (
+            is_direct = (
                 canonical_options.model == "sensevoice"
                 and canonical_options.chunking_strategy is None
-            ):
+            )
+            is_vad = (
+                canonical_options.model == "sensevoice"
+                and canonical_options.chunking_strategy == "auto"
+            )
+            if is_vad and self._vad_adapter is None:
+                raise PipelineNotReady()
+            if not (is_direct or is_vad):
                 raise PipelineError(
                     "invalid_pipeline_mode",
                     "Unsupported audio pipeline mode",
@@ -799,13 +809,26 @@ class Processor:
                 raise PipelineError("cancelled", "Audio processing was cancelled")
             probe = self._frontend.probe(input_path, cancellation)
             blocks = self._frontend.decode(input_path, probe, cancellation)
-            self._process_direct(
-                blocks,
-                cancellation,
-                progress_sink,
-                segment_sink,
-                language=canonical_options.language,
-            )
+            if is_vad:
+                vad_adapter = self._vad_adapter
+                if vad_adapter is None:
+                    raise PipelineNotReady()
+                self._process_vad(
+                    blocks,
+                    cancellation,
+                    progress_sink,
+                    segment_sink,
+                    vad_adapter=vad_adapter,
+                    language=canonical_options.language,
+                )
+            else:
+                self._process_direct(
+                    blocks,
+                    cancellation,
+                    progress_sink,
+                    segment_sink,
+                    language=canonical_options.language,
+                )
             close_decoder()
             artifact_ref = segment_sink.finalize()
             failed = False
@@ -816,6 +839,132 @@ class Processor:
             finally:
                 if failed:
                     segment_sink.abort()
+
+    def _process_vad(
+        self,
+        blocks: DecodedBlocks,
+        cancellation: Cancellation,
+        progress_sink: ProgressSink,
+        segment_sink: SegmentSink,
+        *,
+        vad_adapter: StreamingVadAdapter,
+        language: str,
+    ) -> None:
+        segmenter = StreamingSpeechSegmenter(vad_adapter)
+        pending: list[BufferedSpeechSegment] = []
+        pending_pcm_samples = 0
+        next_record_index = 0
+
+        def check_cancellation() -> None:
+            if cancellation.cancelled:
+                raise PipelineError("cancelled", "Audio processing was cancelled")
+
+        def flush() -> None:
+            nonlocal pending
+            nonlocal pending_pcm_samples
+            nonlocal next_record_index
+            if not pending:
+                return
+            check_cancellation()
+            segments = tuple(pending)
+            batch_result = self._adapter.transcribe_batch(
+                tuple(segment.pcm for segment in segments),
+                language=language,
+            )
+            check_cancellation()
+            if (
+                type(batch_result) is not tuple
+                or len(batch_result) != len(segments)
+                or any(not isinstance(result, AsrResult) for result in batch_result)
+            ):
+                raise PipelineError(
+                    "invalid_model_output",
+                    "ASR model returned an invalid batch result",
+                )
+            for segment, result in zip(segments, batch_result, strict=True):
+                if result.text == "":
+                    continue
+                segment_sink.append(
+                    SegmentRecord(
+                        index=next_record_index,
+                        start_sample=segment.span.start_sample,
+                        end_sample=segment.span.end_sample,
+                        text=result.text,
+                        language=result.language,
+                        annotations=result.annotations,
+                    )
+                )
+                next_record_index += 1
+            pending = []
+            pending_pcm_samples = 0
+
+        def enqueue(segment: BufferedSpeechSegment) -> None:
+            nonlocal pending_pcm_samples
+            if not isinstance(segment, BufferedSpeechSegment):
+                raise PipelineError(
+                    "invalid_model_output",
+                    "Speech segmenter returned an invalid segment",
+                )
+            exceeds_batch = bool(pending) and (
+                len(pending) + 1 > ASR_BATCH_MAX_SEGMENTS
+                or pending_pcm_samples + len(segment.pcm) > ASR_BATCH_MAX_PCM_SAMPLES
+                or segment.span.end_sample - pending[0].span.start_sample
+                > ASR_BATCH_MAX_WALL_SAMPLES
+            )
+            if exceeds_batch:
+                flush()
+            pending.append(segment)
+            pending_pcm_samples += len(segment.pcm)
+
+        iterator = iter(blocks)
+        try:
+            current = next(iterator)
+        except StopIteration:
+            progress_sink.update(
+                processed_samples=0,
+                total_samples=None,
+            )
+            return
+
+        processed_end_sample = 0
+        while True:
+            try:
+                following = next(iterator)
+            except StopIteration:
+                following = None
+            is_final = following is None
+
+            if current.start_sample != processed_end_sample:
+                raise PipelineError(
+                    "invalid_audio",
+                    "Decoded audio blocks are not contiguous",
+                )
+            if not is_final and len(current.pcm) < BLOCK_SAMPLES:
+                raise PipelineError(
+                    "invalid_audio",
+                    "Decoded audio has a non-final short block",
+                )
+            check_cancellation()
+            emitted = segmenter.process(current, is_final=is_final)
+            check_cancellation()
+            if type(emitted) is not tuple:
+                raise PipelineError(
+                    "invalid_model_output",
+                    "Speech segmenter returned an invalid result",
+                )
+            for segment in emitted:
+                enqueue(segment)
+
+            processed_end_sample += len(current.pcm)
+            progress_sink.update(
+                processed_samples=processed_end_sample,
+                total_samples=None,
+            )
+            if is_final:
+                break
+            current = following
+
+        flush()
 
     def _process_direct(
         self,
