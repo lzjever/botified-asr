@@ -14,7 +14,7 @@ from typing import BinaryIO, Callable
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEASE_ID_PATTERN = re.compile(
     r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})$"
 )
@@ -170,11 +170,12 @@ class Storage:
                     )
                     """
                 )
+                self._create_v2_ledger()
+                self._create_v3_speaker_profiles()
                 self._connection.execute(
                     "INSERT INTO schema_meta(singleton, version) VALUES (1, ?)",
                     (SCHEMA_VERSION,),
                 )
-                self._create_v2_ledger()
             return
 
         with self._lock:
@@ -185,10 +186,13 @@ class Storage:
             raise StorageSchemaError("storage schema version is missing")
         version = int(row["version"])
         if version == SCHEMA_VERSION:
-            self._verify_v2_ledger()
+            self._verify_v3_schema()
             return
         if version == 1:
             self._migrate_v1_to_v2()
+            version = 2
+        if version == 2:
+            self._migrate_v2_to_v3()
             return
         raise StorageSchemaError(
             f"unsupported storage schema version: {version}"
@@ -280,6 +284,108 @@ class Storage:
                 "storage schema v2 ledger has unexpected columns"
             )
 
+    def _create_v3_speaker_profiles(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE speaker_profiles (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                name_key TEXT NOT NULL,
+                description TEXT,
+                embedding BLOB NOT NULL
+                    CHECK (
+                        typeof(embedding) = 'blob'
+                        AND length(embedding) = 4 * embedding_dimension
+                    ),
+                embedding_model_id TEXT NOT NULL,
+                embedding_model_revision TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL
+                    CHECK (embedding_dimension > 0),
+                embedding_policy_fingerprint TEXT NOT NULL,
+                sample_count INTEGER NOT NULL
+                    CHECK (sample_count BETWEEN 2 AND 5),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE UNIQUE INDEX speaker_profiles_name_key_uq
+            ON speaker_profiles(name_key)
+            """
+        )
+
+    def _verify_v3_schema(self) -> None:
+        self._verify_v2_ledger()
+        expected_columns = (
+            ("id", "TEXT", 1, None, 1),
+            ("name", "TEXT", 1, None, 0),
+            ("name_key", "TEXT", 1, None, 0),
+            ("description", "TEXT", 0, None, 0),
+            ("embedding", "BLOB", 1, None, 0),
+            ("embedding_model_id", "TEXT", 1, None, 0),
+            ("embedding_model_revision", "TEXT", 1, None, 0),
+            ("embedding_dimension", "INTEGER", 1, None, 0),
+            ("embedding_policy_fingerprint", "TEXT", 1, None, 0),
+            ("sample_count", "INTEGER", 1, None, 0),
+            ("created_at", "TEXT", 1, None, 0),
+            ("updated_at", "TEXT", 1, None, 0),
+        )
+        with self._lock:
+            exists = self._connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'speaker_profiles'
+                """
+            ).fetchone()
+            columns = tuple(
+                (
+                    row["name"],
+                    row["type"],
+                    row["notnull"],
+                    row["dflt_value"],
+                    row["pk"],
+                )
+                for row in self._connection.execute(
+                    "PRAGMA table_info(speaker_profiles)"
+                )
+            )
+            indexes = {
+                row["name"]: row
+                for row in self._connection.execute(
+                    "PRAGMA index_list(speaker_profiles)"
+                )
+            }
+        if exists is None:
+            raise StorageSchemaError(
+                "storage schema v3 speaker profile table is missing"
+            )
+        if columns != expected_columns:
+            raise StorageSchemaError(
+                "storage schema v3 speaker profile table has unexpected columns"
+            )
+        name_key_index = indexes.get("speaker_profiles_name_key_uq")
+        if (
+            name_key_index is None
+            or name_key_index["unique"] != 1
+            or name_key_index["partial"] != 0
+        ):
+            raise StorageSchemaError(
+                "storage schema v3 speaker profile name index is invalid"
+            )
+        with self._lock:
+            indexed_columns = tuple(
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA index_info(speaker_profiles_name_key_uq)"
+                )
+            )
+        if indexed_columns != ("name_key",):
+            raise StorageSchemaError(
+                "storage schema v3 speaker profile name index is invalid"
+            )
+
     def _migrate_v1_to_v2(self) -> None:
         with self._transaction():
             old_table = self._connection.execute(
@@ -357,15 +463,30 @@ class Storage:
             self._connection.execute("DROP TABLE upload_leases")
             changed = self._connection.execute(
                 """
-                UPDATE schema_meta SET version = ?
+                UPDATE schema_meta SET version = 2
                 WHERE singleton = 1 AND version = 1
                 """,
-                (SCHEMA_VERSION,),
             ).rowcount
             if changed != 1:
                 raise StorageSchemaError(
                     "storage schema version changed during migration"
                 )
+
+    def _migrate_v2_to_v3(self) -> None:
+        with self._transaction():
+            self._verify_v2_ledger()
+            self._create_v3_speaker_profiles()
+            changed = self._connection.execute(
+                """
+                UPDATE schema_meta SET version = 3
+                WHERE singleton = 1 AND version = 2
+                """
+            ).rowcount
+            if changed != 1:
+                raise StorageSchemaError(
+                    "storage schema version changed during migration"
+                )
+            self._verify_v3_schema()
 
     def begin_upload(
         self,

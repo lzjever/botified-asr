@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import struct
 import threading
 from pathlib import Path
 
@@ -84,27 +85,177 @@ def create_v1_database(
     return controlled_path
 
 
-def test_fresh_schema_is_explicit_v2_generic_ledger(tmp_path: Path) -> None:
+def create_v2_database(
+    data_dir: Path,
+    *,
+    with_lease: bool = False,
+) -> Path | None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    staging = data_dir / "staging"
+    staging.mkdir()
+    lease_id = "b" * 32
+    controlled_path = staging / f"{lease_id}.ready"
+
+    connection = sqlite3.connect(data_dir / "botified-asr.sqlite3")
+    connection.executescript(
+        """
+        CREATE TABLE schema_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            version INTEGER NOT NULL
+        );
+        INSERT INTO schema_meta(singleton, version) VALUES (1, 2);
+        CREATE TABLE storage_leases (
+            id TEXT PRIMARY KEY,
+            lease_type TEXT NOT NULL
+                CHECK (lease_type IN ('upload', 'artifact')),
+            resource_kind TEXT NOT NULL,
+            owner_kind TEXT NOT NULL
+                CHECK (owner_kind IN ('sync', 'job', 'legacy')),
+            owner_id TEXT NOT NULL,
+            phase TEXT NOT NULL
+                CHECK (phase IN ('writing', 'sealed')),
+            controlled_path TEXT NOT NULL UNIQUE,
+            reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+            actual_bytes INTEGER NOT NULL CHECK (
+                actual_bytes >= 0 AND actual_bytes <= reserved_bytes
+            ),
+            content_sha256 TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX storage_leases_type_phase_idx
+            ON storage_leases(lease_type, phase);
+        CREATE INDEX storage_leases_owner_idx
+            ON storage_leases(owner_kind, owner_id);
+        """
+    )
+    if with_lease:
+        payload = b"data"
+        controlled_path.write_bytes(payload)
+        connection.execute(
+            """
+            INSERT INTO storage_leases(
+                id, lease_type, resource_kind, owner_kind, owner_id,
+                phase, controlled_path, reserved_bytes, actual_bytes,
+                content_sha256, created_at
+            ) VALUES (?, 'upload', 'transcription', 'legacy', ?, 'sealed',
+                      ?, ?, ?, ?, ?)
+            """,
+            (
+                lease_id,
+                lease_id,
+                str(controlled_path),
+                len(payload),
+                len(payload),
+                hashlib.sha256(payload).hexdigest(),
+                "2026-07-26T00:00:00.000Z",
+            ),
+        )
+    connection.commit()
+    connection.close()
+    return controlled_path if with_lease else None
+
+
+def _speaker_profile_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "01234567",
+        "name": "Alice",
+        "name_key": "alice",
+        "description": None,
+        "embedding": struct.pack("<ff", 1.0, 0.0),
+        "embedding_model_id": "funasr/campplus",
+        "embedding_model_revision": "1" * 40,
+        "embedding_dimension": 2,
+        "embedding_policy_fingerprint": "a" * 64,
+        "sample_count": 2,
+        "created_at": "2026-07-27T12:00:00Z",
+        "updated_at": "2026-07-27T12:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def _insert_speaker_profile(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO speaker_profiles(
+            id, name, name_key, description, embedding,
+            embedding_model_id, embedding_model_revision,
+            embedding_dimension, embedding_policy_fingerprint,
+            sample_count, created_at, updated_at
+        ) VALUES (
+            :id, :name, :name_key, :description, :embedding,
+            :embedding_model_id, :embedding_model_revision,
+            :embedding_dimension, :embedding_policy_fingerprint,
+            :sample_count, :created_at, :updated_at
+        )
+        """,
+        _speaker_profile_row(**overrides),
+    )
+
+
+def _recreate_speaker_profiles_with_column_drift(
+    connection: sqlite3.Connection,
+    *,
+    drift: str,
+) -> None:
+    description = "TEXT NOT NULL" if drift == "description-nullability" else "TEXT"
+    embedding = "TEXT NOT NULL" if drift == "embedding-type" else "BLOB NOT NULL"
+    connection.executescript(
+        f"""
+        DROP INDEX speaker_profiles_name_key_uq;
+        DROP TABLE speaker_profiles;
+        CREATE TABLE speaker_profiles (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL,
+            description {description},
+            embedding {embedding}
+                CHECK (
+                    typeof(embedding) = 'blob'
+                    AND length(embedding) = 4 * embedding_dimension
+                ),
+            embedding_model_id TEXT NOT NULL,
+            embedding_model_revision TEXT NOT NULL,
+            embedding_dimension INTEGER NOT NULL
+                CHECK (embedding_dimension > 0),
+            embedding_policy_fingerprint TEXT NOT NULL,
+            sample_count INTEGER NOT NULL
+                CHECK (sample_count BETWEEN 2 AND 5),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX speaker_profiles_name_key_uq
+            ON speaker_profiles(name_key);
+        """
+    )
+
+
+def test_fresh_schema_is_explicit_v3_with_speaker_profiles(tmp_path: Path) -> None:
     storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
     try:
         version = storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
         ).fetchone()[0]
-        columns = {
+        profile_columns = tuple(
+            storage._connection.execute("PRAGMA table_info(speaker_profiles)")
+        )
+        profile_indexes = {
+            row["name"]: row
+            for row in storage._connection.execute(
+                "PRAGMA index_list(speaker_profiles)"
+            )
+        }
+
+        assert version == 3
+        assert {
             row["name"]
             for row in storage._connection.execute(
                 "PRAGMA table_info(storage_leases)"
             )
-        }
-        indexes = {
-            row["name"]
-            for row in storage._connection.execute(
-                "PRAGMA index_list(storage_leases)"
-            )
-        }
-
-        assert version == 2
-        assert columns == {
+        } == {
             "id",
             "lease_type",
             "resource_kind",
@@ -117,10 +268,56 @@ def test_fresh_schema_is_explicit_v2_generic_ledger(tmp_path: Path) -> None:
             "content_sha256",
             "created_at",
         }
+        assert tuple(
+            (
+                row["name"],
+                row["type"],
+                row["notnull"],
+                row["dflt_value"],
+                row["pk"],
+            )
+            for row in profile_columns
+        ) == (
+            ("id", "TEXT", 1, None, 1),
+            ("name", "TEXT", 1, None, 0),
+            ("name_key", "TEXT", 1, None, 0),
+            ("description", "TEXT", 0, None, 0),
+            ("embedding", "BLOB", 1, None, 0),
+            ("embedding_model_id", "TEXT", 1, None, 0),
+            ("embedding_model_revision", "TEXT", 1, None, 0),
+            ("embedding_dimension", "INTEGER", 1, None, 0),
+            ("embedding_policy_fingerprint", "TEXT", 1, None, 0),
+            ("sample_count", "INTEGER", 1, None, 0),
+            ("created_at", "TEXT", 1, None, 0),
+            ("updated_at", "TEXT", 1, None, 0),
+        )
+        unique_name_key = profile_indexes["speaker_profiles_name_key_uq"]
+        assert unique_name_key["unique"] == 1
+        assert unique_name_key["partial"] == 0
+        assert tuple(
+            row["name"]
+            for row in storage._connection.execute(
+                "PRAGMA index_info(speaker_profiles_name_key_uq)"
+            )
+        ) == ("name_key",)
+        assert not any("created" in name for name in profile_indexes)
         assert {
             "storage_leases_type_phase_idx",
             "storage_leases_owner_idx",
-        } <= indexes
+        } <= {
+            row["name"]
+            for row in storage._connection.execute(
+                "PRAGMA index_list(storage_leases)"
+            )
+        }
+
+        _insert_speaker_profile(storage._connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_speaker_profile(
+                storage._connection,
+                id="ABCDEFGH",
+                name="ALICE",
+            )
     finally:
         storage.close()
 
@@ -142,10 +339,16 @@ def test_v1_schema_migrates_transactionally_and_reconciles_legacy(
     try:
         assert storage._connection.execute(
             "SELECT version FROM schema_meta WHERE singleton = 1"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 3
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM storage_leases"
         ).fetchone()[0] == 0
+        assert storage._connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'speaker_profiles'
+            """
+        ).fetchone()[0] == 1
         assert storage._connection.execute(
             """
             SELECT COUNT(*) FROM sqlite_master
@@ -221,6 +424,320 @@ def test_failed_v1_migration_rolls_back_structure_and_version(
         assert legacy_path.read_bytes() == b"data"
     finally:
         connection.close()
+
+
+def test_v2_schema_migrates_to_v3_without_rewriting_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controlled_path = create_v2_database(tmp_path, with_lease=True)
+    monkeypatch.setattr(Storage, "_reconcile_startup", lambda _self: None)
+
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        assert (
+            storage._connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == 3
+        )
+        lease = storage._connection.execute(
+            """
+            SELECT id, lease_type, resource_kind, owner_kind, owner_id,
+                   phase, controlled_path, reserved_bytes, actual_bytes,
+                   content_sha256, created_at
+            FROM storage_leases
+            """
+        ).fetchone()
+        assert tuple(lease) == (
+            "b" * 32,
+            "upload",
+            "transcription",
+            "legacy",
+            "b" * 32,
+            "sealed",
+            str(controlled_path),
+            4,
+            4,
+            hashlib.sha256(b"data").hexdigest(),
+            "2026-07-26T00:00:00.000Z",
+        )
+        assert controlled_path is not None
+        assert controlled_path.read_bytes() == b"data"
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM speaker_profiles"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        storage.close()
+
+
+def test_failed_v2_migration_rolls_back_then_retries_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controlled_path = create_v2_database(tmp_path, with_lease=True)
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_v3_schema_version
+            BEFORE UPDATE OF version ON schema_meta
+            WHEN NEW.version = 3
+            BEGIN
+                SELECT RAISE(ABORT, 'injected v3 migration failure');
+            END;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected v3 migration failure",
+    ):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            connection.execute(
+                """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE name IN (
+                'speaker_profiles',
+                'speaker_profiles_name_key_uq'
+            )
+            """
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM storage_leases").fetchone()[0] == 1
+        )
+        assert controlled_path is not None
+        assert controlled_path.read_bytes() == b"data"
+        connection.execute("DROP TRIGGER reject_v3_schema_version")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with monkeypatch.context() as retry:
+        retry.setattr(Storage, "_reconcile_startup", lambda _self: None)
+        storage = Storage(
+            tmp_path,
+            limits(),
+            free_bytes=lambda _: 1 << 40,
+        )
+    try:
+        assert (
+            storage._connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == 3
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        storage.close()
+
+
+def test_failed_v3_verification_rolls_back_then_retries_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_v2_database(tmp_path)
+    create_speaker_profiles = Storage._create_v3_speaker_profiles
+
+    def create_invalid_speaker_profiles(storage: Storage) -> None:
+        create_speaker_profiles(storage)
+        storage._connection.execute(
+            "DROP INDEX speaker_profiles_name_key_uq"
+        )
+
+    with monkeypatch.context() as failure:
+        failure.setattr(
+            Storage,
+            "_create_v3_speaker_profiles",
+            create_invalid_speaker_profiles,
+        )
+        with pytest.raises(StorageSchemaError, match="name index"):
+            Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            connection.execute(
+                """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE name IN (
+                'speaker_profiles',
+                'speaker_profiles_name_key_uq'
+            )
+            """
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        assert (
+            connection.execute(
+                "SELECT version FROM schema_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == 3
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM speaker_profiles"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-table",
+        "wrong-table",
+        "wrong-column",
+        "missing-index",
+        "wrong-index-column",
+        "wrong-column-type",
+        "wrong-column-nullability",
+    ),
+)
+def test_v3_schema_verifier_rejects_missing_or_wrong_profile_structure(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        if mutation == "wrong-column-type":
+            _recreate_speaker_profiles_with_column_drift(
+                connection,
+                drift="embedding-type",
+            )
+        elif mutation == "wrong-column-nullability":
+            _recreate_speaker_profiles_with_column_drift(
+                connection,
+                drift="description-nullability",
+            )
+        else:
+            statements = {
+                "missing-table": ("DROP TABLE speaker_profiles",),
+                "wrong-table": (
+                    "ALTER TABLE speaker_profiles RENAME TO wrong_speaker_profiles",
+                ),
+                "wrong-column": (
+                    "ALTER TABLE speaker_profiles "
+                    "RENAME COLUMN updated_at TO wrong_updated_at",
+                ),
+                "missing-index": ("DROP INDEX speaker_profiles_name_key_uq",),
+                "wrong-index-column": (
+                    "DROP INDEX speaker_profiles_name_key_uq",
+                    "CREATE UNIQUE INDEX speaker_profiles_name_key_uq "
+                    "ON speaker_profiles(name)",
+                ),
+            }[mutation]
+            for statement in statements:
+                connection.execute(statement)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StorageSchemaError):
+        Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+
+
+def test_v3_schema_verifier_allows_unrelated_tables_and_indexes(
+    tmp_path: Path,
+) -> None:
+    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+    connection = sqlite3.connect(tmp_path / "botified-asr.sqlite3")
+    try:
+        connection.execute("CREATE TABLE extension_data (key TEXT PRIMARY KEY)")
+        connection.execute(
+            "CREATE INDEX extension_speaker_name_idx ON speaker_profiles(name)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40).close()
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    ("dimension", "embedding", "sample-count"),
+)
+def test_speaker_profile_table_enforces_only_local_storage_checks(
+    tmp_path: Path,
+    constraint: str,
+) -> None:
+    storage = Storage(tmp_path, limits(), free_bytes=lambda _: 1 << 40)
+    try:
+        _insert_speaker_profile(
+            storage._connection,
+            id="bad",
+            name=" A ",
+            name_key="a",
+            embedding_model_id="bad",
+            embedding_model_revision="short",
+            embedding_policy_fingerprint="opaque",
+            created_at="later",
+            updated_at="earlier",
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM speaker_profiles"
+            ).fetchone()[0]
+            == 1
+        )
+
+        if constraint == "dimension":
+            invalid_rows = ({"embedding_dimension": 0},)
+        elif constraint == "embedding":
+            invalid_rows = (
+                {"embedding": "12345678"},
+                {"embedding": b"\x00" * 7},
+            )
+        else:
+            invalid_rows = (
+                {"sample_count": 1},
+                {"sample_count": 6},
+            )
+
+        for invalid in invalid_rows:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_speaker_profile(storage._connection, **invalid)
+    finally:
+        storage.close()
 
 
 def test_storage_rejects_preexisting_control_directory_symlink(
