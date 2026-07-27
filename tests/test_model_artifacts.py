@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,45 @@ CAMPLUS_CONFIG_BYTES = 537
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+_MODEL_MANIFEST_BYTES = (
+    b'{"files":[{"byte_size":6,"relative_path":"config.json",'
+    b'"sha256":"b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"},'
+    b'{"byte_size":5,"relative_path":"weights/model.bin",'
+    b'"sha256":"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"}],'
+    b'"immutable_revision":"0123456789abcdef0123456789abcdef01234567",'
+    b'"model_id":"example/model","provider":"huggingface","version":1}'
+)
+_MODEL_MANIFEST_SHA256 = (
+    "bed3f90fd2ad7a4e8f9222b837fff2e6413899cd2394093133bcb1611bdfcd2b"
+)
+
+
+def _manifest_files() -> tuple[model_artifacts.ModelArtifactFile, ...]:
+    return (
+        model_artifacts.ModelArtifactFile(
+            relative_path="weights/model.bin",
+            sha256=_sha256(b"model"),
+            expected_bytes=len(b"model"),
+        ),
+        model_artifacts.ModelArtifactFile(
+            relative_path="config.json",
+            sha256=_sha256(b"config"),
+            expected_bytes=len(b"config"),
+        ),
+    )
+
+
+def _resolved_snapshot(
+    *,
+    files: tuple[model_artifacts.ModelArtifactFile, ...] | None = None,
+    root: Path = Path("/missing/model/snapshot"),
+) -> model_artifacts.ResolvedModelSnapshot:
+    return model_artifacts.ResolvedModelSnapshot(
+        spec=_spec(files=files or _manifest_files()),
+        root=root,
+    )
 
 
 def _spec(
@@ -301,6 +341,136 @@ def test_model_artifact_spec_rejects_mutable_or_unsafe_identity(
         factory()
 
     assert type(caught.value) is model_artifacts.ModelManifestError
+
+
+def test_model_snapshot_manifest_digest_is_exact_sorted_and_file_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_root = tmp_path / "does-not-exist"
+    declared = _manifest_files()
+    snapshot = _resolved_snapshot(files=declared, root=missing_root)
+    reversed_snapshot = _resolved_snapshot(
+        files=tuple(reversed(declared)),
+        root=tmp_path / "also-missing",
+    )
+
+    def fail_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("manifest digest must not open model files")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    assert not missing_root.exists()
+    assert _sha256(_MODEL_MANIFEST_BYTES) == _MODEL_MANIFEST_SHA256
+    assert (
+        model_artifacts.model_snapshot_manifest_digest(snapshot)
+        == _MODEL_MANIFEST_SHA256
+    )
+    assert (
+        model_artifacts.model_snapshot_manifest_digest(reversed_snapshot)
+        == _MODEL_MANIFEST_SHA256
+    )
+
+
+def _change_snapshot_manifest_field(
+    snapshot: model_artifacts.ResolvedModelSnapshot,
+    field: str,
+) -> model_artifacts.ResolvedModelSnapshot:
+    spec = snapshot.spec
+    if field == "provider":
+        spec = replace(spec)
+        object.__setattr__(spec, "provider", "other-provider")
+    elif field == "model_id":
+        spec = replace(spec, model_id="example/other-model")
+    elif field == "revision":
+        spec = replace(spec, revision="1" * 40)
+    elif field == "file_added":
+        spec = replace(
+            spec,
+            files=(
+                *spec.files,
+                model_artifacts.ModelArtifactFile(
+                    relative_path="tokenizer.json",
+                    sha256=_sha256(b"tokenizer"),
+                    expected_bytes=len(b"tokenizer"),
+                ),
+            ),
+        )
+    elif field == "file_removed":
+        spec = replace(spec, files=spec.files[:-1])
+    else:
+        first, *remaining = spec.files
+        file_changes = {
+            "path": {"relative_path": "weights/other-model.bin"},
+            "size": {"expected_bytes": first.expected_bytes + 1},
+            "hash": {"sha256": _sha256(b"other-model")},
+        }
+        spec = replace(
+            spec,
+            files=(replace(first, **file_changes[field]), *remaining),
+        )
+    return replace(snapshot, spec=spec)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "provider",
+        "model_id",
+        "revision",
+        "path",
+        "size",
+        "hash",
+        "file_added",
+        "file_removed",
+    ),
+)
+def test_each_model_snapshot_manifest_field_changes_the_digest(
+    field: str,
+) -> None:
+    snapshot = _resolved_snapshot()
+    changed = _change_snapshot_manifest_field(snapshot, field)
+
+    assert model_artifacts.model_snapshot_manifest_digest(changed) != (
+        model_artifacts.model_snapshot_manifest_digest(snapshot)
+    )
+
+
+def test_unicode_artifact_path_uses_canonical_utf8_metadata() -> None:
+    snapshot = _resolved_snapshot(
+        files=(
+            model_artifacts.ModelArtifactFile(
+                relative_path="配置.json",
+                sha256=_sha256(b"config"),
+                expected_bytes=len(b"config"),
+            ),
+        )
+    )
+    utf8_metadata = (
+        '{"files":[{"byte_size":6,"relative_path":"配置.json",'
+        '"sha256":"b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"}],'
+        '"immutable_revision":"0123456789abcdef0123456789abcdef01234567",'
+        '"model_id":"example/model","provider":"huggingface","version":1}'
+    ).encode("utf-8")
+    ascii_escaped_metadata = (
+        b'{"files":[{"byte_size":6,"relative_path":"\\u914d\\u7f6e.json",'
+        b'"sha256":"b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"}],'
+        b'"immutable_revision":"0123456789abcdef0123456789abcdef01234567",'
+        b'"model_id":"example/model","provider":"huggingface","version":1}'
+    )
+
+    digest = model_artifacts.model_snapshot_manifest_digest(snapshot)
+
+    assert digest == _sha256(utf8_metadata)
+    assert digest != _sha256(ascii_escaped_metadata)
+
+
+@pytest.mark.parametrize("invalid", (None, object(), _spec()))
+def test_model_snapshot_manifest_digest_rejects_invalid_types(
+    invalid: object,
+) -> None:
+    with pytest.raises(TypeError):
+        model_artifacts.model_snapshot_manifest_digest(invalid)  # type: ignore[arg-type]
 
 
 def test_revision_is_part_of_the_isolated_snapshot_path(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import re
 import shutil
 import stat
@@ -87,6 +88,37 @@ class ModelArtifactSpec:
 class ResolvedModelSnapshot:
     spec: ModelArtifactSpec
     root: Path
+
+
+def model_snapshot_manifest_digest(snapshot: ResolvedModelSnapshot) -> str:
+    if type(snapshot) is not ResolvedModelSnapshot:
+        raise TypeError("resolved model snapshot is invalid")
+    spec = snapshot.spec
+    manifest = {
+        "files": [
+            {
+                "byte_size": artifact.expected_bytes,
+                "relative_path": artifact.relative_path,
+                "sha256": artifact.sha256,
+            }
+            for artifact in sorted(
+                spec.files,
+                key=lambda artifact: artifact.relative_path,
+            )
+        ],
+        "immutable_revision": spec.revision,
+        "model_id": spec.model_id,
+        "provider": spec.provider,
+        "version": 1,
+    }
+    canonical = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class SnapshotFetcher(Protocol):
