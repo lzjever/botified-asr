@@ -170,6 +170,7 @@ class BoundedSpeechPcmBuffer:
         self._canonical_cursor_sample: int | None = None
         self._pcm_cursor_sample: int | None = None
         self._canonical_watermark_sample = 0
+        self._forced_floor_sample: int | None = None
         self._terminal = False
 
     @property
@@ -235,7 +236,6 @@ class BoundedSpeechPcmBuffer:
             elif span.start_sample != self._open_origin_sample:
                 self._raise_invalid_output()
             emitted.extend(self._complete_speech(span.end_sample))
-            self._trim_idle_history()
 
         if open_start_sample is None:
             if self._open_origin_sample is not None:
@@ -274,16 +274,29 @@ class BoundedSpeechPcmBuffer:
             self._raise_invalid_output()
 
     def _begin_speech(self, origin_sample: int) -> None:
-        if (
-            origin_sample < self._canonical_watermark_sample
-            or origin_sample > self._processed_end_sample
-        ):
+        if origin_sample > self._processed_end_sample:
             self._raise_invalid_output()
-        pcm_start_sample = max(0, origin_sample - VAD_PREPADDING_SAMPLES)
+        if (
+            origin_sample <= self._canonical_watermark_sample
+            and self._forced_floor_sample == self._canonical_watermark_sample
+        ):
+            if (
+                self._canonical_watermark_sample - origin_sample
+                > VAD_PREPADDING_SAMPLES
+            ):
+                self._raise_invalid_output()
+            canonical_start_sample = self._canonical_watermark_sample
+            pcm_start_sample = canonical_start_sample
+        else:
+            if origin_sample < self._canonical_watermark_sample:
+                self._raise_invalid_output()
+            canonical_start_sample = origin_sample
+            pcm_start_sample = max(0, origin_sample - VAD_PREPADDING_SAMPLES)
+            self._forced_floor_sample = None
         if pcm_start_sample < self.retained_start_sample:
             self._raise_invalid_output()
         self._open_origin_sample = origin_sample
-        self._canonical_cursor_sample = origin_sample
+        self._canonical_cursor_sample = canonical_start_sample
         self._pcm_cursor_sample = pcm_start_sample
 
     def _complete_speech(
@@ -291,22 +304,34 @@ class BoundedSpeechPcmBuffer:
         end_sample: int,
     ) -> tuple[BufferedSpeechSegment, ...]:
         canonical_cursor = self._require_canonical_cursor()
+        had_forced_continuation = self._forced_floor_sample == canonical_cursor
         if end_sample < canonical_cursor:
-            self._raise_invalid_output()
+            if (
+                not had_forced_continuation
+                or canonical_cursor - end_sample > VAD_PREPADDING_SAMPLES
+            ):
+                self._raise_invalid_output()
+            effective_end_sample = canonical_cursor
+        else:
+            effective_end_sample = end_sample
 
-        emitted = list(self._release_full_segments(end_sample))
+        emitted = list(self._release_full_segments(effective_end_sample))
         canonical_cursor = self._require_canonical_cursor()
         pcm_cursor = self._require_pcm_cursor()
-        if end_sample > pcm_cursor:
+        if effective_end_sample > pcm_cursor:
             emitted.append(
                 self._make_segment(
                     canonical_start=canonical_cursor,
                     pcm_start=pcm_cursor,
-                    end=end_sample,
+                    end=effective_end_sample,
                 )
             )
 
-        self._canonical_watermark_sample = end_sample
+        self._canonical_watermark_sample = effective_end_sample
+        if had_forced_continuation:
+            self._forced_floor_sample = effective_end_sample
+        else:
+            self._forced_floor_sample = None
         self._open_origin_sample = None
         self._canonical_cursor_sample = None
         self._pcm_cursor_sample = None
@@ -331,6 +356,7 @@ class BoundedSpeechPcmBuffer:
             self._canonical_cursor_sample = segment_end
             self._pcm_cursor_sample = segment_end
             self._canonical_watermark_sample = segment_end
+            self._forced_floor_sample = segment_end
             self._trim_before(segment_end)
             pcm_cursor = segment_end
         return tuple(emitted)
@@ -580,6 +606,38 @@ class StreamingVadSession:
             "invalid_model_output",
             "VAD model returned an invalid marker transition",
         )
+
+
+class StreamingSpeechSegmenter:
+    def __init__(self, adapter: StreamingVadAdapter) -> None:
+        self._vad_session = StreamingVadSession(adapter)
+        self._pcm_buffer = BoundedSpeechPcmBuffer()
+        self._terminal = False
+
+    def process(
+        self,
+        block: DecodedBlock,
+        *,
+        is_final: bool,
+    ) -> tuple[BufferedSpeechSegment, ...]:
+        if self._terminal:
+            raise PipelineError(
+                "invalid_model_output",
+                "Streaming speech segmenter is no longer usable",
+            )
+        try:
+            completed_spans = self._vad_session.process(
+                block,
+                is_final=is_final,
+            )
+            return self._pcm_buffer.consume(
+                block,
+                completed_spans=completed_spans,
+                open_start_sample=self._vad_session.open_start_sample,
+            )
+        except Exception:
+            self._terminal = True
+            raise
 
 
 @runtime_checkable
