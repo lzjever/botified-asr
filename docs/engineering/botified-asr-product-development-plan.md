@@ -222,7 +222,7 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 multipart/form-data
 ```
 
-multipart parser 只接受一个 `file` part 和下表字段白名单；总 part 数最多 64、单 part header 最多 32 KiB。multipart overhead 定义为整个 multipart body 的实际字节数减去唯一 `file` payload 的实际字节数，包含 boundary、part header 和所有非 file part payload，最多 1 MiB。重复 scalar 字段、未知 part 和第二个 file 在进入模型前返回 `400 invalid_multipart`。
+multipart parser 只接受一个 `file` part 和下表字段白名单；总 part 数最多 64、单 part header 最多 32 KiB。multipart overhead 定义为整个 multipart body 的实际字节数减去唯一 `file` payload 的实际字节数，包含 boundary、part header 和所有非 file part payload，最多 1 MiB。流式接收先执行 §7.1 的 raw body 联合安全上限；multipart 正常解析结束后再精确校验 `实际 body bytes - file payload bytes <= 1 MiB`。重复 scalar 字段、未知 part 和第二个 file 在进入模型前返回 `400 invalid_multipart`。
 
 首版字段：
 
@@ -470,12 +470,14 @@ limits:
 - 部署者可以收紧这些边界，安装器使用以上发布上限。
 - `max_upload_bytes` 不得高于 1 GiB，`max_audio_duration_secs` 不得高于 12 小时；服务启动时拒绝超过首版验证上限的配置。
 - `max_upload_bytes` 只计算 transcription 请求中唯一 `file` part 的 payload 实际字节数；`file` payload 小于或等于上限时可接受。multipart overhead 另按 §6.2 的独立 1 MiB 上限计算。
-- 不能只依据 Content-Length；应用层按实际流入的 `file` payload 和 multipart overhead 分别累计计数，Content-Length 是否存在或其声明值不得改变下述公开错误优先级。
+- 每个请求先确定适用的 file limit `B`：带 `Prefer: respond-async` 或 `sync_max_upload_bytes == max_upload_bytes` 时为 `max_upload_bytes`，其余情况为 `sync_max_upload_bytes`。
+- 应用在把 raw body byte 交给 multipart parser 分类前先累计 `R`，并施加联合安全上限 `R <= B + 1 MiB`；累计收到第 `B + 1 MiB + 1` 个 raw body byte 时固定返回 `400 invalid_multipart`。该错误优先于尚未分类的 file 或 overhead 单项错误。
+- 不能只依据 Content-Length；应用层按实际流入的 raw body、`file` payload 和 multipart overhead 分别累计计数，Content-Length 是否存在或其声明值不得改变下述公开错误优先级。
 - duration 在上传完成后由 `ffprobe` 获取并再次校验。
 - 没有 `chunking_strategy=auto` 的请求超过 `direct_max_audio_duration_secs` 时，无论 sync/async 都返回 `422 long_audio_requires_vad`。
-- 带 `Prefer: respond-async` 时，累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`。
-- 未带 `Prefer: respond-async` 且 `sync_max_upload_bytes < max_upload_bytes` 时，累计收到第 `sync_max_upload_bytes + 1` 个 `file` payload 字节便立即停止接收，稳定返回 `422 async_required` 并幂等清理 upload lease、reservation 和 staging 文件；不得继续接收以推测最终是否超过硬上限。
-- 未带 `Prefer: respond-async` 且 `sync_max_upload_bytes == max_upload_bytes` 时，累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`，不得返回 `422`。
+- 联合安全上限未先触发时，带 `Prefer: respond-async` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`。
+- 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes < max_upload_bytes` 的请求累计收到第 `sync_max_upload_bytes + 1` 个 `file` payload 字节便立即停止接收，稳定返回 `422 async_required` 并幂等清理 upload lease、reservation 和 staging 文件；不得继续接收以推测最终是否超过硬上限。
+- 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes == max_upload_bytes` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`，不得返回 `422`。
 - 完成上传后的校验顺序固定为：媒体可解码、总时长硬上限、VAD 要求、基于 sync 时长边界的 async 要求；流式接收期间已按上述累计 byte 规则处理 byte 上限。一次响应只返回首个错误。
 
 ### 7.2 异步提交
@@ -927,7 +929,9 @@ BOTIFIED_ASR_API_KEY
 - 应用只读取进程环境中的 `BOTIFIED_ASR_API_KEY`，不定位、打开或解析 `service.env`。
 - installer 创建 mode `0600` 的 `${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/service.env`，systemd/container launcher 从该文件向服务进程注入唯一同名环境变量。
 - YAML 不支持明文 `api_key` 字段。
-- 无论监听地址是什么，缺少或空 secret 都拒绝启动。
+- 应用不得 trim 或以其他方式改写该值；整个值必须符合 RFC 6750 `b64token` ASCII grammar：至少一个 `ALPHA`、`DIGIT`、`-`、`.`、`_`、`~`、`+` 或 `/`，之后只允许可选的尾随 `=` padding。
+- 无论监听地址是什么，缺少、空、含空白、Unicode、控制字符、其他非法字符或中间 padding 的 secret 都拒绝启动。
+- secret 校验错误只返回稳定的配置错误，不得回显 secret 的全部或部分内容。
 - 本地开发在进程环境中显式设置测试 token，不提供隐式 no-auth。
 
 ### 10.3 唯一客户端连接配置

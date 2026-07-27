@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "botified-asr"
+version = "0.0.0"
+description = "Independent Botified ASR service"
+requires-python = "==3.11.*"
+dependencies = [
+  "python-multipart==0.0.20",
+  "pyyaml==6.0.2",
+  "starlette==0.47.2",
+  "uvicorn==0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "openai==1.97.1",
+  "pytest==8.4.1",
+]
+
+[project.scripts]
+botified-asr = "botified_asr.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/botified_asr"]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
