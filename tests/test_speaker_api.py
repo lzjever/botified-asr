@@ -101,6 +101,8 @@ def _client(
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
         processor=BombProcessor(),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_policy(),
         close_storage_on_shutdown=False,
     )

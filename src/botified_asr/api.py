@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,19 +21,20 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
+from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation, MediaProbe
 from botified_asr.canonical_options import (
     CanonicalOptionsValidationError,
     canonicalize_option_values,
+    serialize_canonical_options,
 )
 from botified_asr.composition import (
     PreparedSyncResponse,
     TranscriptionProcessor,
     prepare_sync_transcription,
 )
-from botified_asr.contracts import CanonicalOptions
+from botified_asr.contracts import DIRECT_MAX_SAMPLES, CanonicalOptions
+from botified_asr.jobs import JobStatus, QueuedJobSpec
 from botified_asr.pipeline import PipelineError, PipelineNotReady
-from botified_asr.jobs import JobStatus
 from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.speaker_profiles import SpeakerProfile
 from botified_asr.speaker_snapshot import (
@@ -44,7 +46,8 @@ from botified_asr.storage import (
     Storage,
     StorageAdmissionError,
     StoredJobResult,
-    UploadLease,
+    JobInputRef,
+    JobUploadLease,
 )
 
 MODEL_CREATED = 1785024000
@@ -61,6 +64,7 @@ SCALAR_FIELDS = {
 ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
 SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
+_LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class ApiError(Exception):
@@ -131,12 +135,20 @@ def create_app(
     storage: Storage,
     processor: TranscriptionProcessor,
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    audio_prober: Callable[[Path, Cancellation], MediaProbe],
+    processor_fingerprint: str,
     close_storage_on_shutdown: bool = True,
 ) -> Starlette:
     if not api_key:
         raise ValueError("api_key must not be empty")
     if type(speaker_embedding_policy) is not SpeakerEmbeddingPolicy:
         raise TypeError("speaker embedding policy is invalid")
+    if not callable(audio_prober):
+        raise TypeError("audio prober must be callable")
+    if type(processor_fingerprint) is not str:
+        raise TypeError("processor fingerprint must be a string")
+    if _LOWERCASE_SHA256.fullmatch(processor_fingerprint) is None:
+        raise ValueError("processor fingerprint is invalid")
     expected_api_key_digest = hashlib.sha256(api_key.encode("utf-8")).digest()
 
     def authenticate(request: Request) -> None:
@@ -231,6 +243,17 @@ def create_app(
         authenticate(request)
         require_ready()
         prefer_async = _prefers_async(request.headers)
+        if prefer_async:
+            try:
+                return await _submit_async_transcription(
+                    request,
+                    storage,
+                    audio_prober,
+                    processor_fingerprint,
+                    speaker_embedding_policy,
+                )
+            except StorageAdmissionError as exc:
+                raise _storage_admission_error(exc) from exc
         prepared: PreparedSyncResponse | None = None
         response_owns_artifact = False
         try:
@@ -242,18 +265,14 @@ def create_app(
         input_cleanup_complete = False
         try:
             fields = await _ingest_multipart(
-                request, storage, lease, prefer_async=prefer_async
+                request,
+                storage,
+                lambda payload: storage.append(lease, payload),
+                prefer_async=prefer_async,
             )
             options = canonicalize_options(fields)
             input_ref = storage.seal_upload(lease)
             input_path = storage.resolve_input(input_ref)
-            if prefer_async:
-                raise ApiError(
-                    503,
-                    "service_not_ready",
-                    "Async job executor is not ready",
-                    error_type="server_error",
-                )
             cancellation = Cancellation()
             try:
                 prepared = await _prepare_while_watching_disconnect(
@@ -540,6 +559,111 @@ def _close_prepared(prepared: PreparedSyncResponse) -> None:
                 raise
 
 
+async def _submit_async_transcription(
+    request: Request,
+    storage: Storage,
+    audio_prober: Callable[[Path, Cancellation], MediaProbe],
+    processor_fingerprint: str,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
+) -> Response:
+    lease = storage.begin_job_upload(datetime.now(timezone.utc))
+    cleanup_handle: JobUploadLease | JobInputRef = lease
+    ownership_transferred = False
+    try:
+        fields = await _ingest_multipart(
+            request,
+            storage,
+            lambda payload: storage.append_job_upload(lease, payload),
+            prefer_async=True,
+        )
+        options = canonicalize_options(fields)
+        input_ref = storage.seal_job_upload(lease)
+        cleanup_handle = input_ref
+        cancellation = Cancellation()
+        try:
+            probe = await run_in_threadpool(
+                audio_prober,
+                input_ref.path,
+                cancellation,
+            )
+        except AudioError as exc:
+            raise _processing_api_error(exc) from exc
+        _validate_async_preflight(storage, options, probe)
+        spec = QueuedJobSpec(
+            canonical_options_json=serialize_canonical_options(options),
+            effective_max_audio_samples=(
+                storage.limits.max_audio_duration_secs * SAMPLE_RATE
+            ),
+            effective_direct_max_audio_samples=min(
+                storage.limits.direct_max_audio_duration_secs * SAMPLE_RATE,
+                storage.limits.max_audio_duration_secs * SAMPLE_RATE,
+                DIRECT_MAX_SAMPLES,
+            ),
+            processor_fingerprint=processor_fingerprint,
+        )
+        try:
+            published = storage.publish_job(
+                input_ref,
+                spec,
+                speaker_embedding_policy=speaker_embedding_policy,
+            )
+        except SelectedSpeakerNotFoundError as exc:
+            raise ApiError(
+                404,
+                "speaker_not_found",
+                "One or more known speakers were not found",
+                param="known_speaker_ids[]",
+            ) from exc
+        except SelectedSpeakerIncompatibleError as exc:
+            raise ApiError(
+                409,
+                "speaker_profile_incompatible",
+                "One or more known speakers are incompatible",
+                param="known_speaker_ids[]",
+            ) from exc
+        ownership_transferred = True
+        return JSONResponse(
+            {
+                "id": published.id,
+                "status": published.status.value,
+                "created_at": _public_utc_timestamp(published.created_at),
+            },
+            status_code=202,
+            headers={
+                "Preference-Applied": "respond-async",
+                "Location": f"/v1/audio/transcriptions/{published.id}",
+            },
+        )
+    finally:
+        if not ownership_transferred:
+            storage.abort_job_upload(cleanup_handle)
+
+
+def _validate_async_preflight(
+    storage: Storage,
+    options: CanonicalOptions,
+    probe: MediaProbe,
+) -> None:
+    if probe.duration_seconds > storage.limits.max_audio_duration_secs:
+        raise ApiError(
+            413,
+            "audio_too_long",
+            "Audio exceeds max_audio_duration_secs",
+            param="file",
+        )
+    if options.chunking_strategy is None:
+        if (
+            probe.duration_seconds
+            > storage.limits.direct_max_audio_duration_secs
+        ):
+            raise ApiError(
+                422,
+                "long_audio_requires_vad",
+                "chunking_strategy=auto is required for long audio",
+                param="chunking_strategy",
+            )
+
+
 async def _prepare_while_watching_disconnect(
     request: Request,
     storage: Storage,
@@ -713,7 +837,7 @@ def _processing_api_error(
 async def _ingest_multipart(
     request: Request,
     storage: Storage,
-    lease: UploadLease,
+    append_file: Callable[[bytes], None],
     *,
     prefer_async: bool,
 ) -> dict[str, list[str]]:
@@ -723,7 +847,11 @@ async def _ingest_multipart(
     if media_type != b"multipart/form-data" or not boundary:
         raise _invalid_multipart("multipart/form-data with a boundary is required")
 
-    state = _MultipartState(storage, lease, prefer_async=prefer_async)
+    state = _MultipartState(
+        storage,
+        append_file,
+        prefer_async=prefer_async,
+    )
     parser = MultipartParser(boundary, state.callbacks)
     raw_body_limit = (
         state.file_byte_limit + MAX_MULTIPART_OVERHEAD_BYTES
@@ -771,12 +899,12 @@ class _MultipartState:
     def __init__(
         self,
         storage: Storage,
-        lease: UploadLease,
+        append_file: Callable[[bytes], None],
         *,
         prefer_async: bool,
     ) -> None:
         self.storage = storage
-        self.lease = lease
+        self.append_file = append_file
         self.prefer_async = prefer_async
         self.body_bytes = 0
         self.file_bytes = 0
@@ -906,10 +1034,10 @@ class _MultipartState:
         if len(payload) > remaining:
             if remaining > 0:
                 prefix = payload[:remaining]
-                self.storage.append(self.lease, prefix)
+                self.append_file(prefix)
                 self.file_bytes += len(prefix)
             raise ApiError(status, code, message, param="file")
-        self.storage.append(self.lease, payload)
+        self.append_file(payload)
         self.file_bytes += len(payload)
 
     @property

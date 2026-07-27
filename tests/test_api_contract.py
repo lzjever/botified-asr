@@ -123,6 +123,8 @@ def app_client(
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
         processor=processor or FakeProcessor(),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -156,6 +158,8 @@ def test_malformed_authorization_is_stable_and_redacted(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -209,6 +213,8 @@ def test_auth_and_not_ready_do_not_receive_body_or_create_lease(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -532,6 +538,8 @@ def test_same_byte_stream_is_independent_of_asgi_chunking(storage: Storage) -> N
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
@@ -557,6 +565,8 @@ def test_success_is_independent_of_every_byte_boundary(storage: Storage) -> None
                 seen.append((path.read_bytes(), options)) or "same"
             )
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -579,6 +589,8 @@ def test_hard_limit_is_independent_of_asgi_chunking(storage: Storage) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
@@ -616,6 +628,8 @@ def test_joint_raw_limit_exact_is_accepted_and_plus_one_is_chunk_stable(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -647,6 +661,8 @@ def test_overhead_limit_plus_one_is_rejected_by_final_exact_check(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -678,6 +694,8 @@ def test_joint_raw_rejection_stops_receiving_more_body(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -723,6 +741,8 @@ def test_joint_cap_wins_when_file_limit_crosses_after_full_overhead_budget(
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -787,6 +807,8 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
         processor=FakeProcessor(
             lambda _path, _options: "ok"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
@@ -814,6 +836,8 @@ def test_client_disconnect_cleans_receiving_upload(storage: Storage) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "unexpected"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
     )
 
@@ -1065,6 +1089,8 @@ def test_app_composition_closes_owned_storage(tmp_path: Path) -> None:
         processor=FakeProcessor(
             lambda _path, _options: "ok"
         ),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
     )
 

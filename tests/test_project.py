@@ -68,6 +68,8 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=SdkProcessor(),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=speakers.SpeakerEmbeddingPolicy(
             model_id="funasr/campplus",
             model_revision="1" * 40,

@@ -52,6 +52,8 @@ def main() -> None:
             readiness=readiness,
             storage=storage,
             processor=processor,
+            audio_prober=frontend.probe,
+            processor_fingerprint=bundle.processor_fingerprint,
             speaker_embedding_policy=bundle.speaker_embedding_policy,
             close_storage_on_shutdown=False,
         )

@@ -154,6 +154,8 @@ def app(storage: FakeStorage, readiness: Readiness | None = None):
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
         processor=object(),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=embedding_policy(),
         close_storage_on_shutdown=False,
     )

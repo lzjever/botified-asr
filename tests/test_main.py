@@ -28,7 +28,7 @@ def install_fakes(
     limits = object()
     fetcher = object()
     resolver = object()
-    frontend = object()
+    frontend = SimpleNamespace(probe=object())
     asr = object()
     vad = object()
     speaker = object()
@@ -38,6 +38,7 @@ def install_fakes(
         vad=vad,
         speaker=speaker,
         speaker_embedding_policy=speaker_embedding_policy,
+        processor_fingerprint="3" * 64,
     )
     processor = object()
     readiness = SimpleNamespace(
@@ -196,6 +197,8 @@ def expected_success_events(
                 "readiness": scenario.readiness,
                 "storage": scenario.storage,
                 "processor": scenario.processor,
+                "audio_prober": scenario.frontend.probe,
+                "processor_fingerprint": "3" * 64,
                 "speaker_embedding_policy": (scenario.speaker_embedding_policy),
                 "close_storage_on_shutdown": False,
             },

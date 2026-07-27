@@ -206,6 +206,8 @@ def _app(storage: Storage, processor: Any):
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=processor,
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
     )
