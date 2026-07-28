@@ -922,6 +922,13 @@ def _processing_api_error(
                 "The uploaded file is not valid audio",
                 param="file",
             )
+        if exc.code == "audio_too_long":
+            return ApiError(
+                413,
+                exc.code,
+                "Audio exceeds max_audio_duration_secs",
+                param="file",
+            )
         return ApiError(
             500,
             "internal_error",

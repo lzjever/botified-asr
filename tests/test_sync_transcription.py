@@ -140,6 +140,16 @@ class SpyProcessor:
                     "long_audio_requires_vad",
                     "private long-audio detail",
                 )
+            if self.behavior == "audio_too_long":
+                raise PipelineError(
+                    "audio_too_long",
+                    "decoded past /private/effective-duration-cap",
+                )
+            if self.behavior == "unknown_pipeline":
+                raise PipelineError(
+                    "unexpected_pipeline_code",
+                    "unknown pipeline failure at /private/model.bin",
+                )
             if self.behavior == "model":
                 raise RuntimeError("model failed at /private/model.bin")
             if self.behavior == "not_ready":
@@ -293,11 +303,40 @@ def test_sync_projection_is_exact_and_cleans_after_normal_consumption(
     _assert_no_resources(storage)
 
 
+def test_sync_vad_actual_duration_overflow_is_exact_413_and_cleans(
+    storage: Storage,
+) -> None:
+    processor = SpyProcessor("audio_too_long")
+    files = _files()
+    files["chunking_strategy"] = (None, "auto")
+
+    with TestClient(_app(storage, processor)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=files,
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {
+            "message": "Audio exceeds max_audio_duration_secs",
+            "type": "invalid_request_error",
+            "param": "file",
+            "code": "audio_too_long",
+        }
+    }
+    assert "/private/effective-duration-cap" not in response.text
+    assert processor.calls == 1
+    _assert_no_resources(storage)
+
+
 @pytest.mark.parametrize(
     ("behavior", "status", "code", "param"),
     [
         ("long", 422, "long_audio_requires_vad", "chunking_strategy"),
         ("model", 500, "internal_error", None),
+        ("unknown_pipeline", 500, "internal_error", None),
         ("not_ready", 503, "pipeline_not_ready", None),
         ("invalid_audio", 400, "invalid_audio", "file"),
         ("audio_tool_unavailable", 503, "audio_tool_unavailable", None),
