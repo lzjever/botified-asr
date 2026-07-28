@@ -87,10 +87,18 @@ def patch_ids(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def queue_and_claim(storage: Storage) -> jobs.DurableJob:
+    queued = queue_job(storage)
+    claimed = storage.claim_next_job("generation-1", STARTED_AT)
+    assert claimed is not None
+    assert claimed.id == queued.id
+    return claimed
+
+
+def queue_job(storage: Storage) -> jobs.DurableJob:
     upload = storage.begin_job_upload(CREATED_AT)
     storage.append_job_upload(upload, b"audio")
     input_ref = storage.seal_job_upload(upload)
-    storage.publish_job(
+    return storage.publish_job(
         input_ref,
         jobs.QueuedJobSpec(
             canonical_options_json=CANONICAL_OPTIONS_JSON,
@@ -100,9 +108,6 @@ def queue_and_claim(storage: Storage) -> jobs.DurableJob:
         ),
         speaker_embedding_policy=speaker_policy(),
     )
-    claimed = storage.claim_next_job("generation-1", STARTED_AT)
-    assert claimed is not None
-    return claimed
 
 
 class StorageResultWriter:
@@ -245,6 +250,500 @@ def commit_terminal(
         token,
         finished_at,
     )
+
+
+def test_delete_or_cancel_queued_is_visible_once_then_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        queued = queue_job(storage)
+        input_path = storage.staging_dir / f"{queued.id}.ready"
+
+        requested_at = CREATED_AT - timedelta(minutes=1)
+        assert (
+            storage.delete_or_cancel_job(queued.id, requested_at)
+            is jobs.JobDeletionOutcome.QUEUED_CANCELLED
+        )
+        cancelled = storage.get_visible_job(queued.id)
+        assert cancelled is not None
+        assert cancelled.status is jobs.JobStatus.CANCELLED
+        assert cancelled.attempt_no == 0
+        assert not cancelled.cancel_requested
+        assert cancelled.finished_at == CREATED_AT
+        assert cancelled.input_lease_id == queued.id
+        assert cancelled.input_cleanup_pending
+        assert input_path.is_file()
+        assert storage.total_reserved_bytes() == len(b"audio")
+
+        storage.cleanup_cancelled_job_input(queued.id)
+        storage.cleanup_cancelled_job_input(queued.id)
+        cancelled = storage.get_visible_job(queued.id)
+        assert cancelled is not None
+        assert cancelled.input_lease_id is None
+        assert not cancelled.input_cleanup_pending
+        assert not input_path.exists()
+        assert storage.total_reserved_bytes() == 0
+
+        assert (
+            storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.TERMINAL_DELETED
+        )
+        assert storage.get_visible_job(queued.id) is None
+        assert (
+            storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.NOT_FOUND
+        )
+
+
+def test_queued_cancellation_cleanup_failure_recovers_on_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    queued = queue_job(storage)
+    input_path = storage.staging_dir / f"{queued.id}.ready"
+
+    def fail_unlink(_: Path) -> None:
+        raise OSError("injected queued input cleanup failure")
+
+    monkeypatch.setattr(storage, "_unlink_if_present", fail_unlink)
+    assert (
+        storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+        is jobs.JobDeletionOutcome.QUEUED_CANCELLED
+    )
+    with pytest.raises(
+        OSError,
+        match="injected queued input cleanup failure",
+    ):
+        storage.cleanup_cancelled_job_input(queued.id)
+    pending = storage.get_visible_job(queued.id)
+    assert pending is not None
+    assert pending.status is jobs.JobStatus.CANCELLED
+    assert pending.input_lease_id == queued.id
+    assert pending.input_cleanup_pending
+    assert input_path.is_file()
+    storage.close()
+
+    recovered = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(recovered):
+        cleaned = recovered.get_visible_job(queued.id)
+        assert cleaned is not None
+        assert cleaned.status is jobs.JobStatus.CANCELLED
+        assert cleaned.input_lease_id is None
+        assert not cleaned.input_cleanup_pending
+        assert not input_path.exists()
+        assert recovered.total_reserved_bytes() == 0
+
+
+def test_second_delete_races_queued_input_cleanup_without_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        queued = queue_job(storage)
+        input_path = storage.staging_dir / f"{queued.id}.ready"
+        assert (
+            storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.QUEUED_CANCELLED
+        )
+        pending = storage.get_visible_job(queued.id)
+        assert pending is not None
+        assert pending.input_cleanup_pending
+
+        assert (
+            storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.TERMINAL_DELETED
+        )
+        storage.cleanup_cancelled_job_input(queued.id)
+        assert storage.get_visible_job(queued.id) is None
+        assert not input_path.exists()
+        assert storage.total_reserved_bytes() == 0
+
+
+def test_delete_or_cancel_running_is_idempotent_and_preserves_attempt_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        writer = storage.begin_job_attempt_artifact(
+            running.id,
+            running.attempt_token,
+        )
+        storage.append_artifact(writer, b"partial")
+        input_path = storage.staging_dir / f"{running.id}.ready"
+
+        for requested_at in (
+            FINISHED_AT,
+            CREATED_AT - timedelta(minutes=1),
+        ):
+            assert (
+                storage.delete_or_cancel_job(running.id, requested_at)
+                is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+            )
+
+        stored = storage.get_visible_job(running.id)
+        assert stored is not None
+        assert stored.status is jobs.JobStatus.RUNNING
+        assert stored.attempt_token == running.attempt_token
+        assert stored.cancel_requested
+        assert input_path.is_file()
+        assert writer.path.is_file()
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases WHERE owner_id = ?",
+                (running.id,),
+            ).fetchone()[0]
+            == 2
+        )
+        storage.abort_artifact(writer)
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        jobs.JobStatus.SUCCEEDED,
+        jobs.JobStatus.FAILED,
+        jobs.JobStatus.CANCELLED,
+    ),
+)
+def test_delete_terminal_job_cleans_only_its_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: jobs.JobStatus,
+) -> None:
+    job_ids = iter(("7K3M9Q2W", "8K3M9Q2W"))
+    monkeypatch.setattr(jobs, "generate_job_id", lambda: "7K3M9Q2W")
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(job_ids))
+    monkeypatch.setattr(jobs, "generate_attempt_token", lambda: "attempt-1")
+    monkeypatch.setattr(
+        storage_module,
+        "generate_attempt_token",
+        lambda: "attempt-1",
+    )
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        first = queue_and_claim(storage)
+        result_ref = None
+        if terminal_status is jobs.JobStatus.SUCCEEDED:
+            finish_progress(storage, first)
+            result_ref = seal_result(storage, first)
+            assert first.attempt_token is not None
+            assert (
+                storage.commit_job_success(
+                    first.id,
+                    first.attempt_token,
+                    result_ref,
+                )
+                is jobs.JobSuccessOutcome.COMMITTED
+            )
+        elif terminal_status is jobs.JobStatus.FAILED:
+            assert (
+                commit_terminal(storage, first, "failure")
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+        else:
+            assert (
+                storage.delete_or_cancel_job(first.id, FINISHED_AT)
+                is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+            )
+            assert (
+                commit_terminal(storage, first, "cancellation")
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+
+        second = queue_job(storage)
+        second_path = storage.staging_dir / f"{second.id}.ready"
+        second_lease = tuple(
+            storage._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (second.id,),
+            ).fetchone()
+        )
+
+        assert (
+            storage.delete_or_cancel_job(first.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.TERMINAL_DELETED
+        )
+        assert storage.get_visible_job(first.id) is None
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases WHERE owner_id = ?",
+                (first.id,),
+            ).fetchone()[0]
+            == 0
+        )
+        if result_ref is not None:
+            assert not result_ref.path.exists()
+        assert storage.get_visible_job(second.id) == second
+        assert second_path.is_file()
+        assert (
+            tuple(
+                storage._connection.execute(
+                    "SELECT * FROM storage_leases WHERE id = ?",
+                    (second.id,),
+                ).fetchone()
+            )
+            == second_lease
+        )
+
+
+@pytest.mark.parametrize("delete_first", (False, True))
+def test_claim_and_delete_orders_are_fenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delete_first: bool,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        queued = queue_job(storage)
+        if delete_first:
+            assert (
+                storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+                is jobs.JobDeletionOutcome.QUEUED_CANCELLED
+            )
+            assert storage.claim_next_job("generation-1", STARTED_AT) is None
+        else:
+            claimed = storage.claim_next_job("generation-1", STARTED_AT)
+            assert claimed is not None
+            assert (
+                storage.delete_or_cancel_job(queued.id, FINISHED_AT)
+                is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+            )
+            stored = storage.get_visible_job(queued.id)
+            assert stored is not None
+            assert stored.status is jobs.JobStatus.RUNNING
+            assert stored.cancel_requested
+
+
+@pytest.mark.parametrize("terminal_kind", ("success", "failure"))
+@pytest.mark.parametrize("delete_first", (False, True))
+def test_terminal_commit_and_delete_orders_are_fenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_kind: str,
+    delete_first: bool,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        result_ref = None
+        if terminal_kind == "success":
+            finish_progress(storage, running)
+            result_ref = seal_result(storage, running)
+
+        if delete_first:
+            assert (
+                storage.delete_or_cancel_job(running.id, FINISHED_AT)
+                is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+            )
+
+        if terminal_kind == "success":
+            assert running.attempt_token is not None
+            outcome = storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            expected = (
+                jobs.JobSuccessOutcome.CANCEL_REQUESTED
+                if delete_first
+                else jobs.JobSuccessOutcome.COMMITTED
+            )
+            assert outcome is expected
+            if delete_first:
+                assert not result_ref.path.exists()
+        else:
+            outcome = commit_terminal(storage, running, "failure")
+            expected = (
+                jobs.JobTerminalOutcome.CANCEL_REQUESTED
+                if delete_first
+                else jobs.JobTerminalOutcome.COMMITTED
+            )
+            assert outcome is expected
+
+        if delete_first:
+            assert (
+                commit_terminal(storage, running, "cancellation")
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+
+        assert (
+            storage.delete_or_cancel_job(running.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.TERMINAL_DELETED
+        )
+        assert storage.get_visible_job(running.id) is None
+
+
+@pytest.mark.parametrize("fault_stage", ("unlink", "fsync", "database"))
+def test_terminal_delete_fault_recovers_on_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    running = queue_and_claim(storage)
+    finish_progress(storage, running)
+    result_ref = seal_result(storage, running)
+    input_path = storage.staging_dir / f"{running.id}.ready"
+    assert running.attempt_token is not None
+    original_cleanup_unlink = storage._unlink_if_present
+
+    def fail_commit_input_cleanup(path: Path) -> None:
+        if path == input_path:
+            raise OSError("injected commit input cleanup failure")
+        original_cleanup_unlink(path)
+
+    with monkeypatch.context() as commit_fault:
+        commit_fault.setattr(
+            storage,
+            "_unlink_if_present",
+            fail_commit_input_cleanup,
+        )
+        with pytest.raises(
+            OSError,
+            match="injected commit input cleanup failure",
+        ):
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+    pending = storage.get_visible_job(running.id)
+    assert pending is not None
+    assert pending.status is jobs.JobStatus.SUCCEEDED
+    assert pending.input_lease_id == running.id
+    assert pending.input_cleanup_pending
+
+    if fault_stage == "database":
+        storage._connection.execute(
+            f"""
+            CREATE TRIGGER reject_terminal_delete
+            BEFORE DELETE ON transcription_jobs
+            WHEN OLD.id = '{running.id}'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected terminal delete failure');
+            END
+            """
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="injected terminal delete failure",
+        ):
+            storage.delete_or_cancel_job(running.id, FINISHED_AT)
+        storage._connection.execute("DROP TRIGGER reject_terminal_delete")
+    else:
+        original_unlink = Path.unlink
+        original_fsync = storage_module._fsync_directory
+
+        def fail_input_unlink(path: Path) -> None:
+            if path == input_path:
+                raise OSError("injected terminal delete failure")
+            original_unlink(path)
+
+        def fail_staging_fsync(directory: Path) -> None:
+            if directory == storage.staging_dir:
+                raise OSError("injected terminal delete failure")
+            original_fsync(directory)
+
+        with monkeypatch.context() as fault:
+            if fault_stage == "unlink":
+                fault.setattr(Path, "unlink", fail_input_unlink)
+            else:
+                fault.setattr(
+                    storage_module,
+                    "_fsync_directory",
+                    fail_staging_fsync,
+                )
+            with pytest.raises(
+                OSError,
+                match="injected terminal delete failure",
+            ):
+                storage.delete_or_cancel_job(running.id, FINISHED_AT)
+
+    deleting = storage._connection.execute(
+        """
+        SELECT phase, status, input_lease_id, input_cleanup_pending
+        FROM transcription_jobs WHERE id = ?
+        """,
+        (running.id,),
+    ).fetchone()
+    assert tuple(deleting) == (
+        "deleting",
+        "succeeded",
+        running.id,
+        1,
+    )
+    storage.close()
+
+    recovered = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(recovered):
+        assert recovered.get_visible_job(running.id) is None
+        assert (
+            recovered._connection.execute(
+                "SELECT COUNT(*) FROM transcription_jobs WHERE id = ?",
+                (running.id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            recovered._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases WHERE owner_id = ?",
+                (running.id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert not input_path.exists()
+        assert not result_ref.path.exists()
+        assert recovered.total_reserved_bytes() == 0
 
 
 @pytest.mark.parametrize(

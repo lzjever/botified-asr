@@ -473,8 +473,11 @@ def execute_claimed_job_attempt(
             )
         return max(now(), job.started_at)
 
-    def commit_cancellation(job: DurableJob, when: datetime) -> None:
-        storage.commit_job_cancellation(
+    def commit_cancellation(
+        job: DurableJob,
+        when: datetime,
+    ) -> JobTerminalOutcome:
+        return storage.commit_job_cancellation(
             job.id,
             attempt_token,
             when,
@@ -585,6 +588,16 @@ def execute_claimed_job_attempt(
             return
         except (PipelineError, AudioError) as error:
             if error.code == "cancelled":
+                outcome = commit_cancellation(
+                    current_job,
+                    finished_at(current_job),
+                )
+                if outcome is JobTerminalOutcome.COMMITTED:
+                    return
+                if outcome is not JobTerminalOutcome.STALE:
+                    raise RuntimeError(
+                        "job cancellation commit returned an invalid outcome"
+                    )
                 raise
             error_code = (
                 error.code

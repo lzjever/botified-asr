@@ -19,6 +19,7 @@ from botified_asr.job_fingerprints import build_request_fingerprints
 from botified_asr.jobs import (
     DurableJob,
     JobCancellationRequestedError,
+    JobDeletionOutcome,
     JobPhase,
     JobProgressOutcome,
     JobSuccessOutcome,
@@ -1726,6 +1727,114 @@ class Storage:
             ).fetchone()
         return None if row is None else _decode_transcription_job(row)
 
+    def delete_or_cancel_job(
+        self,
+        job_id: str,
+        requested_at: datetime,
+    ) -> JobDeletionOutcome:
+        validate_job_id(job_id)
+        _encode_job_timestamp(requested_at)
+        terminal_statuses = {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }
+
+        while True:
+            delete_terminal = False
+            was_queued = False
+            with self._transaction():
+                row = self._connection.execute(
+                    f"""
+                    SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                    FROM transcription_jobs WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    return JobDeletionOutcome.NOT_FOUND
+                job = _decode_transcription_job(row)
+
+                if (
+                    job.phase is JobPhase.DELETING
+                    and job.status in terminal_statuses
+                ):
+                    delete_terminal = True
+                elif job.phase is not JobPhase.VISIBLE:
+                    return JobDeletionOutcome.NOT_FOUND
+                elif job.status is JobStatus.QUEUED:
+                    encoded_finished_at = _encode_job_timestamp(
+                        max(requested_at, job.created_at)
+                    )
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET
+                            status = 'cancelled',
+                            input_cleanup_pending = 1,
+                            finished_at = ?
+                        WHERE id = ? AND phase = 'visible'
+                          AND status = 'queued'
+                          AND cancel_requested = 0
+                        """,
+                        (encoded_finished_at, job_id),
+                    ).rowcount
+                    if changed != 1:
+                        raise RuntimeError(
+                            "queued job changed during cancellation"
+                        )
+                    was_queued = True
+                elif job.status is JobStatus.RUNNING:
+                    if job.started_at is None:
+                        raise StorageSchemaError(
+                            "running job start timestamp is missing"
+                        )
+                    if not job.cancel_requested:
+                        changed = self._connection.execute(
+                            """
+                            UPDATE transcription_jobs
+                            SET cancel_requested = 1
+                            WHERE id = ? AND phase = 'visible'
+                              AND status = 'running'
+                              AND cancel_requested = 0
+                            """,
+                            (job_id,),
+                        ).rowcount
+                        if changed != 1:
+                            raise RuntimeError(
+                                "running job changed during cancellation"
+                            )
+                    return JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+                elif job.status in terminal_statuses:
+                    changed = self._connection.execute(
+                        """
+                        UPDATE transcription_jobs SET phase = 'deleting'
+                        WHERE id = ? AND phase = 'visible'
+                          AND status IN (
+                              'succeeded', 'failed', 'cancelled'
+                          )
+                        """,
+                        (job_id,),
+                    ).rowcount
+                    if changed != 1:
+                        raise RuntimeError(
+                            "terminal job changed during deletion"
+                        )
+                    delete_terminal = True
+                else:
+                    raise StorageSchemaError(
+                        "visible transcription job status is corrupt"
+                    )
+
+            if was_queued:
+                return JobDeletionOutcome.QUEUED_CANCELLED
+            if delete_terminal:
+                self._delete_terminal_job(job_id)
+                return JobDeletionOutcome.TERMINAL_DELETED
+
+    def cleanup_cancelled_job_input(self, job_id: str) -> None:
+        validate_job_id(job_id)
+        self._cleanup_terminal_job_input(job_id, JobStatus.CANCELLED)
+
     def claim_next_job(
         self,
         generation: str,
@@ -3150,6 +3259,179 @@ class Storage:
                 )
             _decode_transcription_job(cleaned_row)
 
+    def _delete_terminal_job(self, job_id: str) -> None:
+        with self._transaction():
+            job_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            lease_rows = self._connection.execute(
+                """
+                SELECT * FROM storage_leases
+                WHERE owner_kind = 'job' AND owner_id = ?
+                ORDER BY id
+                """,
+                (job_id,),
+            ).fetchall()
+            if job_row is None:
+                if lease_rows:
+                    raise StorageSchemaError(
+                        "deleted terminal job retains storage leases"
+                    )
+                return
+            job = _decode_transcription_job(job_row)
+            if (
+                job.phase is not JobPhase.DELETING
+                or job.status
+                not in {
+                    JobStatus.SUCCEEDED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                }
+            ):
+                raise StorageSchemaError(
+                    "terminal job deletion state is corrupt"
+                )
+            for lease_row in lease_rows:
+                if (
+                    not self._valid_reconciliation_row(lease_row)
+                ):
+                    raise StorageSchemaError(
+                        "terminal job storage lease is corrupt"
+                    )
+            input_rows = [
+                row
+                for row in lease_rows
+                if row["lease_type"] == "upload"
+            ]
+            input_path = self.staging_dir / f"{job_id}.ready"
+            if job.input_cleanup_pending:
+                if (
+                    job.input_lease_id != job_id
+                    or len(input_rows) != 1
+                    or input_rows[0]["id"] != job_id
+                    or input_rows[0]["resource_kind"] != "transcription"
+                    or input_rows[0]["phase"] != "sealed"
+                    or input_rows[0]["controlled_path"]
+                    != str(input_path)
+                    or input_rows[0]["actual_bytes"]
+                    != job.input_size_bytes
+                ):
+                    raise StorageSchemaError(
+                        "terminal job input reference is corrupt"
+                    )
+            elif job.input_lease_id is not None or input_rows:
+                raise StorageSchemaError(
+                    "terminal job input reference is corrupt"
+                )
+            result_rows = [
+                row
+                for row in lease_rows
+                if row["resource_kind"] == "result_complete"
+            ]
+            if (
+                job.status is JobStatus.SUCCEEDED
+                and (
+                    len(result_rows) != 1
+                    or result_rows[0]["id"] != job.result_lease_id
+                    or result_rows[0]["phase"] != "sealed"
+                )
+            ):
+                raise StorageSchemaError(
+                    "succeeded job result reference is corrupt"
+                )
+            if (
+                job.status is not JobStatus.SUCCEEDED
+                and (job.result_lease_id is not None or result_rows)
+            ):
+                raise StorageSchemaError(
+                    "terminal job result reference is corrupt"
+                )
+
+        staging_cleanup_paths = {
+            self.staging_dir / f"{row['id']}.{suffix}"
+            for row in input_rows
+            for suffix in ("partial", "ready")
+        }
+        artifact_cleanup_paths = {
+            self.artifact_dir / f"{row['id']}.{suffix}"
+            for row in lease_rows
+            if row["lease_type"] == "artifact"
+            for suffix in ("partial", "complete")
+        }
+        for path in staging_cleanup_paths | artifact_cleanup_paths:
+            self._preflight_cleanup_path(path)
+        with self._lock:
+            for row in lease_rows:
+                handle = self._files.pop(row["id"], None)
+                if handle is not None:
+                    handle.close()
+        for path in staging_cleanup_paths:
+            self._unlink_if_present(path)
+        if staging_cleanup_paths:
+            _fsync_directory(self.staging_dir)
+        for path in artifact_cleanup_paths:
+            self._unlink_if_present(path)
+        if artifact_cleanup_paths:
+            _fsync_directory(self.artifact_dir)
+
+        with self._transaction():
+            current_job = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            current_leases = self._connection.execute(
+                """
+                SELECT * FROM storage_leases
+                WHERE owner_kind = 'job' AND owner_id = ?
+                ORDER BY id
+                """,
+                (job_id,),
+            ).fetchall()
+            if current_job is None:
+                if current_leases:
+                    raise StorageSchemaError(
+                        "deleted terminal job retains storage leases"
+                    )
+                return
+            if (
+                tuple(current_job) != tuple(job_row)
+                or [tuple(row) for row in current_leases]
+                != [tuple(row) for row in lease_rows]
+            ):
+                raise RuntimeError(
+                    "terminal job deletion state changed"
+                )
+            self._connection.execute(
+                """
+                DELETE FROM storage_leases
+                WHERE owner_kind = 'job' AND owner_id = ?
+                """,
+                (job_id,),
+            )
+            changed = self._connection.execute(
+                """
+                DELETE FROM transcription_jobs
+                WHERE id = ? AND phase = 'deleting'
+                  AND status IN ('succeeded', 'failed', 'cancelled')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM storage_leases
+                      WHERE owner_kind = 'job' AND owner_id = ?
+                  )
+                """,
+                (job_id, job_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    "terminal job changed during deletion"
+                )
+
     def _job_result_is_committed(
         self,
         row: sqlite3.Row | None,
@@ -3758,6 +4040,15 @@ class Storage:
                     and job.status is None
                 )
                 or (
+                    job.phase is JobPhase.DELETING
+                    and job.status
+                    in {
+                        JobStatus.SUCCEEDED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                    }
+                )
+                or (
                     job.phase is JobPhase.VISIBLE
                     and job.status
                     in {
@@ -3810,6 +4101,9 @@ class Storage:
 
         receiving_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
         terminal_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        deleting_terminal_inputs: dict[
+            str, tuple[sqlite3.Row, sqlite3.Row]
+        ] = {}
         segment_cleanup: list[sqlite3.Row] = []
         result_cleanup: list[sqlite3.Row] = []
         recoverable_results: dict[
@@ -3819,7 +4113,11 @@ class Storage:
         referenced_job_leases: set[str] = set()
         for job_id, (job_row, job) in jobs_by_id.items():
             requires_input = (
-                job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}
+                job.phase is JobPhase.RECEIVING
+                or (
+                    job.phase is JobPhase.DELETING
+                    and job.status is None
+                )
                 or job.status in {JobStatus.QUEUED, JobStatus.RUNNING}
                 or job.input_cleanup_pending
             )
@@ -3840,10 +4138,16 @@ class Storage:
             ):
                 raise StorageSchemaError(
                     "transcription job input reference is corrupt"
-                )
+            )
             referenced_job_leases.add(lease_row["id"])
             controlled_path = Path(lease_row["controlled_path"])
-            if job.phase in {JobPhase.RECEIVING, JobPhase.DELETING}:
+            if (
+                job.phase is JobPhase.RECEIVING
+                or (
+                    job.phase is JobPhase.DELETING
+                    and job.status is None
+                )
+            ):
                 receiving_cleanup.append((job_row, lease_row))
                 continue
             if (
@@ -3857,6 +4161,19 @@ class Storage:
                 raise StorageSchemaError(
                     "visible transcription job input is corrupt"
                 )
+            if job.phase is JobPhase.DELETING:
+                if not _is_absent_or_regular_file_with_size(
+                    controlled_path,
+                    lease_row["actual_bytes"],
+                ):
+                    raise StorageSchemaError(
+                        "terminal transcription job input is corrupt"
+                    )
+                deleting_terminal_inputs[job_id] = (
+                    job_row,
+                    lease_row,
+                )
+                continue
             if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
                 if not _is_regular_file_with_size(
                     controlled_path,
@@ -3898,16 +4215,24 @@ class Storage:
             referenced_job_leases.add(result_row["id"])
             result_path = Path(result_row["controlled_path"])
             should_recover = (
-                job.status is JobStatus.RUNNING
+                job.phase is JobPhase.VISIBLE
+                and job.status is JobStatus.RUNNING
                 and not job.cancel_requested
                 and job.total_samples is not None
                 and job.processed_samples == job.total_samples
             )
             requires_valid_result = (
-                job.status is JobStatus.SUCCEEDED or should_recover
+                (
+                    job.phase is JobPhase.VISIBLE
+                    and job.status is JobStatus.SUCCEEDED
+                )
+                or should_recover
             )
             if result_row["phase"] == "writing":
-                if job.status is JobStatus.SUCCEEDED:
+                if (
+                    job.phase is JobPhase.VISIBLE
+                    and job.status is JobStatus.SUCCEEDED
+                ):
                     raise StorageSchemaError(
                         "succeeded job result is incomplete"
                     )
@@ -3916,7 +4241,10 @@ class Storage:
             try:
                 result_mode = result_path.lstat().st_mode
             except FileNotFoundError:
-                if job.status is JobStatus.SUCCEEDED:
+                if (
+                    job.phase is JobPhase.VISIBLE
+                    and job.status is JobStatus.SUCCEEDED
+                ):
                     raise StorageSchemaError(
                         "succeeded job result is missing"
                     ) from None
@@ -3950,15 +4278,21 @@ class Storage:
                     }
                 )
                 if (
-                    job.status is JobStatus.SUCCEEDED
-                    or storage_mismatch
+                    job.phase is JobPhase.VISIBLE
+                    and (
+                        job.status is JobStatus.SUCCEEDED
+                        or storage_mismatch
+                    )
                 ):
                     raise StorageSchemaError(
                         "job result storage is corrupt"
                     ) from error
                 result_cleanup.append(result_row)
                 continue
-            if job.status is JobStatus.SUCCEEDED:
+            if (
+                job.phase is JobPhase.VISIBLE
+                and job.status is JobStatus.SUCCEEDED
+            ):
                 if manifest.finished_at != job.finished_at:
                     raise StorageSchemaError(
                         "succeeded job result timestamp is corrupt"
@@ -3978,7 +4312,11 @@ class Storage:
                     )
 
         preflight_paths: set[Path] = set()
-        for _, lease_row in receiving_cleanup + terminal_cleanup:
+        for _, lease_row in (
+            receiving_cleanup
+            + terminal_cleanup
+            + list(deleting_terminal_inputs.values())
+        ):
             preflight_paths.update(
                 {
                     self.staging_dir / f"{lease_row['id']}.partial",
@@ -4218,6 +4556,7 @@ class Storage:
         }
         receiving_cleanup = []
         terminal_cleanup = []
+        deleting_terminal_cleanup = []
         protected_paths = set()
         for job_id, (job_row, job) in classified_jobs.items():
             lease_row = leases_by_id.get(job.input_lease_id or "")
@@ -4228,7 +4567,8 @@ class Storage:
                     )
                 receiving_cleanup.append((job_row, lease_row))
             elif (
-                job.status
+                job.phase is JobPhase.VISIBLE
+                and job.status
                 in {
                     JobStatus.SUCCEEDED,
                     JobStatus.FAILED,
@@ -4249,7 +4589,20 @@ class Storage:
                 protected_paths.add(
                     self.staging_dir / f"{job_id}.ready"
                 )
-            if job.status is JobStatus.SUCCEEDED:
+            if (
+                job.phase is JobPhase.DELETING
+                and job.status
+                in {
+                    JobStatus.SUCCEEDED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                }
+            ):
+                deleting_terminal_cleanup.append(job_row)
+            if (
+                job.phase is JobPhase.VISIBLE
+                and job.status is JobStatus.SUCCEEDED
+            ):
                 result_row = leases_by_id.get(
                     job.result_lease_id or ""
                 )
@@ -4262,7 +4615,11 @@ class Storage:
                 )
 
         cleanup_paths: set[Path] = set()
-        for _, lease_row in receiving_cleanup + terminal_cleanup:
+        for _, lease_row in (
+            receiving_cleanup
+            + terminal_cleanup
+            + list(deleting_terminal_inputs.values())
+        ):
             cleanup_paths.update(
                 {
                     self.staging_dir / f"{lease_row['id']}.partial",
@@ -4325,6 +4682,7 @@ class Storage:
             or segment_cleanup
             or result_cleanup
             or generic_cleanup
+            or deleting_terminal_cleanup
         ):
             with self._transaction():
                 for job_row, lease_row in receiving_cleanup:
@@ -4458,6 +4816,65 @@ class Storage:
                         "DELETE FROM storage_leases WHERE id = ?",
                         (row["id"],),
                     )
+                for job_row in deleting_terminal_cleanup:
+                    current_job = self._connection.execute(
+                        f"""
+                        SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                        FROM transcription_jobs WHERE id = ?
+                        """,
+                        (job_row["id"],),
+                    ).fetchone()
+                    expected_input = deleting_terminal_inputs.get(
+                        job_row["id"]
+                    )
+                    if expected_input is not None:
+                        _, input_lease = expected_input
+                        current_input = self._connection.execute(
+                            """
+                            SELECT * FROM storage_leases WHERE id = ?
+                            """,
+                            (input_lease["id"],),
+                        ).fetchone()
+                        if (
+                            current_input is None
+                            or tuple(current_input) != tuple(input_lease)
+                        ):
+                            raise StorageSchemaError(
+                                "terminal deletion input changed during startup"
+                            )
+                        self._connection.execute(
+                            "DELETE FROM storage_leases WHERE id = ?",
+                            (input_lease["id"],),
+                        )
+                    remaining_lease = self._connection.execute(
+                        """
+                        SELECT 1 FROM storage_leases
+                        WHERE owner_kind = 'job' AND owner_id = ?
+                        """,
+                        (job_row["id"],),
+                    ).fetchone()
+                    if (
+                        current_job is None
+                        or tuple(current_job) != tuple(job_row)
+                        or remaining_lease is not None
+                    ):
+                        raise StorageSchemaError(
+                            "terminal deletion state changed during startup"
+                        )
+                    changed = self._connection.execute(
+                        """
+                        DELETE FROM transcription_jobs
+                        WHERE id = ? AND phase = 'deleting'
+                          AND status IN (
+                              'succeeded', 'failed', 'cancelled'
+                          )
+                        """,
+                        (job_row["id"],),
+                    ).rowcount
+                    if changed != 1:
+                        raise StorageSchemaError(
+                            "terminal job changed during startup deletion"
+                        )
 
     def _valid_reconciliation_row(self, row: sqlite3.Row) -> bool:
         lease_id = row["id"]

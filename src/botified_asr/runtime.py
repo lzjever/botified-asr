@@ -41,6 +41,7 @@ class JobExecutor:
         self._failure: BaseException | None = None
         self._stop_error: BaseException | None = None
         self._marker_written = False
+        self._active_job_id: str | None = None
         self._active_cancellation: Cancellation | None = None
 
     @property
@@ -76,6 +77,16 @@ class JobExecutor:
 
     def wake(self) -> None:
         self._wake_event.set()
+
+    def notify_cancellation(self, job_id: str) -> None:
+        with self._lock:
+            cancellation = (
+                self._active_cancellation
+                if self._active_job_id == job_id
+                else None
+            )
+        if cancellation is not None:
+            cancellation.cancel()
 
     def stop(self) -> None:
         with self._lock:
@@ -141,6 +152,7 @@ class JobExecutor:
                     return
                 if running_job is not None:
                     cancellation = Cancellation()
+                    self._active_job_id = running_job.id
                     self._active_cancellation = cancellation
 
             if running_job is None:
@@ -182,6 +194,7 @@ class JobExecutor:
                 ):
                     self._stop_error = runner_error
                 if not stopping:
+                    self._active_job_id = None
                     self._active_cancellation = None
 
             if not stopping:
@@ -214,6 +227,7 @@ class JobExecutor:
                         if self._stop_error is None:
                             self._stop_error = error
             with self._lock:
+                self._active_job_id = None
                 self._active_cancellation = None
             return
 

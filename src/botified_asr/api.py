@@ -34,7 +34,12 @@ from botified_asr.composition import (
 )
 from botified_asr.contracts import DIRECT_MAX_SAMPLES, CanonicalOptions
 from botified_asr.errors import InferenceSaturated
-from botified_asr.jobs import JobStatus, QueuedJobSpec
+from botified_asr.jobs import (
+    JobDeletionOutcome,
+    JobStatus,
+    QueuedJobSpec,
+    validate_job_id,
+)
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.runtime import JobExecutor
@@ -412,6 +417,40 @@ def create_app(
             )
         raise RuntimeError("visible job has an unsupported status")
 
+    async def delete_transcription_job(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        try:
+            job_id = validate_job_id(request.path_params["job_id"])
+        except (TypeError, ValueError):
+            raise _job_not_found() from None
+        outcome = await run_in_threadpool(
+            storage.delete_or_cancel_job,
+            job_id,
+            datetime.now(timezone.utc),
+        )
+        if outcome is JobDeletionOutcome.QUEUED_CANCELLED:
+            return JSONResponse(
+                {"id": job_id, "status": "cancelled"},
+                status_code=202,
+                background=BackgroundTask(
+                    storage.cleanup_cancelled_job_input,
+                    job_id,
+                ),
+            )
+        if outcome is JobDeletionOutcome.RUNNING_CANCEL_REQUESTED:
+            if job_executor is not None:
+                job_executor.notify_cancellation(job_id)
+            return JSONResponse(
+                {"id": job_id, "status": "running"},
+                status_code=202,
+            )
+        if outcome is JobDeletionOutcome.TERMINAL_DELETED:
+            return Response(status_code=204)
+        if outcome is JobDeletionOutcome.NOT_FOUND:
+            raise _job_not_found()
+        raise RuntimeError("storage returned an unsupported deletion outcome")
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         executor_started = False
@@ -457,6 +496,11 @@ def create_app(
                 "/v1/audio/transcriptions/{job_id}",
                 get_transcription_job,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/audio/transcriptions/{job_id}",
+                delete_transcription_job,
+                methods=["DELETE"],
             ),
         ],
         exception_handlers={

@@ -1743,3 +1743,40 @@ def test_claimed_job_attempt_propagates_local_cancel_and_integrity_errors(
             assert _artifact_kinds(storage, running.id) == ()
         finally:
             storage.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        PipelineError("cancelled", "requested pipeline cancellation"),
+        AudioError("cancelled", "requested audio cancellation"),
+    ),
+)
+def test_claimed_job_attempt_commits_requested_local_cancellation(
+    tmp_path: Path,
+    error: BaseException,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    try:
+        _execute_attempt(
+            storage,
+            ClaimedJobProcessor(
+                error=error,
+                before_progress=lambda: _request_job_cancel(
+                    storage,
+                    running.id,
+                ),
+            ),
+            running,
+        )
+
+        cancelled = _assert_clean_terminal(
+            storage,
+            running.id,
+            jobs.JobStatus.CANCELLED,
+        )
+        assert cancelled.error_code is None
+        assert cancelled.finished_at == JOB_FINISHED_AT
+    finally:
+        storage.close()

@@ -1,18 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
+from typing import Any, Callable
 
 import anyio
 import pytest
 from starlette.testclient import TestClient
 
+import botified_asr.api as api_module
+import botified_asr.storage as storage_module
 from botified_asr.api import Readiness, create_app
-from botified_asr.jobs import DurableJob, JobPhase, JobStatus
+from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
+from botified_asr.errors import PipelineError
+from botified_asr.jobs import (
+    DurableJob,
+    JobDeletionOutcome,
+    JobPhase,
+    JobStatus,
+    QueuedJobSpec,
+)
 from botified_asr.result_artifact import CanonicalArtifactError
+from botified_asr.runtime import JobExecutor
 from botified_asr.speakers import SpeakerEmbeddingPolicy
+from botified_asr.storage import Storage
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
@@ -122,14 +137,24 @@ class FakeStorage:
         malformed: bool = False,
         result: FakeStoredResult | None = None,
         open_error: Exception | None = None,
+        deletion_outcome: JobDeletionOutcome = JobDeletionOutcome.NOT_FOUND,
+        delete_error: Exception | None = None,
+        events: list[str] | None = None,
     ) -> None:
         self.job = job
         self.malformed = malformed
         self.result = result
         self.open_error = open_error
+        self.deletion_outcome = deletion_outcome
+        self.delete_error = delete_error
+        self.events = events
         self.get_calls = 0
         self.open_calls = 0
         self.release_calls = 0
+        self.delete_calls: list[tuple[str, datetime]] = []
+        self.cleanup_calls: list[str] = []
+        self.delete_thread_ids: list[int] = []
+        self.delete_had_running_loop = False
 
     def get_visible_job(self, _: str) -> DurableJob | None:
         self.get_calls += 1
@@ -148,7 +173,55 @@ class FakeStorage:
         self.release_calls += 1
 
 
-def app(storage: FakeStorage, readiness: Readiness | None = None):
+    def delete_or_cancel_job(
+        self,
+        job_id: str,
+        requested_at: datetime,
+    ) -> JobDeletionOutcome:
+        self.delete_calls.append((job_id, requested_at))
+        self.delete_thread_ids.append(threading.get_ident())
+        if self.events is not None:
+            self.events.append("storage")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self.delete_had_running_loop = True
+        if self.delete_error is not None:
+            raise self.delete_error
+        return self.deletion_outcome
+
+    def cleanup_cancelled_job_input(self, job_id: str) -> None:
+        self.cleanup_calls.append(job_id)
+        if self.events is not None:
+            self.events.append("cleanup")
+
+
+class FakeJobExecutor:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.ready = True
+        self.events = events
+        self.notifications: list[str] = []
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def notify_cancellation(self, job_id: str) -> None:
+        if self.events is not None:
+            self.events.append("notify")
+        self.notifications.append(job_id)
+
+
+def app(
+    storage: FakeStorage | Storage,
+    readiness: Readiness | None = None,
+    *,
+    job_executor: FakeJobExecutor | JobExecutor | None = None,
+):
     return create_app(
         api_key="test-secret",
         readiness=readiness or Readiness(True, True, True),
@@ -157,8 +230,49 @@ def app(storage: FakeStorage, readiness: Readiness | None = None):
         audio_prober=lambda _path, _cancellation: None,
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=embedding_policy(),
+        job_executor=job_executor,
         close_storage_on_shutdown=False,
     )
+
+
+def real_storage(tmp_path: Path) -> Storage:
+    return Storage(
+        tmp_path,
+        LimitsConfig(
+            max_upload_bytes=RESERVATION_QUANTUM,
+            sync_max_upload_bytes=RESERVATION_QUANTUM,
+            max_active_uploads=4,
+            max_queued_jobs=4,
+            max_job_storage_bytes=4 * RESERVATION_QUANTUM,
+            min_filesystem_free_bytes=1,
+        ),
+        current_processor_fingerprint="3" * 64,
+        free_bytes=lambda _: 1 << 40,
+    )
+
+
+def queue_real_job(storage: Storage) -> DurableJob:
+    upload = storage.begin_job_upload(CREATED_AT)
+    storage.append_job_upload(upload, b"audio")
+    input_ref = storage.seal_job_upload(upload)
+    return storage.publish_job(
+        input_ref,
+        QueuedJobSpec(
+            canonical_options_json=OPTIONS,
+            effective_max_audio_samples=32_000,
+            effective_direct_max_audio_samples=16_000,
+            processor_fingerprint="3" * 64,
+        ),
+        speaker_embedding_policy=embedding_policy(),
+    )
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for job state")
+        time.sleep(0.005)
 
 
 @pytest.mark.parametrize(
@@ -182,6 +296,322 @@ def test_job_get_checks_auth_and_readiness_before_storage(
 
     assert response.status_code == status
     assert storage.get_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("headers", "readiness", "status"),
+    (
+        ({}, Readiness(True, True, True), 401),
+        (AUTH, Readiness(True, True, False), 503),
+    ),
+)
+def test_job_delete_checks_auth_and_readiness_before_storage(
+    headers: dict[str, str],
+    readiness: Readiness,
+    status: int,
+) -> None:
+    storage = FakeStorage(
+        None,
+        deletion_outcome=JobDeletionOutcome.QUEUED_CANCELLED,
+    )
+    with TestClient(app(storage, readiness)) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=headers,
+        )
+
+    assert response.status_code == status
+    assert storage.delete_calls == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "body", "events"),
+    (
+        (
+            JobDeletionOutcome.QUEUED_CANCELLED,
+            202,
+            {"id": "7K3M9Q2W", "status": "cancelled"},
+            ["storage", "cleanup"],
+        ),
+        (
+            JobDeletionOutcome.RUNNING_CANCEL_REQUESTED,
+            202,
+            {"id": "7K3M9Q2W", "status": "running"},
+            ["storage", "notify"],
+        ),
+        (
+            JobDeletionOutcome.TERMINAL_DELETED,
+            204,
+            None,
+            ["storage"],
+        ),
+        (
+            JobDeletionOutcome.NOT_FOUND,
+            404,
+            {
+                "error": {
+                    "message": "Transcription job not found",
+                    "type": "invalid_request_error",
+                    "param": "job_id",
+                    "code": "job_not_found",
+                }
+            },
+            ["storage"],
+        ),
+    ),
+)
+def test_job_delete_maps_outcome_and_only_notifies_running(
+    outcome: JobDeletionOutcome,
+    status: int,
+    body: dict[str, object] | None,
+    events: list[str],
+) -> None:
+    observed_events: list[str] = []
+    storage = FakeStorage(
+        None,
+        deletion_outcome=outcome,
+        events=observed_events,
+    )
+    executor = FakeJobExecutor(observed_events)
+    with TestClient(app(storage, job_executor=executor)) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=AUTH,
+        )
+
+    assert response.status_code == status
+    if body is None:
+        assert response.content == b""
+    else:
+        assert response.json() == body
+    assert observed_events == events
+    assert executor.notifications == (
+        ["7K3M9Q2W"]
+        if outcome is JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+        else []
+    )
+    assert storage.cleanup_calls == (
+        ["7K3M9Q2W"]
+        if outcome is JobDeletionOutcome.QUEUED_CANCELLED
+        else []
+    )
+
+
+def test_queued_job_delete_cleans_real_input_after_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        storage_module,
+        "generate_job_id",
+        lambda: "7K3M9Q2W",
+    )
+    storage = real_storage(tmp_path)
+    try:
+        queued = queue_real_job(storage)
+        input_path = storage.staging_dir / f"{queued.id}.ready"
+        with TestClient(app(storage)) as client:
+            response = client.delete(
+                f"/v1/audio/transcriptions/{queued.id}",
+                headers=AUTH,
+            )
+
+        assert response.status_code == 202
+        assert response.json() == {
+            "id": queued.id,
+            "status": "cancelled",
+        }
+        cancelled = storage.get_visible_job(queued.id)
+        assert cancelled is not None
+        assert cancelled.status is JobStatus.CANCELLED
+        assert cancelled.input_lease_id is None
+        assert not cancelled.input_cleanup_pending
+        assert not input_path.exists()
+        assert storage.total_reserved_bytes() == 0
+    finally:
+        storage.close()
+
+
+def test_job_delete_malformed_id_is_not_found_without_storage_call() -> None:
+    storage = FakeStorage(None)
+    with TestClient(app(storage)) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/malformed",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "message": "Transcription job not found",
+            "type": "invalid_request_error",
+            "param": "job_id",
+            "code": "job_not_found",
+        }
+    }
+    assert storage.delete_calls == []
+
+
+def test_job_delete_runs_storage_in_threadpool_with_aware_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_at = datetime(
+        2026,
+        7,
+        27,
+        13,
+        14,
+        15,
+        tzinfo=timezone.utc,
+    )
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            assert tz is timezone.utc
+            return requested_at
+
+    monkeypatch.setattr(api_module, "datetime", FixedDateTime)
+    storage = FakeStorage(
+        None,
+        deletion_outcome=JobDeletionOutcome.TERMINAL_DELETED,
+    )
+    caller_thread_id = threading.get_ident()
+    with TestClient(app(storage)) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 204
+    assert storage.delete_calls == [("7K3M9Q2W", requested_at)]
+    assert storage.delete_calls[0][1].tzinfo is timezone.utc
+    assert storage.delete_thread_ids != [caller_thread_id]
+    assert not storage.delete_had_running_loop
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ValueError("injected valid-ID storage failure"),
+        RuntimeError("injected delete failure"),
+    ),
+)
+def test_job_delete_storage_error_does_not_notify(error: Exception) -> None:
+    events: list[str] = []
+    storage = FakeStorage(
+        None,
+        delete_error=error,
+        events=events,
+    )
+    executor = FakeJobExecutor(events)
+    with TestClient(
+        app(storage, job_executor=executor),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 500
+    assert events == ["storage"]
+    assert executor.notifications == []
+
+
+def test_job_delete_running_without_executor_still_returns_accepted() -> None:
+    storage = FakeStorage(
+        None,
+        deletion_outcome=JobDeletionOutcome.RUNNING_CANCEL_REQUESTED,
+    )
+    with TestClient(app(storage)) as client:
+        response = client.delete(
+            "/v1/audio/transcriptions/7K3M9Q2W",
+            headers=AUTH,
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {"id": "7K3M9Q2W", "status": "running"}
+
+
+def test_running_job_delete_notifies_real_executor_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_ids = iter(("7K3M9Q2W", "8K3M9Q2W"))
+    monkeypatch.setattr(
+        storage_module,
+        "generate_job_id",
+        lambda: next(job_ids),
+    )
+    storage = real_storage(tmp_path)
+    first = queue_real_job(storage)
+    second = queue_real_job(storage)
+    first_started = threading.Event()
+    second_started = threading.Event()
+
+    class BlockingThenFailingProcessor:
+        calls = 0
+
+        def process(
+            self,
+            _input_path: Path,
+            _options: object,
+            cancellation: Any,
+            _progress: object,
+            _sink: object,
+            **_kwargs: Any,
+        ) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                first_started.set()
+                deadline = time.monotonic() + 2
+                while not cancellation.cancelled:
+                    if time.monotonic() >= deadline:
+                        raise AssertionError(
+                            "timed out waiting for API cancellation"
+                        )
+                    time.sleep(0.005)
+                raise PipelineError("cancelled", "job cancelled")
+            second_started.set()
+            raise PipelineError("invalid_audio", "second job finished")
+
+    executor = JobExecutor(
+        storage,
+        BlockingThenFailingProcessor(),
+        embedding_policy(),
+        "generation-1",
+        lambda: datetime.now(timezone.utc),
+    )
+    try:
+        with TestClient(
+            app(storage, job_executor=executor),
+        ) as client:
+            assert first_started.wait(timeout=2)
+            response = client.delete(
+                f"/v1/audio/transcriptions/{first.id}",
+                headers=AUTH,
+            )
+
+            assert response.status_code == 202
+            assert response.json() == {
+                "id": first.id,
+                "status": "running",
+            }
+            assert second_started.wait(timeout=2)
+            wait_until(
+                lambda: storage.get_visible_job(first.id).status
+                is JobStatus.CANCELLED
+            )
+            wait_until(
+                lambda: storage.get_visible_job(second.id).status
+                is JobStatus.FAILED
+            )
+            assert executor.ready
+            assert executor.failure is None
+    finally:
+        executor.stop()
+        storage.close()
 
 
 @pytest.mark.parametrize("malformed", (False, True))

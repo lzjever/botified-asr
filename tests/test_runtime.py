@@ -13,8 +13,11 @@ from botified_asr import jobs
 from botified_asr import storage as storage_module
 from botified_asr.audio import Cancellation
 from botified_asr.canonical_options import serialize_canonical_options
+from botified_asr.composition import TranscriptionProcessorPool
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import CanonicalOptions
+from botified_asr.errors import PipelineError
+from botified_asr.inference import SerialInferenceLane
 from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import Storage, StorageSchemaError
 
@@ -228,6 +231,213 @@ def test_job_executor_starts_idle_then_claims_a_later_job(
         executor.stop()
         storage.close()
     assert not executor.ready
+
+
+def test_job_executor_notify_cancellation_only_targets_active_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    ids = iter(("01234567", "ABCDEFGH"))
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(ids))
+    storage = _storage(tmp_path)
+    first = _queue_job(storage)
+    second = _queue_job(storage)
+    started = {
+        first.id: threading.Event(),
+        second.id: threading.Event(),
+    }
+    cancelled = {
+        first.id: threading.Event(),
+        second.id: threading.Event(),
+    }
+
+    def execute(
+        actual_storage: Storage,
+        _processor: object,
+        running: jobs.DurableJob,
+        cancellation: Cancellation,
+        **_kwargs: Any,
+    ) -> None:
+        started[running.id].set()
+        assert cancellation._event.wait(timeout=2)
+        cancelled[running.id].set()
+        actual_storage.commit_job_failure(
+            running.id,
+            running.attempt_token,
+            "internal_error",
+            NOW,
+        )
+
+    monkeypatch.setattr(runtime, "execute_claimed_job_attempt", execute)
+    executor = runtime.JobExecutor(
+        storage,
+        object(),
+        _speaker_embedding_policy(),
+        GENERATION,
+        _now,
+    )
+    try:
+        executor.notify_cancellation(first.id)
+        executor.start()
+        executor.wake()
+        assert started[first.id].wait(timeout=2)
+        assert not cancelled[first.id].is_set()
+
+        executor.notify_cancellation(second.id)
+        assert not cancelled[first.id].wait(timeout=0.05)
+        executor.notify_cancellation(first.id)
+        assert cancelled[first.id].wait(timeout=2)
+        assert started[second.id].wait(timeout=2)
+
+        executor.notify_cancellation(first.id)
+        assert not cancelled[second.id].wait(timeout=0.05)
+        executor.notify_cancellation(second.id)
+        assert cancelled[second.id].wait(timeout=2)
+        _wait_until(
+            lambda: storage.get_visible_job(second.id).status
+            is jobs.JobStatus.FAILED
+        )
+
+        executor.notify_cancellation(second.id)
+        assert executor.ready
+        assert executor.failure is None
+    finally:
+        executor.stop()
+        storage.close()
+
+
+def test_running_job_cancellation_removes_inference_waiter_and_executor_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    ids = iter(("01234567", "ABCDEFGH"))
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(ids))
+    storage = _storage(tmp_path)
+    first = _queue_job(storage)
+    second = _queue_job(storage)
+    lane = SerialInferenceLane()
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    first_started = threading.Event()
+    late_entry = threading.Event()
+    second_started = threading.Event()
+
+    def hold_lane() -> None:
+        lane.invoke(
+            lambda: (
+                holder_entered.set(),
+                release_holder.wait(timeout=2),
+            )
+        )
+
+    class LaneProcessor:
+        calls = 0
+
+        def process(self, *_args: Any, **_kwargs: Any) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                first_started.set()
+                return lane.invoke(late_entry.set)
+            second_started.set()
+            raise PipelineError("invalid_audio", "second job finished")
+
+    holder = threading.Thread(target=hold_lane, daemon=True)
+    holder.start()
+    assert holder_entered.wait(timeout=2)
+    processor = TranscriptionProcessorPool((LaneProcessor(),)).async_processor
+    executor = runtime.JobExecutor(
+        storage,
+        processor,
+        _speaker_embedding_policy(),
+        GENERATION,
+        _now,
+    )
+    try:
+        executor.start()
+        executor.wake()
+        assert first_started.wait(timeout=2)
+        outcome = storage.delete_or_cancel_job(first.id, NOW)
+        assert outcome is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+
+        executor.notify_cancellation(first.id)
+        assert second_started.wait(timeout=2)
+        _wait_until(
+            lambda: storage.get_visible_job(first.id).status
+            is jobs.JobStatus.CANCELLED
+        )
+        _wait_until(
+            lambda: storage.get_visible_job(second.id).status
+            is jobs.JobStatus.FAILED
+        )
+
+        release_holder.set()
+        holder.join(timeout=2)
+        assert not holder.is_alive()
+        assert not late_entry.is_set()
+        assert executor.ready
+        assert executor.failure is None
+    finally:
+        release_holder.set()
+        holder.join(timeout=2)
+        executor.stop()
+        storage.close()
+
+
+def test_shutdown_local_cancellation_remains_stale_and_requeues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        storage_module,
+        "generate_job_id",
+        lambda: "01234567",
+    )
+    storage = _storage(tmp_path)
+    queued = _queue_job(storage)
+    entered = threading.Event()
+
+    class CancelOnSignalProcessor:
+        def process(
+            self,
+            _input_path: Path,
+            _options: CanonicalOptions,
+            cancellation: Cancellation,
+            _progress: object,
+            _sink: object,
+            **_kwargs: Any,
+        ) -> object:
+            entered.set()
+            assert cancellation._event.wait(timeout=2)
+            raise PipelineError("cancelled", "shutdown cancellation")
+
+    executor = runtime.JobExecutor(
+        storage,
+        CancelOnSignalProcessor(),
+        _speaker_embedding_policy(),
+        GENERATION,
+        _now,
+    )
+    try:
+        executor.start()
+        executor.wake()
+        assert entered.wait(timeout=2)
+
+        executor.stop()
+
+        requeued = storage.get_visible_job(queued.id)
+        assert requeued is not None
+        assert requeued.status is jobs.JobStatus.QUEUED
+        assert requeued.attempt_no == 1
+        assert not requeued.cancel_requested
+        assert requeued.attempt_token is None
+        assert requeued.owner_generation is None
+        assert executor.failure is None
+    finally:
+        executor.stop()
+        storage.close()
 
 
 def test_job_executor_shutdown_fences_claims_cancels_and_requeues_from_zero(

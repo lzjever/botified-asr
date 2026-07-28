@@ -46,6 +46,13 @@ class JobTerminalOutcome(str, Enum):
     CANCEL_REQUESTED = "cancel_requested"
 
 
+class JobDeletionOutcome(str, Enum):
+    QUEUED_CANCELLED = "queued_cancelled"
+    RUNNING_CANCEL_REQUESTED = "running_cancel_requested"
+    TERMINAL_DELETED = "terminal_deleted"
+    NOT_FOUND = "not_found"
+
+
 class StaleJobAttemptError(RuntimeError):
     pass
 
