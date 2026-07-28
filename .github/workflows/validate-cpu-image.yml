@@ -1,0 +1,226 @@
+name: Validate CPU image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.image_arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            image_arch: amd64
+            uname_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            image_arch: arm64
+            uname_arch: aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.uname_arch }}"
+
+      - name: Read project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(
+            python3 - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as source:
+              print(tomllib.load(source)["project"]["version"])
+          PY
+          )"
+          test -n "$version"
+          printf 'BOTIFIED_ASR_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Build CPU image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --pull \
+            --no-cache \
+            --build-arg BOTIFIED_ASR_VERSION="$BOTIFIED_ASR_VERSION" \
+            -t botified-asr:test \
+            .
+
+      - name: Verify image metadata and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(
+            docker image inspect \
+              --format '{{.Architecture}}' \
+              botified-asr:test
+          )" = "${{ matrix.image_arch }}"
+          test "$(
+            docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+              botified-asr:test
+          )" = "$BOTIFIED_ASR_VERSION"
+          test "$(
+            docker image inspect \
+              --format '{{.Config.User}}' \
+              botified-asr:test
+          )" = "10001:10001"
+          test "$(
+            docker run \
+              --rm \
+              --network none \
+              --read-only \
+              botified-asr:test \
+              --version
+          )" = "botified-asr $BOTIFIED_ASR_VERSION"
+
+      - name: Run authenticated transcription smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          container_name="botified-asr-cpu-validation"
+          runtime_root="${{ runner.temp }}/botified-asr-validation"
+          config_dir="$runtime_root/config"
+          data_dir="$runtime_root/data"
+          model_cache_dir="$runtime_root/model-cache"
+          config_path="$config_dir/config.yaml"
+          health_response="$runtime_root/health.json"
+          transcription_response="$runtime_root/transcription.json"
+
+          mkdir -p "$config_dir" "$data_dir" "$model_cache_dir"
+          sudo chown -R 10001:10001 "$data_dir" "$model_cache_dir"
+
+          cat > "$config_path" <<'YAML'
+          server:
+            listen: "0.0.0.0:17770"
+            public_base_url: "http://127.0.0.1:17770"
+
+          runtime:
+            device: "cpu"
+            model_cache_dir: "/var/cache/botified-asr/models"
+            max_speakers: 32
+            inference_lanes: 1
+
+          storage:
+            data_dir: "/var/lib/botified-asr"
+          YAML
+
+          on_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] \
+              && docker container inspect "$container_name" >/dev/null 2>&1; then
+              docker logs "$container_name" || true
+            fi
+            exit "$status"
+          }
+          trap on_exit EXIT
+
+          export BOTIFIED_ASR_API_KEY="$(
+            python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+          )"
+
+          docker run \
+            --detach \
+            --name "$container_name" \
+            --read-only \
+            --memory 8g \
+            --network bridge \
+            --publish 127.0.0.1::17770 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g,mode=1777 \
+            --mount \
+              "type=bind,src=$config_path,dst=/etc/botified-asr/config.yaml,readonly" \
+            --mount \
+              "type=bind,src=$data_dir,dst=/var/lib/botified-asr" \
+            --mount \
+              "type=bind,src=$model_cache_dir,dst=/var/cache/botified-asr/models" \
+            --env BOTIFIED_ASR_API_KEY \
+            botified-asr:test \
+            --config /etc/botified-asr/config.yaml
+
+          host_port="$(
+            docker container inspect \
+              --format '{{(index (index .NetworkSettings.Ports "17770/tcp") 0).HostPort}}' \
+              "$container_name"
+          )"
+          test -n "$host_port"
+
+          ready=false
+          deadline=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if [ "$(
+              curl \
+                --silent \
+                --max-time 5 \
+                --output "$health_response" \
+                --write-out '%{http_code}' \
+                --header "Authorization: Bearer $BOTIFIED_ASR_API_KEY" \
+                "http://127.0.0.1:$host_port/health/ready" \
+                || true
+            )" = "200" ]; then
+              ready=true
+              break
+            fi
+            if [ "$(
+              docker container inspect \
+                --format '{{.State.Running}}' \
+                "$container_name"
+            )" != "true" ]; then
+              break
+            fi
+            sleep 5
+          done
+          test "$ready" = "true"
+
+          test "$(
+            curl \
+              --silent \
+              --show-error \
+              --max-time 300 \
+              --output "$transcription_response" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $BOTIFIED_ASR_API_KEY" \
+              --form model=sensevoice \
+              --form \
+                file=@assets/botified-asr-smoke.flac\;type=audio/flac \
+              "http://127.0.0.1:$host_port/v1/audio/transcriptions"
+          )" = "200"
+
+          python3 - "$transcription_response" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              text = json.load(source).get("text")
+          raise SystemExit(not isinstance(text, str) or not text.strip())
+          PY
+
+          trap - EXIT
+
+      - name: Stop validation container
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          container_name="botified-asr-cpu-validation"
+          if docker container inspect "$container_name" >/dev/null 2>&1; then
+            docker stop --time 120 "$container_name" || true
+            docker rm "$container_name" \
+              || docker rm --force "$container_name" \
+              || true
+          fi
