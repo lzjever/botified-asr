@@ -614,7 +614,7 @@ succeeded 始终返回 job envelope：
 
 - `json`、`verbose_json` 和 `diarized_json` 的 canonical response 放在 `result`。
 - `text/plain` 只用于同步请求；异步 `response_format=text` 使用 `result.text`。
-- failed 返回 `{"id":"...","status":"failed","error":{...},"finished_at":"<RFC3339 UTC>"}`，不返回原始异常。
+- failed 返回 `{"id":"...","status":"failed","error":{...},"finished_at":"<RFC3339 UTC>"}`，不返回原始异常。runtime worker 只允许持久化 `invalid_audio`、`audio_too_long`、`long_audio_requires_vad`、`too_many_speakers`、`invalid_model_output`、`pipeline_not_ready` 或 `internal_error`；未知异常统一映射为 `internal_error`，不得保存原始异常文本或 traceback。`worker_crashed` 仅由恢复器写入，runtime failure commit 不接受该值。
 - cancelled 返回 `{"id":"...","status":"cancelled","finished_at":"<RFC3339 UTC>"}`。
 - 所有时间使用 RFC 3339 UTC；queued/running 不返回不存在的 finished 字段，terminal 不返回 progress。
 
@@ -626,7 +626,7 @@ DELETE /v1/audio/transcriptions/{job_id}
 
 - queued：CAS 为 cancelled，异步清理输入，返回 `202 {"id":"...","status":"cancelled"}`；GET 在 retention 内可见 cancelled。
 - running：原子设置 `cancel_requested=true`，返回 `202 {"id":"...","status":"running"}`；重复 DELETE 幂等返回相同响应，worker 在下一个安全点 CAS 为 cancelled 并清理。
-- worker 只有在 `status=running AND attempt_token=<当前值> AND cancel_requested=false` 时才能提交 succeeded；DELETE 和结果提交竞争时只允许一个 CAS 获胜。
+- worker 只有在 `status=running AND attempt_token=<当前值> AND cancel_requested=false` 时才能提交 succeeded；failed commit 同样要求 `phase=visible AND status=running AND attempt_token=<当前值> AND cancel_requested=false`。若已设置 `cancel_requested=true`，failure 不得覆盖取消，worker 必须改为提交 cancelled；DELETE、success 和 failure 提交竞争时只允许一个 CAS 获胜。
 - succeeded/failed/cancelled：先转入内部 deleting phase，幂等删除 artifact 和 reservation 后删除记录，返回 `204`；deleting 对 GET 表现为 `404`。
 - cancelled job 的再次 DELETE 进入上一条 terminal 删除语义；记录删除后的请求返回 `404`，不增加永久 tombstone。
 

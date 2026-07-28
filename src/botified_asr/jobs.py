@@ -40,6 +40,12 @@ class JobSuccessOutcome(str, Enum):
     CANCEL_REQUESTED = "cancel_requested"
 
 
+class JobTerminalOutcome(str, Enum):
+    COMMITTED = "committed"
+    STALE = "stale"
+    CANCEL_REQUESTED = "cancel_requested"
+
+
 def validate_job_id(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("job ID must be a string")

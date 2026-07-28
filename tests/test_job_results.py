@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,8 +29,18 @@ from botified_asr.storage import Storage, StorageSchemaError
 CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 STARTED_AT = CREATED_AT + timedelta(minutes=1)
 FINISHED_AT = STARTED_AT + timedelta(minutes=1)
+NON_UTC_FINISHED_AT = FINISHED_AT.astimezone(timezone(timedelta(hours=1)))
 TOTAL_SAMPLES = 32_000
 PROCESSOR_FINGERPRINT = "3" * 64
+RUNTIME_FAILURE_CODES = (
+    "invalid_audio",
+    "audio_too_long",
+    "long_audio_requires_vad",
+    "too_many_speakers",
+    "invalid_model_output",
+    "pipeline_not_ready",
+    "internal_error",
+)
 CANONICAL_OPTIONS_JSON = (
     '{"chunking_strategy":null,"include":[],"known_speaker_ids":[],'
     '"language":"auto","model":"sensevoice","response_format":"json"}'
@@ -187,6 +198,401 @@ def finish_progress(storage: Storage, running: jobs.DurableJob) -> None:
         )
         is jobs.JobProgressOutcome.UPDATED
     )
+
+
+def new_running_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Storage, jobs.DurableJob]:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    return storage, queue_and_claim(storage)
+
+
+def request_cancel(storage: Storage, job_id: str) -> None:
+    storage._connection.execute(
+        "UPDATE transcription_jobs SET cancel_requested = 1 WHERE id = ?",
+        (job_id,),
+    )
+
+
+def commit_terminal(
+    storage: Storage,
+    running: jobs.DurableJob,
+    terminal: str,
+    *,
+    attempt_token: str | None = None,
+    failure_code: str = "internal_error",
+    finished_at: datetime = FINISHED_AT,
+) -> jobs.JobTerminalOutcome:
+    token = running.attempt_token if attempt_token is None else attempt_token
+    assert token is not None
+    if terminal == "failure":
+        return storage.commit_job_failure(
+            running.id,
+            token,
+            failure_code,
+            finished_at,
+        )
+    assert terminal == "cancellation"
+    return storage.commit_job_cancellation(
+        running.id,
+        token,
+        finished_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "expected_status"),
+    (
+        *((code, jobs.JobStatus.FAILED) for code in RUNTIME_FAILURE_CODES),
+        (None, jobs.JobStatus.CANCELLED),
+    ),
+)
+def test_fenced_terminal_commit_cleans_input_and_is_not_repeatable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str | None,
+    expected_status: jobs.JobStatus,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        finished_at = STARTED_AT if failure_code is not None else FINISHED_AT
+        if failure_code is None:
+            request_cancel(storage, running.id)
+            terminal_kind = "cancellation"
+        else:
+            terminal_kind = "failure"
+
+        def commit() -> jobs.JobTerminalOutcome:
+            return commit_terminal(
+                storage,
+                running,
+                terminal_kind,
+                failure_code=failure_code or "internal_error",
+                finished_at=finished_at,
+            )
+
+        assert commit() is jobs.JobTerminalOutcome.COMMITTED
+        terminal = storage.get_visible_job(running.id)
+        assert terminal is not None
+        assert terminal.status is expected_status
+        assert terminal.attempt_token is None
+        assert terminal.owner_generation is None
+        assert terminal.result_lease_id is None
+        assert terminal.error_code == failure_code
+        assert terminal.input_lease_id is None
+        assert not terminal.input_cleanup_pending
+        assert terminal.finished_at == finished_at
+        assert terminal.cancel_requested is (failure_code is None)
+        assert not (storage.staging_dir / f"{running.id}.ready").exists()
+        assert storage.total_reserved_bytes() == 0
+        assert commit() is jobs.JobTerminalOutcome.STALE
+
+
+@pytest.mark.parametrize("terminal", ("failure", "cancellation"))
+def test_terminal_commit_with_stale_token_is_a_zero_change_loser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        if terminal == "cancellation":
+            request_cancel(storage, running.id)
+        before = recovery_snapshot(tmp_path)
+
+        outcome = commit_terminal(
+            storage,
+            running,
+            terminal,
+            attempt_token="stale-token",
+        )
+
+        assert outcome is jobs.JobTerminalOutcome.STALE
+        assert recovery_snapshot(tmp_path) == before
+
+
+def test_cancellation_wins_the_exact_attempt_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        before_request = recovery_snapshot(tmp_path)
+        assert (
+            commit_terminal(storage, running, "cancellation")
+            is jobs.JobTerminalOutcome.STALE
+        )
+        assert recovery_snapshot(tmp_path) == before_request
+
+        request_cancel(storage, running.id)
+        after_request = recovery_snapshot(tmp_path)
+        assert (
+            commit_terminal(storage, running, "failure")
+            is jobs.JobTerminalOutcome.CANCEL_REQUESTED
+        )
+        assert recovery_snapshot(tmp_path) == after_request
+        assert (
+            commit_terminal(storage, running, "cancellation")
+            is jobs.JobTerminalOutcome.COMMITTED
+        )
+
+
+@pytest.mark.parametrize(
+    ("terminal", "failure_code", "finished_at"),
+    (
+        ("failure", "unknown_private_error", FINISHED_AT),
+        ("failure", "cancelled", FINISHED_AT),
+        ("failure", "worker_crashed", FINISHED_AT),
+        ("failure", "internal_error", STARTED_AT - timedelta(microseconds=1)),
+        ("failure", "internal_error", NON_UTC_FINISHED_AT),
+        ("cancellation", None, STARTED_AT - timedelta(microseconds=1)),
+        ("cancellation", None, NON_UTC_FINISHED_AT),
+    ),
+)
+def test_terminal_commit_rejects_invalid_values_before_any_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+    failure_code: str | None,
+    finished_at: datetime,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        if terminal == "cancellation":
+            request_cancel(storage, running.id)
+        before = recovery_snapshot(tmp_path)
+
+        with pytest.raises(ValueError):
+            commit_terminal(
+                storage,
+                running,
+                terminal,
+                failure_code=failure_code or "internal_error",
+                finished_at=finished_at,
+            )
+
+        assert recovery_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("terminal", ("failure", "cancellation"))
+def test_terminal_commit_rejects_corrupt_running_shape_before_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        storage._connection.execute(
+            """
+            UPDATE transcription_jobs
+            SET owner_generation = NULL, cancel_requested = ?
+            WHERE id = ?
+            """,
+            (int(terminal == "cancellation"), running.id),
+        )
+        before = recovery_snapshot(tmp_path)
+
+        with pytest.raises(StorageSchemaError):
+            commit_terminal(storage, running, terminal)
+
+        assert recovery_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("terminal", ("failure", "cancellation"))
+def test_repeated_terminal_commit_resumes_only_its_pending_input_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        if terminal == "cancellation":
+            request_cancel(storage, running.id)
+
+        original_unlink = storage._unlink_if_present
+        faulted = False
+
+        def fail_first_unlink(path: Path) -> None:
+            nonlocal faulted
+            if not faulted:
+                faulted = True
+                raise OSError("injected terminal input unlink failure")
+            original_unlink(path)
+
+        monkeypatch.setattr(storage, "_unlink_if_present", fail_first_unlink)
+
+        def commit(
+            error_code: str = "internal_error",
+        ) -> jobs.JobTerminalOutcome:
+            return commit_terminal(
+                storage,
+                running,
+                terminal,
+                failure_code=error_code,
+            )
+
+        with pytest.raises(
+            OSError,
+            match="injected terminal input unlink failure",
+        ):
+            commit()
+
+        pending = storage.get_visible_job(running.id)
+        assert pending is not None
+        assert pending.status is (
+            jobs.JobStatus.FAILED
+            if terminal == "failure"
+            else jobs.JobStatus.CANCELLED
+        )
+        assert pending.input_lease_id == running.id
+        assert pending.input_cleanup_pending
+        assert pending.error_code == (
+            "internal_error" if terminal == "failure" else None
+        )
+        assert pending.finished_at == FINISHED_AT
+        assert storage.total_reserved_bytes() == len(b"audio")
+
+        if terminal == "failure":
+            before_wrong_target = recovery_snapshot(tmp_path)
+            assert (
+                commit("invalid_audio")
+                is jobs.JobTerminalOutcome.STALE
+            )
+            assert recovery_snapshot(tmp_path) == before_wrong_target
+
+        assert commit() is jobs.JobTerminalOutcome.STALE
+        cleaned = storage.get_visible_job(running.id)
+        assert cleaned is not None
+        assert cleaned.status is pending.status
+        assert cleaned.error_code == pending.error_code
+        assert cleaned.finished_at == pending.finished_at
+        assert cleaned.attempt_token == pending.attempt_token
+        assert cleaned.owner_generation == pending.owner_generation
+        assert cleaned.input_lease_id is None
+        assert not cleaned.input_cleanup_pending
+        assert storage.total_reserved_bytes() == 0
+        assert not (storage.staging_dir / f"{running.id}.ready").exists()
+
+
+def test_terminal_cleanup_hands_off_a_deleting_job_without_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        original_unlink = storage._unlink_if_present
+
+        def unlink_then_take_ownership(path: Path) -> None:
+            original_unlink(path)
+            storage._connection.execute(
+                "UPDATE transcription_jobs SET phase = 'deleting' WHERE id = ?",
+                (running.id,),
+            )
+
+        monkeypatch.setattr(
+            storage,
+            "_unlink_if_present",
+            unlink_then_take_ownership,
+        )
+
+        assert (
+            commit_terminal(storage, running, "failure")
+            is jobs.JobTerminalOutcome.COMMITTED
+        )
+        deleting = storage._connection.execute(
+            """
+            SELECT phase, status, error_code, input_lease_id,
+                   input_cleanup_pending, finished_at
+            FROM transcription_jobs WHERE id = ?
+            """,
+            (running.id,),
+        ).fetchone()
+        assert tuple(deleting) == (
+            "deleting",
+            "failed",
+            "internal_error",
+            running.id,
+            1,
+            "2026-07-27T12:02:00Z",
+        )
+        assert storage.total_reserved_bytes() == len(b"audio")
+        assert not (storage.staging_dir / f"{running.id}.ready").exists()
+
+
+@pytest.mark.parametrize("check", ("first", "second"))
+def test_terminal_cleanup_rejects_a_missing_row_with_an_orphan_upload_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    check: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        original_unlink = storage._unlink_if_present
+
+        if check == "first":
+            def fail_unlink(_path: Path) -> None:
+                raise OSError("injected terminal input unlink failure")
+
+            monkeypatch.setattr(storage, "_unlink_if_present", fail_unlink)
+            with pytest.raises(
+                OSError,
+                match="injected terminal input unlink failure",
+            ):
+                commit_terminal(storage, running, "failure")
+            monkeypatch.setattr(
+                storage,
+                "_unlink_if_present",
+                original_unlink,
+            )
+            storage._connection.execute(
+                "DELETE FROM transcription_jobs WHERE id = ?",
+                (running.id,),
+            )
+            before = recovery_snapshot(tmp_path)
+
+            with pytest.raises(StorageSchemaError):
+                commit_terminal(storage, running, "failure")
+
+            assert recovery_snapshot(tmp_path) == before
+        else:
+            def unlink_then_drop_row(path: Path) -> None:
+                original_unlink(path)
+                storage._connection.execute(
+                    "DELETE FROM transcription_jobs WHERE id = ?",
+                    (running.id,),
+                )
+
+            monkeypatch.setattr(
+                storage,
+                "_unlink_if_present",
+                unlink_then_drop_row,
+            )
+            with pytest.raises(StorageSchemaError):
+                commit_terminal(storage, running, "failure")
+
+        orphan = storage._connection.execute(
+            """
+            SELECT lease_type, resource_kind, owner_kind, owner_id, phase
+            FROM storage_leases WHERE id = ?""",
+            (running.id,),
+        ).fetchone()
+        assert tuple(orphan) == (
+            "upload",
+            "transcription",
+            "job",
+            running.id,
+            "sealed",
+        )
+        assert storage.total_reserved_bytes() == len(b"audio")
 
 
 def test_job_result_writer_commits_exact_success_state(

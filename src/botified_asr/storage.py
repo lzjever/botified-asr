@@ -22,6 +22,7 @@ from botified_asr.jobs import (
     JobProgressOutcome,
     JobSuccessOutcome,
     JobStatus,
+    JobTerminalOutcome,
     QueuedJobSpec,
     generate_attempt_token,
     generate_job_id,
@@ -58,6 +59,15 @@ ARTIFACT_NAME_PATTERN = re.compile(
 )
 LEASE_TYPES = {"upload", "artifact"}
 ARTIFACT_KINDS = {"segment_jsonl", "result_complete"}
+_RUNTIME_JOB_FAILURE_CODES = {
+    "invalid_audio",
+    "audio_too_long",
+    "long_audio_requires_vad",
+    "too_many_speakers",
+    "invalid_model_output",
+    "pipeline_not_ready",
+    "internal_error",
+}
 _SPEAKER_PROFILE_COLUMNS = """
     id, name, name_key, description, embedding,
     embedding_model_id, embedding_model_revision,
@@ -2454,7 +2464,10 @@ class Storage:
                 result_ref,
             )
         if already_committed:
-            self._cleanup_succeeded_job_input(job_id)
+            self._cleanup_terminal_job_input(
+                job_id,
+                JobStatus.SUCCEEDED,
+            )
             return JobSuccessOutcome.COMMITTED
         if (
             row is None
@@ -2555,13 +2568,158 @@ class Storage:
                         and current["result_lease_id"] == result_ref.id
                     )
         if committed:
-            self._cleanup_succeeded_job_input(job_id)
+            self._cleanup_terminal_job_input(
+                job_id,
+                JobStatus.SUCCEEDED,
+            )
             return JobSuccessOutcome.COMMITTED
         if not bound:
             self.release_artifact(result_ref)
         if cancelled:
             return JobSuccessOutcome.CANCEL_REQUESTED
         return JobSuccessOutcome.STALE
+
+    def commit_job_failure(
+        self,
+        job_id: str,
+        attempt_token: str,
+        error_code: str,
+        finished_at: datetime,
+    ) -> JobTerminalOutcome:
+        validate_job_id(job_id)
+        _validate_nonempty_text(attempt_token, name="attempt token")
+        if type(error_code) is not str:
+            raise TypeError("job failure code must be a string")
+        if error_code not in _RUNTIME_JOB_FAILURE_CODES:
+            raise ValueError("job failure code is invalid")
+        return self._commit_job_terminal(
+            job_id,
+            attempt_token,
+            status=JobStatus.FAILED,
+            error_code=error_code,
+            finished_at=finished_at,
+            expected_cancel_requested=False,
+        )
+
+    def commit_job_cancellation(
+        self,
+        job_id: str,
+        attempt_token: str,
+        finished_at: datetime,
+    ) -> JobTerminalOutcome:
+        validate_job_id(job_id)
+        _validate_nonempty_text(attempt_token, name="attempt token")
+        return self._commit_job_terminal(
+            job_id,
+            attempt_token,
+            status=JobStatus.CANCELLED,
+            error_code=None,
+            finished_at=finished_at,
+            expected_cancel_requested=True,
+        )
+
+    def _commit_job_terminal(
+        self,
+        job_id: str,
+        attempt_token: str,
+        *,
+        status: JobStatus,
+        error_code: str | None,
+        finished_at: datetime,
+        expected_cancel_requested: bool,
+    ) -> JobTerminalOutcome:
+        encoded_finished_at = _encode_job_timestamp(finished_at)
+        outcome = JobTerminalOutcome.STALE
+        cleanup_pending = False
+        with self._transaction():
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            job = (
+                None
+                if row is None
+                else _decode_transcription_job(row)
+            )
+            same_terminal_identity = (
+                job is not None
+                and job.status is status
+                and (
+                    status is JobStatus.CANCELLED
+                    or job.error_code == error_code
+                )
+            )
+            if job is None or same_terminal_identity:
+                cleanup_pending = True
+            elif (
+                job.status is not JobStatus.RUNNING
+                or job.attempt_token != attempt_token
+            ):
+                return JobTerminalOutcome.STALE
+
+            if not cleanup_pending:
+                if job.started_at is None:
+                    raise StorageSchemaError(
+                        "running job start timestamp is missing"
+                    )
+                if finished_at < job.started_at:
+                    raise ValueError("job timestamps are out of order")
+                if job.cancel_requested != expected_cancel_requested:
+                    if (
+                        not expected_cancel_requested
+                        and job.cancel_requested
+                    ):
+                        return JobTerminalOutcome.CANCEL_REQUESTED
+                    return JobTerminalOutcome.STALE
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET
+                        status = ?,
+                        attempt_token = NULL,
+                        owner_generation = NULL,
+                        error_code = ?,
+                        input_cleanup_pending = 1,
+                        finished_at = ?
+                    WHERE id = ? AND phase = 'visible'
+                      AND status = 'running' AND attempt_token = ?
+                      AND cancel_requested = ?
+                      AND result_lease_id IS NULL
+                    """,
+                    (
+                        status.value,
+                        error_code,
+                        encoded_finished_at,
+                        job_id,
+                        attempt_token,
+                        int(expected_cancel_requested),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "running job changed during terminal commit"
+                    )
+                terminal_row = self._connection.execute(
+                    f"""
+                    SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                    FROM transcription_jobs WHERE id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if terminal_row is None:
+                    raise StorageSchemaError(
+                        "committed terminal job disappeared"
+                    )
+                _decode_transcription_job(terminal_row)
+                outcome = JobTerminalOutcome.COMMITTED
+                cleanup_pending = True
+
+        if cleanup_pending:
+            self._cleanup_terminal_job_input(job_id, status)
+        return outcome
 
     def open_succeeded_job_result(
         self,
@@ -2675,7 +2833,12 @@ class Storage:
                 handle.close()
             raise
 
-    def _cleanup_succeeded_job_input(self, job_id: str) -> None:
+    def _cleanup_terminal_job_input(
+        self,
+        job_id: str,
+        expected_status: JobStatus,
+    ) -> None:
+        status = expected_status.value
         input_path = self.staging_dir / f"{job_id}.ready"
         with self._transaction():
             job_row = self._connection.execute(
@@ -2685,10 +2848,24 @@ class Storage:
                 """,
                 (job_id,),
             ).fetchone()
+            if job_row is None:
+                orphan_lease = self._connection.execute(
+                    "SELECT 1 FROM storage_leases WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if orphan_lease is None:
+                    return
+                raise StorageSchemaError(
+                    "terminal job input lease is orphaned"
+                )
             if (
-                job_row is not None
-                and job_row["phase"] == "visible"
-                and job_row["status"] == "succeeded"
+                job_row["phase"] == "deleting"
+                and job_row["status"] == status
+            ):
+                return
+            if (
+                job_row["phase"] == "visible"
+                and job_row["status"] == status
                 and job_row["input_lease_id"] is None
                 and job_row["input_cleanup_pending"] == 0
             ):
@@ -2698,9 +2875,8 @@ class Storage:
                 (job_id,),
             ).fetchone()
             if (
-                job_row is None
-                or job_row["phase"] != "visible"
-                or job_row["status"] != "succeeded"
+                job_row["phase"] != "visible"
+                or job_row["status"] != status
                 or job_row["input_lease_id"] != job_id
                 or job_row["input_cleanup_pending"] != 1
                 or lease_row is None
@@ -2717,14 +2893,14 @@ class Storage:
                 != job_row["input_size_bytes"]
             ):
                 raise StorageSchemaError(
-                    "succeeded job input cleanup state is corrupt"
+                    "terminal job input cleanup state is corrupt"
                 )
             if not _is_absent_or_regular_file_with_size(
                 input_path,
                 lease_row["actual_bytes"],
             ):
                 raise StorageSchemaError(
-                    "succeeded job input file is corrupt"
+                    "terminal job input file is corrupt"
                 )
 
         self._unlink_if_present(input_path)
@@ -2738,10 +2914,24 @@ class Storage:
                 """,
                 (job_id,),
             ).fetchone()
+            if current_job is None:
+                orphan_lease = self._connection.execute(
+                    "SELECT 1 FROM storage_leases WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if orphan_lease is None:
+                    return
+                raise StorageSchemaError(
+                    "terminal job input lease is orphaned"
+                )
             if (
-                current_job is not None
-                and current_job["phase"] == "visible"
-                and current_job["status"] == "succeeded"
+                current_job["phase"] == "deleting"
+                and current_job["status"] == status
+            ):
+                return
+            if (
+                current_job["phase"] == "visible"
+                and current_job["status"] == status
                 and current_job["input_lease_id"] is None
                 and current_job["input_cleanup_pending"] == 0
             ):
@@ -2751,13 +2941,12 @@ class Storage:
                 (job_id,),
             ).fetchone()
             if (
-                current_job is None
-                or tuple(current_job) != tuple(job_row)
+                tuple(current_job) != tuple(job_row)
                 or current_lease is None
                 or tuple(current_lease) != tuple(lease_row)
             ):
                 raise RuntimeError(
-                    "succeeded job input cleanup state changed"
+                    "terminal job input cleanup state changed"
                 )
             lease_deleted = self._connection.execute(
                 """
@@ -2786,15 +2975,15 @@ class Storage:
                     input_lease_id = NULL,
                     input_cleanup_pending = 0
                 WHERE id = ? AND phase = 'visible'
-                  AND status = 'succeeded'
+                  AND status = ?
                   AND input_lease_id = ?
                   AND input_cleanup_pending = 1
                 """,
-                (job_id, job_id),
+                (job_id, status, job_id),
             ).rowcount
             if lease_deleted != 1 or changed != 1:
                 raise RuntimeError(
-                    "succeeded job changed during input cleanup"
+                    "terminal job changed during input cleanup"
                 )
             cleaned_row = self._connection.execute(
                 f"""
@@ -2805,7 +2994,7 @@ class Storage:
             ).fetchone()
             if cleaned_row is None:
                 raise StorageSchemaError(
-                    "succeeded job disappeared during input cleanup"
+                    "terminal job disappeared during input cleanup"
                 )
             _decode_transcription_job(cleaned_row)
 
