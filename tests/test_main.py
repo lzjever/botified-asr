@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import signal
 import sys
 from datetime import datetime, timezone
@@ -389,6 +390,26 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
     assert scenario.readiness.ready is False
     assert scenario.executor.stop_calls == 1
     assert scenario.storage.close_calls == 1
+
+
+def test_main_version_uses_installed_metadata_without_starting_service(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scenario = install_fakes(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["botified-asr", "--version"])
+
+    with pytest.raises(SystemExit) as caught:
+        main_module.main()
+
+    captured = capsys.readouterr()
+    assert caught.value.code == 0
+    assert captured.out == (
+        f"botified-asr {importlib.metadata.version('botified-asr')}\n"
+    )
+    assert captured.err == ""
+    assert scenario.events == []
+    assert scenario.storage.close_calls == 0
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ import argparse
 import os
 import secrets
 from datetime import datetime, timezone
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from types import FrameType
 
@@ -40,6 +41,11 @@ class _ShutdownAwareServer(uvicorn.Server):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {distribution_version('botified-asr')}",
+    )
     parser.add_argument("--config", type=Path, default=_default_config_path())
     args = parser.parse_args()
     config = load_config(args.config)
