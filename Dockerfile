@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG BOTIFIED_ASR_VERSION
+
 FROM python:3.11.13-slim-bookworm AS python-base
 
 FROM python-base AS builder
@@ -14,8 +16,18 @@ RUN python --version \
 COPY pyproject.toml uv.lock ./
 COPY src/ src/
 
-RUN uv sync --frozen --no-dev --no-editable \
-    && /opt/botified-asr/bin/botified-asr --version \
+RUN uv sync --frozen --no-dev --no-editable
+
+ARG BOTIFIED_ASR_VERSION
+
+RUN actual_version=$(/opt/botified-asr/bin/botified-asr --version) \
+    && expected_version="botified-asr ${BOTIFIED_ASR_VERSION:-}" \
+    && if [ -z "${BOTIFIED_ASR_VERSION:-}" ] \
+       || [ "$actual_version" != "$expected_version" ]; then \
+           printf 'botified-asr version mismatch: expected "%s", got "%s"\n' \
+               "$expected_version" "$actual_version" >&2; \
+           exit 1; \
+       fi \
     && /opt/botified-asr/bin/botified-asr --help >/dev/null \
     && /opt/botified-asr/bin/python -c \
        'import botified_asr, torch; assert not torch.cuda.is_available()'
@@ -33,6 +45,10 @@ RUN apt-get update \
 
 COPY --from=builder /opt/botified-asr /opt/botified-asr
 
+ARG BOTIFIED_ASR_VERSION
+
+LABEL org.opencontainers.image.version=$BOTIFIED_ASR_VERSION
+
 RUN groupadd --gid 10001 botified-asr \
     && useradd \
        --uid 10001 \
@@ -48,6 +64,7 @@ RUN groupadd --gid 10001 botified-asr \
        /var/lib/botified-asr \
        /var/cache/botified-asr \
     && python --version \
+    && botified-asr --version >/dev/null \
     && python -c 'import botified_asr, torch; assert not torch.cuda.is_available()' \
     && ffmpeg -version >/dev/null \
     && ffprobe -version >/dev/null
