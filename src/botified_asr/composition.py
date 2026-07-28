@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from botified_asr.audio import SAMPLE_RATE, Cancellation
+from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
+from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.contracts import (
     DIRECT_MAX_SAMPLES,
     MAX_AUDIO_SAMPLES,
     CanonicalOptions,
+)
+from botified_asr.errors import PipelineError
+from botified_asr.jobs import (
+    DurableJob,
+    JobCancellationRequestedError,
+    JobProgressOutcome,
+    JobSuccessOutcome,
+    JobTerminalOutcome,
+    StaleJobAttemptError,
 )
 from botified_asr.pipeline import (
     CanonicalJsonlSegmentSink,
@@ -20,15 +31,26 @@ from botified_asr.pipeline import (
 from botified_asr.result_artifact import (
     CanonicalJsonlReader,
     Projection,
+    RESULT_ENVELOPE_VERSION,
+    ResultEnvelopeManifest,
     ResultProjector,
+    finalize_result_envelope,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
 from botified_asr.speaker_snapshot import (
     SelectedSpeakerSnapshot,
+    parse_selected_speaker_snapshot,
     resolve_selected_speaker_snapshot,
 )
 from botified_asr.speakers import SpeakerEmbeddingPolicy
-from botified_asr.storage import ArtifactRef, ReservedByteWriter, Storage
+from botified_asr.storage import (
+    RUNTIME_JOB_FAILURE_CODES,
+    ArtifactRef,
+    ReservedByteWriter,
+    Storage,
+    StorageAdmissionError,
+    StorageSchemaError,
+)
 
 
 class TranscriptionProcessor(Protocol):
@@ -156,6 +178,68 @@ class ProgressAccumulator:
         return self._exact_total
 
 
+class _DurableJobProgress:
+    def __init__(
+        self,
+        storage: Storage,
+        job_id: str,
+        attempt_token: str,
+        cancellation: Cancellation,
+    ) -> None:
+        self._storage = storage
+        self._job_id = job_id
+        self._attempt_token = attempt_token
+        self._cancellation = cancellation
+        self._local = ProgressAccumulator()
+
+    def update(
+        self,
+        *,
+        processed_samples: int,
+        total_samples: int | None,
+    ) -> None:
+        self._local.update(
+            processed_samples=processed_samples,
+            total_samples=total_samples,
+        )
+        outcome = self._storage.update_job_progress(
+            self._job_id,
+            self._attempt_token,
+            processed_samples,
+            total_samples=total_samples,
+        )
+        if outcome is JobProgressOutcome.UPDATED:
+            return
+        self._cancellation.cancel()
+        if outcome is JobProgressOutcome.CANCEL_REQUESTED:
+            raise JobCancellationRequestedError(
+                "job cancellation was requested"
+            )
+        raise StaleJobAttemptError(
+            "job attempt is no longer running"
+        )
+
+    def finish(self) -> int:
+        return self._local.finish()
+
+
+def _validate_processor_result(
+    result: object,
+    writer: StorageArtifactByteWriter,
+) -> SpeakerLabelMapping:
+    if type(result) is not ProcessorResult:
+        raise RuntimeError("processor returned an invalid result")
+    speaker_mapping = result.speaker_mapping
+    if (
+        type(speaker_mapping) is not SpeakerLabelMapping
+        or type(speaker_mapping.resolutions) is not tuple
+    ):
+        raise RuntimeError("processor returned an invalid speaker mapping")
+    if writer.sealed_ref is None or result.artifact_ref is not writer.sealed_ref:
+        raise RuntimeError("processor returned an unexpected artifact reference")
+    return speaker_mapping
+
+
 def _validate_sample_count(value: int, *, name: str) -> None:
     if type(value) is not int:
         raise TypeError(f"{name} must be an integer")
@@ -254,16 +338,7 @@ def prepare_sync_transcription(
             effective_max_audio_samples=effective_max_audio_samples,
             effective_direct_max_audio_samples=effective_direct_max_audio_samples,
         )
-        if type(result) is not ProcessorResult:
-            raise RuntimeError("processor returned an invalid result")
-        speaker_mapping = result.speaker_mapping
-        if (
-            type(speaker_mapping) is not SpeakerLabelMapping
-            or type(speaker_mapping.resolutions) is not tuple
-        ):
-            raise RuntimeError("processor returned an invalid speaker mapping")
-        if writer.sealed_ref is None or result.artifact_ref is not writer.sealed_ref:
-            raise RuntimeError("processor returned an unexpected artifact reference")
+        speaker_mapping = _validate_processor_result(result, writer)
         total_samples = progress.finish()
         artifact_path = storage.resolve_artifact(writer.sealed_ref)
         reader = CanonicalJsonlReader(artifact_path)
@@ -279,4 +354,244 @@ def prepare_sync_transcription(
         return response
     finally:
         if not transferred:
+            writer._discard()
+
+
+def execute_claimed_job_attempt(
+    storage: Storage,
+    processor: TranscriptionProcessor,
+    running_job: DurableJob,
+    cancellation: Cancellation,
+    *,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    now: Callable[[], datetime],
+) -> None:
+    if type(running_job) is not DurableJob:
+        raise TypeError(
+            "execute_claimed_job_attempt requires a DurableJob"
+        )
+    attempt_token = running_job.attempt_token
+    if attempt_token is None:
+        raise ValueError("claimed job has no attempt token")
+
+    def finished_at(job: DurableJob) -> datetime:
+        if job.started_at is None:
+            raise StorageSchemaError(
+                "running job has no attempt start time"
+            )
+        return max(now(), job.started_at)
+
+    def commit_cancellation(job: DurableJob, when: datetime) -> None:
+        storage.commit_job_cancellation(
+            job.id,
+            attempt_token,
+            when,
+        )
+
+    def commit_failure(
+        job: DurableJob,
+        error_code: str,
+        when: datetime,
+    ) -> None:
+        outcome = storage.commit_job_failure(
+            job.id,
+            attempt_token,
+            error_code,
+            when,
+        )
+        if outcome is JobTerminalOutcome.CANCEL_REQUESTED:
+            commit_cancellation(job, when)
+
+    try:
+        current_job, input_path = storage.resolve_job_attempt_input(
+            running_job.id,
+            attempt_token,
+        )
+    except StaleJobAttemptError:
+        cancellation.cancel()
+        return
+    except JobCancellationRequestedError:
+        cancellation.cancel()
+        commit_cancellation(running_job, finished_at(running_job))
+        return
+
+    if (
+        current_job.canonical_options_json is None
+        or current_job.selected_speaker_snapshot is None
+        or current_job.effective_max_audio_samples is None
+        or current_job.effective_direct_max_audio_samples is None
+    ):
+        raise StorageSchemaError(
+            "running job execution metadata is incomplete"
+        )
+    try:
+        options = parse_canonical_options_json(
+            current_job.canonical_options_json
+        )
+        selected_speaker_snapshot = parse_selected_speaker_snapshot(
+            current_job.selected_speaker_snapshot,
+            speaker_embedding_policy,
+            expected_ids=options.known_speaker_ids,
+        )
+    except ValueError as error:
+        raise StorageSchemaError(
+            "running job execution metadata is corrupt"
+        ) from error
+
+    try:
+        reserved_writer = storage.begin_job_attempt_artifact(
+            current_job.id,
+            attempt_token,
+        )
+    except StaleJobAttemptError:
+        cancellation.cancel()
+        return
+    except JobCancellationRequestedError:
+        cancellation.cancel()
+        commit_cancellation(current_job, finished_at(current_job))
+        return
+
+    writer = StorageArtifactByteWriter(storage, reserved_writer)
+    segment_release_attempted = False
+    try:
+        sink = CanonicalJsonlSegmentSink(writer)
+        progress = _DurableJobProgress(
+            storage,
+            current_job.id,
+            attempt_token,
+            cancellation,
+        )
+        try:
+            result = processor.process(
+                input_path,
+                options,
+                cancellation,
+                progress,
+                sink,
+                selected_speaker_snapshot=selected_speaker_snapshot,
+                effective_max_audio_samples=(
+                    current_job.effective_max_audio_samples
+                ),
+                effective_direct_max_audio_samples=(
+                    current_job.effective_direct_max_audio_samples
+                ),
+            )
+            speaker_mapping = _validate_processor_result(
+                result,
+                writer,
+            )
+            total_samples = progress.finish()
+        except StaleJobAttemptError:
+            cancellation.cancel()
+            return
+        except JobCancellationRequestedError:
+            cancellation.cancel()
+            commit_cancellation(
+                current_job,
+                finished_at(current_job),
+            )
+            return
+        except (PipelineError, AudioError) as error:
+            if error.code == "cancelled":
+                raise
+            error_code = (
+                error.code
+                if error.code in RUNTIME_JOB_FAILURE_CODES
+                else "internal_error"
+            )
+            commit_failure(
+                current_job,
+                error_code,
+                finished_at(current_job),
+            )
+            return
+        except StorageSchemaError:
+            raise
+        except Exception:
+            commit_failure(
+                current_job,
+                "internal_error",
+                finished_at(current_job),
+            )
+            return
+
+        segment_ref = writer.sealed_ref
+        if segment_ref is None:
+            raise RuntimeError(
+                "processor did not seal its segment artifact"
+            )
+        reader = CanonicalJsonlReader(
+            storage.resolve_artifact(segment_ref)
+        )
+        when = finished_at(current_job)
+        if (
+            current_job.request_fingerprint is None
+            or current_job.processor_fingerprint is None
+        ):
+            raise StorageSchemaError(
+                "running job fingerprints are incomplete"
+            )
+        manifest = ResultEnvelopeManifest(
+            version=RESULT_ENVELOPE_VERSION,
+            job_id=current_job.id,
+            attempt_no=current_job.attempt_no,
+            request_fingerprint=current_job.request_fingerprint,
+            processor_fingerprint=current_job.processor_fingerprint,
+            finished_at=when,
+        )
+        try:
+            result_reserved_writer = (
+                storage.begin_job_result_artifact(
+                    current_job.id,
+                    attempt_token,
+                )
+            )
+            result_writer = StorageArtifactByteWriter(
+                storage,
+                result_reserved_writer,
+            )
+            result_ref = finalize_result_envelope(
+                reader,
+                options,
+                total_samples,
+                writer=result_writer,
+                manifest=manifest,
+                speaker_mapping=speaker_mapping,
+            )
+        except StaleJobAttemptError:
+            cancellation.cancel()
+            return
+        except JobCancellationRequestedError:
+            cancellation.cancel()
+            commit_cancellation(current_job, when)
+            return
+        except StorageAdmissionError:
+            commit_failure(
+                current_job,
+                "internal_error",
+                when,
+            )
+            return
+
+        segment_release_attempted = True
+        writer._discard()
+        if type(result_ref) is not ArtifactRef:
+            raise RuntimeError(
+                "result envelope returned an invalid artifact"
+            )
+        outcome = storage.commit_job_success(
+            current_job.id,
+            attempt_token,
+            result_ref,
+        )
+        if outcome is JobSuccessOutcome.CANCEL_REQUESTED:
+            cancellation.cancel()
+            commit_cancellation(current_job, when)
+        elif outcome not in {
+            JobSuccessOutcome.COMMITTED,
+            JobSuccessOutcome.STALE,
+        }:
+            raise RuntimeError("job success commit returned an invalid outcome")
+    finally:
+        if not segment_release_attempted:
             writer._discard()

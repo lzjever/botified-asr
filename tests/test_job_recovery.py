@@ -411,7 +411,14 @@ def test_progress_is_monotonic_token_fenced_and_cancel_aware(
         )
         fixed = storage.get_visible_job(running.id)
         assert fixed.processed_samples == fixed.total_samples == 200
-        with pytest.raises(ValueError):
+        with pytest.raises(StorageSchemaError):
+            storage.update_job_progress(
+                running.id,
+                "token-1",
+                201,
+                total_samples=None,
+            )
+        with pytest.raises(StorageSchemaError):
             storage.update_job_progress(
                 running.id,
                 "token-1",

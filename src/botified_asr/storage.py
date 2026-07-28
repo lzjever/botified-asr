@@ -61,15 +61,17 @@ ARTIFACT_NAME_PATTERN = re.compile(
 )
 LEASE_TYPES = {"upload", "artifact"}
 ARTIFACT_KINDS = {"segment_jsonl", "result_complete"}
-_RUNTIME_JOB_FAILURE_CODES = {
-    "invalid_audio",
-    "audio_too_long",
-    "long_audio_requires_vad",
-    "too_many_speakers",
-    "invalid_model_output",
-    "pipeline_not_ready",
-    "internal_error",
-}
+RUNTIME_JOB_FAILURE_CODES = frozenset(
+    {
+        "invalid_audio",
+        "audio_too_long",
+        "long_audio_requires_vad",
+        "too_many_speakers",
+        "invalid_model_output",
+        "pipeline_not_ready",
+        "internal_error",
+    }
+)
 _SPEAKER_PROFILE_COLUMNS = """
     id, name, name_key, description, embedding,
     embedding_model_id, embedding_model_revision,
@@ -1863,7 +1865,7 @@ class Storage:
                     current_total is not None
                     and processed_samples > current_total
                 ):
-                    raise ValueError(
+                    raise StorageSchemaError(
                         "processed samples exceed the fixed total"
                     )
                 changed = self._connection.execute(
@@ -1895,7 +1897,7 @@ class Storage:
                 ).rowcount
             else:
                 if current_total is not None and current_total != total_samples:
-                    raise ValueError(
+                    raise StorageSchemaError(
                         "EOF total samples do not match the fixed total"
                     )
                 changed = self._connection.execute(
@@ -2740,7 +2742,7 @@ class Storage:
         _validate_nonempty_text(attempt_token, name="attempt token")
         if type(error_code) is not str:
             raise TypeError("job failure code must be a string")
-        if error_code not in _RUNTIME_JOB_FAILURE_CODES:
+        if error_code not in RUNTIME_JOB_FAILURE_CODES:
             raise ValueError("job failure code is invalid")
         return self._commit_job_terminal(
             job_id,

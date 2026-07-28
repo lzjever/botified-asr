@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import wave
+from collections.abc import Callable
 from datetime import datetime, timezone
 from inspect import Parameter, signature
 from pathlib import Path
@@ -11,9 +12,11 @@ import numpy as np
 import pytest
 
 from botified_asr import composition as composition_module
+from botified_asr import jobs
 from botified_asr import pipeline as pipeline_module
 from botified_asr import speaker_profiles, speaker_snapshot, speakers
-from botified_asr.audio import Cancellation, FfmpegAudioFrontend
+from botified_asr.audio import AudioError, Cancellation, FfmpegAudioFrontend
+from botified_asr.canonical_options import serialize_canonical_options
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import MAX_AUDIO_SAMPLES, CanonicalOptions
 from botified_asr.pipeline import (
@@ -26,16 +29,24 @@ from botified_asr.pipeline import (
 )
 from botified_asr.result_artifact import Projection
 from botified_asr.speaker_matching import (
+    KnownSpeakerMatch,
     SpeakerLabelMapping,
     SpeakerLabelResolution,
 )
 from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
-from botified_asr.storage import Storage
+from botified_asr.storage import (
+    Storage,
+    StorageAdmissionError,
+    StorageSchemaError,
+)
 
 
 MODEL_ID = "funasr/campplus"
 MODEL_REVISION = "1" * 40
 PROCESSOR_FINGERPRINT = "3" * 64
+JOB_CREATED_AT = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+JOB_STARTED_AT = datetime(2026, 7, 27, 12, 1, tzinfo=timezone.utc)
+JOB_FINISHED_AT = datetime(2026, 7, 27, 12, 2, tzinfo=timezone.utc)
 
 
 def _speaker_embedding_policy() -> speakers.SpeakerEmbeddingPolicy:
@@ -134,6 +145,94 @@ def _assert_no_artifact(storage: Storage) -> None:
     )
 
 
+def _queue_and_claim_job(
+    storage: Storage,
+    *,
+    options: CanonicalOptions | None = None,
+    effective_max_audio_samples: int = 32_000,
+    effective_direct_max_audio_samples: int = 16_000,
+) -> jobs.DurableJob:
+    canonical_options = _options() if options is None else options
+    upload = storage.begin_job_upload(JOB_CREATED_AT)
+    storage.append_job_upload(upload, b"durable audio")
+    input_ref = storage.seal_job_upload(upload)
+    storage.publish_job(
+        input_ref,
+        jobs.QueuedJobSpec(
+            canonical_options_json=serialize_canonical_options(
+                canonical_options
+            ),
+            effective_max_audio_samples=effective_max_audio_samples,
+            effective_direct_max_audio_samples=(
+                effective_direct_max_audio_samples
+            ),
+            processor_fingerprint=PROCESSOR_FINGERPRINT,
+        ),
+        speaker_embedding_policy=_speaker_embedding_policy(),
+    )
+    running = storage.claim_next_job("generation-1", JOB_STARTED_AT)
+    assert running is not None
+    assert running.attempt_token is not None
+    return running
+
+
+def _artifact_kinds(storage: Storage, job_id: str) -> tuple[str, ...]:
+    return tuple(
+        row[0]
+        for row in storage._connection.execute(
+            """
+            SELECT resource_kind FROM storage_leases
+            WHERE lease_type = 'artifact'
+              AND owner_kind = 'job' AND owner_id = ?
+            ORDER BY resource_kind
+            """,
+            (job_id,),
+        )
+    )
+
+
+def _execute_attempt(
+    storage: Storage,
+    processor: object,
+    running: jobs.DurableJob,
+    cancellation: Cancellation | None = None,
+) -> Cancellation:
+    current_cancellation = cancellation or Cancellation()
+    composition_module.execute_claimed_job_attempt(
+        storage,
+        processor,  # type: ignore[arg-type]
+        running,
+        current_cancellation,
+        speaker_embedding_policy=_speaker_embedding_policy(),
+        now=lambda: JOB_FINISHED_AT,
+    )
+    return current_cancellation
+
+
+def _request_job_cancel(storage: Storage, job_id: str) -> None:
+    storage._connection.execute(
+        """
+        UPDATE transcription_jobs SET cancel_requested = 1
+        WHERE id = ?
+        """,
+        (job_id,),
+    )
+
+
+def _assert_clean_terminal(
+    storage: Storage,
+    job_id: str,
+    status: jobs.JobStatus,
+) -> jobs.DurableJob:
+    terminal = storage.get_visible_job(job_id)
+    assert terminal is not None
+    assert terminal.status is status
+    assert terminal.input_lease_id is None
+    assert _artifact_kinds(storage, job_id) == ()
+    assert storage.total_reserved_bytes() == 0
+    return terminal
+
+
 class EmittingProcessor:
     def __init__(
         self,
@@ -230,6 +329,103 @@ class EmittingProcessor:
         if self.behavior == "missing_progress":
             return pipeline_module.ProcessorResult(ref, self.speaker_mapping)
         return pipeline_module.ProcessorResult(ref, self.speaker_mapping)
+
+
+class ClaimedJobProcessor:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        before_progress: Callable[[], None] | None = None,
+        after_progress: Callable[[int, int | None], None] | None = None,
+    ) -> None:
+        self.error = error
+        self.before_progress = before_progress
+        self.after_progress = after_progress
+        self.calls = 0
+        self.input_paths: list[Path] = []
+        self.input_payloads: list[bytes] = []
+        self.options: list[CanonicalOptions] = []
+        self.cancellations: list[Cancellation] = []
+        self.selected_snapshots: list[SelectedSpeakerSnapshot] = []
+        self.effective_caps: list[tuple[int, int]] = []
+
+    def process(
+        self,
+        input_path: Path,
+        options: CanonicalOptions,
+        cancellation: Cancellation,
+        progress: Any,
+        sink: Any,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
+    ) -> object:
+        self.calls += 1
+        self.input_paths.append(input_path)
+        self.input_payloads.append(input_path.read_bytes())
+        self.options.append(options)
+        self.cancellations.append(cancellation)
+        self.selected_snapshots.append(selected_speaker_snapshot)
+        self.effective_caps.append(
+            (
+                effective_max_audio_samples,
+                effective_direct_max_audio_samples,
+            )
+        )
+        sink.append(
+            SegmentRecord(
+                0,
+                0,
+                16_000,
+                "hello",
+                "en",
+                RichAnnotations("happy", "speech"),
+                anonymous_speaker=(
+                    "A"
+                    if selected_speaker_snapshot.speakers
+                    else None
+                ),
+            )
+        )
+        if self.before_progress is not None:
+            self.before_progress()
+        if self.error is not None:
+            raise self.error
+        for processed_samples, total_samples in (
+            (8_000, None),
+            (16_000, 16_000),
+        ):
+            progress.update(
+                processed_samples=processed_samples,
+                total_samples=total_samples,
+            )
+            if self.after_progress is not None:
+                self.after_progress(
+                    processed_samples,
+                    total_samples,
+                )
+        ref = sink.finalize()
+        speaker_mapping = SpeakerLabelMapping(())
+        if selected_speaker_snapshot.speakers:
+            selected = selected_speaker_snapshot.speakers[0]
+            speaker_mapping = SpeakerLabelMapping(
+                (
+                    SpeakerLabelResolution(
+                        "A",
+                        KnownSpeakerMatch(
+                            selected.id,
+                            selected.name,
+                            1.0,
+                        ),
+                    ),
+                )
+            )
+        return pipeline_module.ProcessorResult(
+            ref,
+            speaker_mapping,
+        )
 
 
 class RuntimeModel:
@@ -836,3 +1032,346 @@ def test_prepared_response_close_retries_release_failure(
         _assert_no_artifact(storage)
     finally:
         storage.close()
+
+
+def test_claimed_job_attempt_success_uses_fresh_durable_inputs_and_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    known_id = "00000001"
+    options = _options(known_speaker_ids=(known_id,))
+    storage = _storage(tmp_path)
+    storage.create_speaker_profile(_profile(known_id, "Alice"))
+    running = _queue_and_claim_job(
+        storage,
+        options=options,
+        effective_max_audio_samples=32_000,
+        effective_direct_max_audio_samples=12_000,
+    )
+    assert storage.delete_speaker_profile(known_id)
+    resolve_calls: list[tuple[jobs.DurableJob, Path]] = []
+    original_resolve = storage.resolve_job_attempt_input
+
+    def resolve_attempt(
+        job_id: str,
+        attempt_token: str,
+    ) -> tuple[jobs.DurableJob, Path]:
+        resolved = original_resolve(job_id, attempt_token)
+        resolve_calls.append(resolved)
+        return resolved
+
+    observed_progress: list[tuple[int, int | None, int, int | None]] = []
+
+    def observe_progress(
+        processed_samples: int,
+        total_samples: int | None,
+    ) -> None:
+        current = storage.get_visible_job(running.id)
+        assert current is not None
+        observed_progress.append(
+            (
+                processed_samples,
+                total_samples,
+                current.processed_samples,
+                current.total_samples,
+            )
+        )
+
+    monkeypatch.setattr(
+        storage,
+        "resolve_job_attempt_input",
+        resolve_attempt,
+    )
+    cancellation = Cancellation()
+    processor = ClaimedJobProcessor(after_progress=observe_progress)
+    try:
+        _execute_attempt(storage, processor, running, cancellation)
+
+        assert len(resolve_calls) == 1
+        resolved, input_path = resolve_calls[0]
+        assert resolved is not running
+        assert input_path == storage.staging_dir / f"{running.id}.ready"
+        assert processor.input_paths == [input_path]
+        assert processor.input_payloads == [b"durable audio"]
+        assert processor.options == [options]
+        assert processor.cancellations == [cancellation]
+        assert processor.effective_caps == [(32_000, 12_000)]
+        assert [
+            (speaker.id, speaker.name)
+            for speaker in processor.selected_snapshots[0].speakers
+        ] == [(known_id, "Alice")]
+        assert observed_progress == [
+            (8_000, None, 8_000, None),
+            (16_000, 16_000, 16_000, 16_000),
+        ]
+        succeeded = storage.get_visible_job(running.id)
+        assert succeeded is not None
+        assert succeeded.status is jobs.JobStatus.SUCCEEDED
+        assert succeeded.processed_samples == 16_000
+        assert succeeded.total_samples == 16_000
+        assert succeeded.finished_at == JOB_FINISHED_AT
+        assert not input_path.exists()
+        assert _artifact_kinds(storage, running.id) == (
+            "result_complete",
+        )
+        assert tuple(
+            tuple(row)
+            for row in storage._connection.execute(
+                "SELECT lease_type, resource_kind FROM storage_leases"
+            )
+        ) == (("artifact", "result_complete"),)
+        stored = storage.open_succeeded_job_result(running.id)
+        try:
+            assert json.loads(b"".join(stored.iter_body()))["text"] == "hello"
+        finally:
+            stored.close()
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("losing_progress", ("cancel", "stale"))
+def test_claimed_job_attempt_progress_loser_discards_only_owned_artifact(
+    tmp_path: Path,
+    losing_progress: str,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    assert running.attempt_token is not None
+
+    def lose_progress() -> None:
+        if losing_progress == "cancel":
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs SET cancel_requested = 1
+                WHERE id = ?
+                """,
+                (running.id,),
+            )
+        else:
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs SET attempt_token = ?
+                WHERE id = ?
+                """,
+                ("attempt-new", running.id),
+            )
+
+    cancellation = Cancellation()
+    processor = ClaimedJobProcessor(before_progress=lose_progress)
+    try:
+        _execute_attempt(storage, processor, running, cancellation)
+
+        current = storage.get_visible_job(running.id)
+        assert current is not None
+        assert cancellation.cancelled
+        assert _artifact_kinds(storage, running.id) == ()
+        if losing_progress == "cancel":
+            assert current.status is jobs.JobStatus.CANCELLED
+            assert current.input_lease_id is None
+            assert not (
+                storage.staging_dir / f"{running.id}.ready"
+            ).exists()
+            assert storage.total_reserved_bytes() == 0
+        else:
+            assert current.status is jobs.JobStatus.RUNNING
+            assert current.attempt_token == "attempt-new"
+            assert current.processed_samples == 0
+            assert current.total_samples is None
+            assert current.input_lease_id == running.id
+            assert (
+                storage.staging_dir / f"{running.id}.ready"
+            ).is_file()
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    (
+        (
+            PipelineError("audio_too_long", "private pipeline detail"),
+            "audio_too_long",
+        ),
+        (
+            AudioError("invalid_audio", "private audio detail"),
+            "invalid_audio",
+        ),
+        (RuntimeError("private unknown detail"), "internal_error"),
+    ),
+)
+def test_claimed_job_attempt_maps_processor_failure_without_message_leak(
+    tmp_path: Path,
+    error: BaseException,
+    expected_code: str,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    try:
+        _execute_attempt(
+            storage,
+            ClaimedJobProcessor(error=error),
+            running,
+        )
+
+        failed = _assert_clean_terminal(
+            storage,
+            running.id,
+            jobs.JobStatus.FAILED,
+        )
+        assert failed.error_code == expected_code
+        assert failed.finished_at == JOB_FINISHED_AT
+        assert str(error) not in "\n".join(storage._connection.iterdump())
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("race", ("failure", "success"))
+def test_claimed_job_attempt_terminal_commit_loses_to_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    saw_result_before_cancel = False
+
+    def request_cancel() -> None:
+        _request_job_cancel(storage, running.id)
+
+    if race == "failure":
+        original_failure = storage.commit_job_failure
+
+        def cancel_before_failure(*args: Any, **kwargs: Any) -> object:
+            request_cancel()
+            return original_failure(*args, **kwargs)
+
+        monkeypatch.setattr(
+            storage,
+            "commit_job_failure",
+            cancel_before_failure,
+        )
+        processor = ClaimedJobProcessor(
+            error=PipelineError("invalid_audio", "private"),
+        )
+    else:
+        original_success = storage.commit_job_success
+
+        def cancel_before_success(*args: Any, **kwargs: Any) -> object:
+            nonlocal saw_result_before_cancel
+            saw_result_before_cancel = (
+                "result_complete" in _artifact_kinds(storage, running.id)
+            )
+            request_cancel()
+            return original_success(*args, **kwargs)
+
+        monkeypatch.setattr(
+            storage,
+            "commit_job_success",
+            cancel_before_success,
+        )
+        processor = ClaimedJobProcessor()
+    try:
+        _execute_attempt(storage, processor, running)
+
+        cancelled = _assert_clean_terminal(
+            storage,
+            running.id,
+            jobs.JobStatus.CANCELLED,
+        )
+        assert cancelled.error_code is None
+        assert cancelled.finished_at == JOB_FINISHED_AT
+        assert saw_result_before_cancel is (race == "success")
+    finally:
+        storage.close()
+
+
+def test_claimed_job_attempt_result_admission_failure_commits_internal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    error = StorageAdmissionError(
+        "storage_full",
+        "private result admission detail",
+    )
+    monkeypatch.setattr(
+        storage,
+        "begin_job_result_artifact",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+    try:
+        _execute_attempt(storage, ClaimedJobProcessor(), running)
+
+        failed = _assert_clean_terminal(
+            storage,
+            running.id,
+            jobs.JobStatus.FAILED,
+        )
+        assert failed.error_code == "internal_error"
+        assert failed.finished_at == JOB_FINISHED_AT
+        assert str(error) not in "\n".join(storage._connection.iterdump())
+    finally:
+        storage.close()
+
+
+def test_claimed_job_attempt_fixed_total_mismatch_is_integrity_error(
+    tmp_path: Path,
+) -> None:
+    storage = _storage(tmp_path)
+    running = _queue_and_claim_job(storage)
+    storage._connection.execute(
+        """
+        UPDATE transcription_jobs SET total_samples = ?
+        WHERE id = ?
+        """,
+        (16_001, running.id),
+    )
+    try:
+        with pytest.raises(StorageSchemaError):
+            _execute_attempt(storage, ClaimedJobProcessor(), running)
+
+        current = storage.get_visible_job(running.id)
+        assert current is not None
+        assert current.status is jobs.JobStatus.RUNNING
+        assert current.total_samples == 16_001
+        assert current.processed_samples == 8_000
+        assert current.input_lease_id == running.id
+        assert _artifact_kinds(storage, running.id) == ()
+    finally:
+        storage.close()
+
+
+def test_claimed_job_attempt_propagates_local_cancel_and_integrity_errors(
+    tmp_path: Path,
+) -> None:
+    errors: tuple[BaseException, ...] = (
+        PipelineError("cancelled", "local pipeline cancellation"),
+        AudioError("cancelled", "local audio cancellation"),
+        StorageSchemaError("private integrity failure"),
+    )
+    for index, error in enumerate(errors):
+        storage = _storage(tmp_path / f"case-{index}")
+        running = _queue_and_claim_job(storage)
+        try:
+            with pytest.raises(type(error)) as caught:
+                _execute_attempt(
+                    storage,
+                    ClaimedJobProcessor(error=error),
+                    running,
+                )
+
+            assert caught.value is error
+            current = storage.get_visible_job(running.id)
+            assert current is not None
+            assert current.status is jobs.JobStatus.RUNNING
+            assert current.attempt_token == running.attempt_token
+            assert current.error_code is None
+            assert current.finished_at is None
+            assert current.input_lease_id == running.id
+            assert (
+                storage.staging_dir / f"{running.id}.ready"
+            ).is_file()
+            assert _artifact_kinds(storage, running.id) == ()
+        finally:
+            storage.close()
