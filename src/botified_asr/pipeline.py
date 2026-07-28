@@ -164,6 +164,31 @@ class BufferedSpeechSegment:
             raise ValueError("buffered speech segment is invalid")
 
 
+def canonical_speech_pcm(segment: object) -> np.ndarray:
+    if not isinstance(segment, BufferedSpeechSegment):
+        raise PipelineError(
+            "invalid_model_output",
+            "Speech segmenter returned an invalid segment",
+        )
+    canonical_start = segment.span.start_sample - segment.pcm_start_sample
+    canonical_end = segment.span.end_sample - segment.pcm_start_sample
+    canonical_pcm = np.ascontiguousarray(
+        segment.pcm[canonical_start:canonical_end],
+        dtype=np.int16,
+    )
+    if (
+        canonical_pcm.ndim != 1
+        or not canonical_pcm.flags.c_contiguous
+        or len(canonical_pcm) != segment.span.end_sample - segment.span.start_sample
+        or not len(canonical_pcm)
+    ):
+        raise PipelineError(
+            "invalid_model_output",
+            "Speech segmenter returned an invalid segment",
+        )
+    return canonical_pcm
+
+
 @dataclass(frozen=True)
 class _BufferedPcmChunk:
     start_sample: int
@@ -288,7 +313,12 @@ class BoundedSpeechPcmBuffer:
     def _begin_speech(self, origin_sample: int) -> None:
         if origin_sample > self._processed_end_sample:
             self._raise_invalid_output()
-        if (
+        if origin_sample == self._canonical_watermark_sample:
+            canonical_start_sample = origin_sample
+            pcm_start_sample = origin_sample
+            if self._forced_floor_sample != self._canonical_watermark_sample:
+                self._forced_floor_sample = None
+        elif (
             origin_sample <= self._canonical_watermark_sample
             and self._forced_floor_sample == self._canonical_watermark_sample
         ):
@@ -303,7 +333,10 @@ class BoundedSpeechPcmBuffer:
             if origin_sample < self._canonical_watermark_sample:
                 self._raise_invalid_output()
             canonical_start_sample = origin_sample
-            pcm_start_sample = max(0, origin_sample - VAD_PREPADDING_SAMPLES)
+            pcm_start_sample = max(
+                self._canonical_watermark_sample,
+                origin_sample - VAD_PREPADDING_SAMPLES,
+            )
             self._forced_floor_sample = None
         if pcm_start_sample < self.retained_start_sample:
             self._raise_invalid_output()
@@ -1000,23 +1033,7 @@ class Processor:
                     anonymous_speakers.append(None)
                     continue
                 check_cancellation()
-                canonical_start = segment.span.start_sample - segment.pcm_start_sample
-                canonical_end = segment.span.end_sample - segment.pcm_start_sample
-                canonical_pcm = np.ascontiguousarray(
-                    segment.pcm[canonical_start:canonical_end],
-                    dtype=np.int16,
-                )
-                if (
-                    canonical_pcm.ndim != 1
-                    or not canonical_pcm.flags.c_contiguous
-                    or len(canonical_pcm)
-                    != segment.span.end_sample - segment.span.start_sample
-                    or not len(canonical_pcm)
-                ):
-                    raise PipelineError(
-                        "invalid_model_output",
-                        "Speech segmenter returned an invalid segment",
-                    )
+                canonical_pcm = canonical_speech_pcm(segment)
                 windows = speaker_adapter.embed_windows(canonical_pcm)
                 durable_fence()
                 anonymous_speakers.append(speaker_state.assign_segment(windows))

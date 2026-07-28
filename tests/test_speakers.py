@@ -297,24 +297,35 @@ def test_finalized_cluster_dto_is_exact_and_empty_finalize_is_terminal() -> None
     assert state.speaker_count == 0
 
 
-def test_finalized_clusters_preserve_creation_order_and_recursive_centroids() -> None:
-    state = _state(threshold=0.5)
+def test_finalized_clusters_preserve_creation_order_and_cumulative_centroids() -> None:
+    state = _state(threshold=0.0)
+    probe_state = _state(threshold=0.0)
     source_a = _unit(1.0, 0.0)
-    source_b = _unit(0.0, 1.0)
-    update_a = _unit(0.8, 0.6)
-    validated_a = source_a.astype(np.float64)
-    validated_a /= np.linalg.norm(validated_a)
-    validated_update = update_a.astype(np.float64)
-    validated_update /= np.linalg.norm(validated_update)
-    expected_a = validated_a + validated_update
+    update_a_1 = _unit(0.0, 1.0)
+    update_a_2 = _unit(-0.6, 0.8)
+    source_b = _unit(-1.0, 0.0)
+    discriminator = _unit(-0.96, 0.28)
+    validated_a = tuple(
+        embedding.astype(np.float64) / np.linalg.norm(embedding.astype(np.float64))
+        for embedding in (source_a, update_a_1, update_a_2)
+    )
+    expected_a = sum(validated_a)
     expected_a /= np.linalg.norm(expected_a)
 
     assert state.assign_segment((_window(source_a),)) == "A"
+    assert state.assign_segment((_window(update_a_1),)) == "A"
+    assert state.assign_segment((_window(update_a_2),)) == "A"
+    assert probe_state.assign_segment((_window(source_a),)) == "A"
+    assert probe_state.assign_segment((_window(update_a_1),)) == "A"
+    assert probe_state.assign_segment((_window(update_a_2),)) == "A"
+    assert probe_state.assign_segment((_window(discriminator),)) == "A"
+    assert probe_state.speaker_count == 1
     assert state.assign_segment((_window(source_b),)) == "B"
-    assert state.assign_segment((_window(update_a),)) == "A"
     source_a[:] = np.nan
+    update_a_1[:] = np.nan
+    update_a_2[:] = np.nan
     source_b[:] = np.nan
-    update_a[:] = np.nan
+    discriminator[:] = np.nan
 
     clusters = state.finalize_clusters()
     assert type(clusters) is tuple
@@ -336,7 +347,7 @@ def test_finalized_clusters_preserve_creation_order_and_recursive_centroids() ->
     )
     np.testing.assert_allclose(
         clusters[1].centroid,
-        _unit(0.0, 1.0).astype(np.float64),
+        _unit(-1.0, 0.0).astype(np.float64),
         rtol=0.0,
         atol=1e-15,
     )

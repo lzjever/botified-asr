@@ -198,6 +198,53 @@ def test_complete_span_whose_prepad_underflows_ring_by_one_ms_fails_closed() -> 
     assert caught.value.code == "invalid_model_output"
 
 
+def test_adjacent_normal_spans_resume_at_trimmed_watermark_without_duplicate_pcm() -> None:
+    source = np.arange(3 * BLOCK_SAMPLES, dtype=np.int32).astype(np.int16)
+    buffer = _new_buffer()
+    first_span = pipeline.SpeechSpan(3_200, 8_960)
+    second_span = pipeline.SpeechSpan(8_960, 24_000)
+
+    first = _consume(
+        buffer,
+        _block(source, 0),
+        completed_spans=(first_span,),
+    )
+    assert _consume(buffer, _block(source, 9_600)) == ()
+    second = _consume(
+        buffer,
+        _block(source, 19_200),
+        completed_spans=(second_span,),
+    )
+
+    assert buffer.retained_start_sample == 8_960  # type: ignore[attr-defined]
+    assert [first[0].span, second[0].span] == [  # type: ignore[attr-defined]
+        first_span,
+        second_span,
+    ]
+    assert first[0].pcm_start_sample == 0  # type: ignore[attr-defined]
+    assert second[0].pcm_start_sample == first_span.end_sample  # type: ignore[attr-defined]
+    np.testing.assert_array_equal(first[0].pcm, source[:8_960])  # type: ignore[attr-defined]
+    np.testing.assert_array_equal(second[0].pcm, source[8_960:24_000])  # type: ignore[attr-defined]
+
+
+def test_short_gap_prepad_starts_at_previous_watermark_without_duplicate_pcm() -> None:
+    source = np.arange(BLOCK_SAMPLES, dtype=np.int32).astype(np.int16)
+    buffer = _new_buffer()
+    first_span = pipeline.SpeechSpan(3_200, 6_000)
+    second_span = pipeline.SpeechSpan(8_560, 9_000)
+
+    emitted = _consume(
+        buffer,
+        _block(source, 0),
+        completed_spans=(first_span, second_span),
+    )
+
+    assert [segment.span for segment in emitted] == [first_span, second_span]  # type: ignore[attr-defined]
+    assert [segment.pcm_start_sample for segment in emitted] == [0, 6_000]  # type: ignore[attr-defined]
+    np.testing.assert_array_equal(emitted[0].pcm, source[:6_000])  # type: ignore[attr-defined]
+    np.testing.assert_array_equal(emitted[1].pcm, source[6_000:9_000])  # type: ignore[attr-defined]
+
+
 def test_open_speech_at_exact_asr_cap_is_emitted_once_without_oversize() -> None:
     source = np.arange(pipeline.DIRECT_MAX_SAMPLES, dtype=np.int32).astype(np.int16)
     buffer = _new_buffer()

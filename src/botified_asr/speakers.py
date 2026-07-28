@@ -171,13 +171,12 @@ class AnonymousSpeakerState:
         if not isinstance(policy, AnonymousSpeakerPolicy):
             raise TypeError("anonymous speaker policy is invalid")
         self._policy = policy
-        self._centroids: list[np.ndarray] = []
-        self._window_counts: list[int] = []
+        self._centroid_sums: list[np.ndarray] = []
         self._finalized = False
 
     @property
     def speaker_count(self) -> int:
-        return len(self._centroids)
+        return len(self._centroid_sums)
 
     def assign_segment(
         self,
@@ -186,15 +185,13 @@ class AnonymousSpeakerState:
         if self._finalized:
             raise RuntimeError("anonymous speaker state is finalized")
         validated = _validate_windows(windows)
-        staged_centroids = [centroid.copy() for centroid in self._centroids]
-        staged_counts = list(self._window_counts)
-        votes = [0] * len(staged_centroids)
+        staged_sums = [centroid_sum.copy() for centroid_sum in self._centroid_sums]
+        votes = [0] * len(staged_sums)
 
         for window in validated:
             ordinal = _assign_window(
                 window.embedding,
-                staged_centroids,
-                staged_counts,
+                staged_sums,
                 policy=self._policy,
             )
             if ordinal == len(votes):
@@ -206,8 +203,7 @@ class AnonymousSpeakerState:
             key=lambda ordinal: (votes[ordinal], -ordinal),
         )
         label = _speaker_label(winning_ordinal)
-        self._centroids = staged_centroids
-        self._window_counts = staged_counts
+        self._centroid_sums = staged_sums
         return label
 
     def finalize_clusters(self) -> tuple[AnonymousSpeakerCluster, ...]:
@@ -216,9 +212,12 @@ class AnonymousSpeakerState:
         clusters = tuple(
             AnonymousSpeakerCluster(
                 label=_speaker_label(ordinal),
-                centroid=tuple(float(component) for component in centroid),
+                centroid=tuple(
+                    float(component)
+                    for component in _normalized_centroid(centroid_sum)
+                ),
             )
-            for ordinal, centroid in enumerate(self._centroids)
+            for ordinal, centroid_sum in enumerate(self._centroid_sums)
         )
         self._finalized = True
         return clusters
@@ -288,14 +287,14 @@ def _validate_windows(
 
 def _assign_window(
     embedding: np.ndarray,
-    centroids: list[np.ndarray],
-    window_counts: list[int],
+    centroid_sums: list[np.ndarray],
     *,
     policy: AnonymousSpeakerPolicy,
 ) -> int:
     nearest_ordinal: int | None = None
     nearest_similarity = -math.inf
-    for ordinal, centroid in enumerate(centroids):
+    for ordinal, centroid_sum in enumerate(centroid_sums):
+        centroid = _normalized_centroid(centroid_sum)
         similarity = float(np.dot(centroid, embedding))
         if not math.isfinite(similarity):
             _raise_invalid_output()
@@ -304,26 +303,28 @@ def _assign_window(
             nearest_similarity = similarity
 
     if nearest_ordinal is None or nearest_similarity < policy.threshold:
-        if len(centroids) >= policy.max_speakers:
+        if len(centroid_sums) >= policy.max_speakers:
             raise PipelineError(
                 "too_many_speakers",
                 "Audio contains too many anonymous speakers",
             )
-        centroids.append(embedding.copy())
-        window_counts.append(1)
-        return len(centroids) - 1
+        centroid_sums.append(embedding.copy())
+        return len(centroid_sums) - 1
 
-    count = window_counts[nearest_ordinal]
-    combined = centroids[nearest_ordinal] * count + embedding
-    combined_norm = float(np.linalg.norm(combined))
-    if not math.isfinite(combined_norm) or combined_norm <= 0.0:
-        _raise_invalid_output()
-    combined /= combined_norm
-    if not np.isfinite(combined).all():
-        _raise_invalid_output()
-    centroids[nearest_ordinal] = combined
-    window_counts[nearest_ordinal] = count + 1
+    combined = centroid_sums[nearest_ordinal] + embedding
+    _normalized_centroid(combined)
+    centroid_sums[nearest_ordinal] = combined
     return nearest_ordinal
+
+
+def _normalized_centroid(centroid_sum: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(centroid_sum))
+    if not math.isfinite(norm) or norm <= 0.0:
+        _raise_invalid_output()
+    centroid = centroid_sum / norm
+    if not np.isfinite(centroid).all():
+        _raise_invalid_output()
+    return centroid
 
 
 def _speaker_label(ordinal: int) -> str:

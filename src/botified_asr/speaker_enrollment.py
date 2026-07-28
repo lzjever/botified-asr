@@ -12,9 +12,9 @@ from botified_asr.contracts import MAX_AUDIO_SAMPLES
 from botified_asr.errors import PipelineError
 from botified_asr.pipeline import (
     AudioFrontend,
-    BufferedSpeechSegment,
     StreamingSpeechSegmenter,
     StreamingVadAdapter,
+    canonical_speech_pcm,
 )
 from botified_asr.speaker_profiles import (
     MAX_SPEAKER_SAMPLES,
@@ -231,7 +231,7 @@ class SpeakerEnrollmentProcessor:
                     "Speech segmenter returned an invalid result",
                 )
             for segment in emitted:
-                canonical_pcm = _canonical_speech_pcm(segment)
+                canonical_pcm = canonical_speech_pcm(segment)
                 speech_samples += len(canonical_pcm)
                 if speech_samples > MAX_SPEECH_SAMPLES:
                     raise PipelineError(
@@ -270,31 +270,6 @@ class SpeakerEnrollmentProcessor:
                         "speaker_samples_inconsistent",
                         "Speaker samples are inconsistent",
                     )
-
-
-def _canonical_speech_pcm(segment: object) -> np.ndarray:
-    if not isinstance(segment, BufferedSpeechSegment):
-        raise PipelineError(
-            "invalid_model_output",
-            "Speech segmenter returned an invalid segment",
-        )
-    canonical_start = segment.span.start_sample - segment.pcm_start_sample
-    canonical_end = segment.span.end_sample - segment.pcm_start_sample
-    canonical_pcm = np.ascontiguousarray(
-        segment.pcm[canonical_start:canonical_end],
-        dtype=np.int16,
-    )
-    if (
-        canonical_pcm.ndim != 1
-        or not canonical_pcm.flags.c_contiguous
-        or len(canonical_pcm) != segment.span.end_sample - segment.span.start_sample
-        or not len(canonical_pcm)
-    ):
-        raise PipelineError(
-            "invalid_model_output",
-            "Speech segmenter returned an invalid segment",
-        )
-    return canonical_pcm
 
 
 def _embedding_from_windows(
