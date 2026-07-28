@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import ssl
 from io import BytesIO
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request
 
 import pytest
@@ -46,11 +47,13 @@ class FakeResponse:
         final_url: str | None = None,
         max_return_bytes: int | None = None,
         fail_on_read: int | None = None,
+        read_exception: OSError | None = None,
     ) -> None:
         self._payload = payload
         self._offset = 0
         self._max_return_bytes = max_return_bytes
         self._fail_on_read = fail_on_read
+        self._read_exception = read_exception
         self.headers = headers or {}
         self.status = status
         self.final_url = final_url
@@ -76,7 +79,7 @@ class FakeResponse:
         assert size > 0
         self.read_sizes.append(size)
         if self._fail_on_read == len(self.read_sizes):
-            raise OSError("response read failed")
+            raise self._read_exception or OSError("response read failed")
         returned = size
         if self._max_return_bytes is not None:
             returned = min(returned, self._max_return_bytes)
@@ -180,51 +183,186 @@ def test_fetcher_streams_with_public_bounded_reads(
 
 @pytest.mark.parametrize(
     "mode",
+    ("open_error", "wrapped_open_error", "read_error", "short"),
+)
+def test_fetcher_retries_transient_artifact_failure_from_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    expected = b"abcd"
+    first_response: FakeResponse | None
+    if mode == "open_error":
+        first_response = None
+        first: FakeResponse | Exception = ConnectionResetError("connection reset")
+    elif mode == "wrapped_open_error":
+        first_response = None
+        first = URLError(ConnectionResetError("connection reset"))
+    elif mode == "read_error":
+        first_response = FakeResponse(
+            expected,
+            max_return_bytes=2,
+            fail_on_read=2,
+            read_exception=ConnectionResetError("connection reset"),
+        )
+        first = first_response
+    else:
+        first_response = FakeResponse(b"abc")
+        first = first_response
+    successful_response = FakeResponse(expected)
+    opener = FakeOpener(first, successful_response)
+    sleeps: list[float] = []
+    monkeypatch.setattr(huggingface_fetcher.time, "sleep", sleeps.append)
+    destination = tmp_path / "staging"
+    destination.mkdir()
+
+    huggingface_fetcher.HuggingFaceSnapshotFetcher(
+        opener=opener,
+        timeout_seconds=30,
+    ).fetch(_spec(_file("model.bin", expected)), destination)
+
+    assert len(opener.calls) == 2
+    assert sleeps == [1]
+    first_request, _first_timeout = opener.calls[0]
+    second_request, _second_timeout = opener.calls[1]
+    assert first_request is not second_request
+    assert first_request.full_url == second_request.full_url
+    assert (
+        first_request.get_header("Accept-encoding")
+        == second_request.get_header("Accept-encoding")
+        == "identity"
+    )
+    assert (destination / "model.bin").read_bytes() == expected
+    if first_response is not None:
+        assert first_response.closed
+    assert successful_response.closed
+
+
+def test_fetcher_opener_failure_never_removes_unowned_existing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = b"existing"
+    opener = FakeOpener(
+        ConnectionResetError("connection reset"),
+        ConnectionResetError("connection reset"),
+        ConnectionResetError("connection reset"),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(huggingface_fetcher.time, "sleep", sleeps.append)
+    destination = tmp_path / "staging"
+    destination.mkdir()
+    target = destination / "model.bin"
+    target.write_bytes(expected)
+
+    with pytest.raises(ConnectionResetError):
+        huggingface_fetcher.HuggingFaceSnapshotFetcher(
+            opener=opener,
+            timeout_seconds=30,
+        ).fetch(_spec(_file("model.bin", b"new")), destination)
+
+    assert len(opener.calls) == 3
+    assert sleeps == [1, 2]
+    assert target.read_bytes() == expected
+
+
+def test_fetcher_does_not_retry_ssl_certificate_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = b"abcd"
+    opener = FakeOpener(
+        ssl.SSLCertVerificationError("certificate verification failed"),
+        FakeResponse(expected),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(huggingface_fetcher.time, "sleep", sleeps.append)
+    destination = tmp_path / "staging"
+    destination.mkdir()
+
+    with pytest.raises(ssl.SSLCertVerificationError):
+        huggingface_fetcher.HuggingFaceSnapshotFetcher(
+            opener=opener,
+            timeout_seconds=30,
+        ).fetch(_spec(_file("model.bin", expected)), destination)
+
+    assert len(opener.calls) == 1
+    assert sleeps == []
+    assert not (destination / "model.bin").exists()
+
+
+def test_fetcher_stops_after_three_transient_failures_and_removes_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = b"abcd"
+    responses = (
+        FakeResponse(b"abc"),
+        FakeResponse(b"abc"),
+        FakeResponse(b"abc"),
+    )
+    opener = FakeOpener(*responses)
+    sleeps: list[float] = []
+    monkeypatch.setattr(huggingface_fetcher.time, "sleep", sleeps.append)
+    destination = tmp_path / "staging"
+    destination.mkdir()
+
+    with pytest.raises(OSError):
+        huggingface_fetcher.HuggingFaceSnapshotFetcher(
+            opener=opener,
+            timeout_seconds=30,
+        ).fetch(_spec(_file("model.bin", expected)), destination)
+
+    assert len(opener.calls) == 3
+    assert sleeps == [1, 2]
+    assert not (destination / "model.bin").exists()
+    assert all(response.closed for response in responses)
+
+
+@pytest.mark.parametrize(
+    "mode",
     (
-        "short",
         "oversize",
         "content_length",
-        "open_error",
-        "read_error",
         "bad_status",
         "insecure_final_url",
+        "http_error",
     ),
 )
-def test_fetcher_stops_after_first_transport_or_size_failure(
+def test_fetcher_does_not_retry_integrity_or_protocol_failure(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mode: str,
 ) -> None:
     expected = b"abcd"
     response: FakeResponse | None
-    if mode == "short":
-        response = FakeResponse(b"abc")
-        first: FakeResponse | Exception = response
-    elif mode == "oversize":
+    if mode == "oversize":
         response = FakeResponse(b"abcde")
-        first = response
+        first: FakeResponse | Exception = response
     elif mode == "content_length":
         response = FakeResponse(expected, headers={"Content-Length": "5"})
-        first = response
-    elif mode == "open_error":
-        response = None
-        first = OSError("open failed")
-    elif mode == "read_error":
-        response = FakeResponse(
-            expected,
-            max_return_bytes=2,
-            fail_on_read=2,
-        )
         first = response
     elif mode == "bad_status":
         response = FakeResponse(expected, status=503)
         first = response
-    else:
+    elif mode == "insecure_final_url":
         response = FakeResponse(
             expected,
             final_url="http://cdn.example.invalid/model.bin",
         )
         first = response
+    else:
+        response = None
+        first = HTTPError(
+            "https://huggingface.co/example/model",
+            503,
+            "Service Unavailable",
+            {},
+            BytesIO(),
+        )
     opener = FakeOpener(first, FakeResponse(b"x"))
+    sleeps: list[float] = []
+    monkeypatch.setattr(huggingface_fetcher.time, "sleep", sleeps.append)
     destination = tmp_path / "staging"
     destination.mkdir()
     spec = _spec(
@@ -239,6 +377,7 @@ def test_fetcher_stops_after_first_transport_or_size_failure(
         ).fetch(spec, destination)
 
     assert len(opener.calls) == 1
+    assert sleeps == []
     assert not (destination / "never-requested.bin").exists()
     downloaded = destination / "model.bin"
     if downloaded.exists():
