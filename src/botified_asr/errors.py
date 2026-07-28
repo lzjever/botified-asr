@@ -13,3 +13,11 @@ class PipelineNotReady(PipelineError):
             "pipeline_not_ready",
             "The requested audio pipeline is not ready",
         )
+
+
+class InferenceSaturated(PipelineError):
+    def __init__(self) -> None:
+        super().__init__(
+            "inference_saturated",
+            "Inference capacity is temporarily unavailable",
+        )

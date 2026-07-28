@@ -4,7 +4,7 @@ import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
 from botified_asr.canonical_options import parse_canonical_options_json
@@ -14,6 +14,7 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError
+from botified_asr.inference import inference_session
 from botified_asr.jobs import (
     DurableJob,
     JobCancellationRequestedError,
@@ -66,6 +67,97 @@ class TranscriptionProcessor(Protocol):
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
     ) -> ProcessorResult: ...
+
+
+class _LeastActiveProcessorSelector:
+    def __init__(
+        self,
+        processors: tuple[TranscriptionProcessor, ...],
+    ) -> None:
+        self._processors = processors
+        self._lock = threading.Lock()
+        self._active_sessions = [0] * len(processors)
+        self._cursor = 0
+
+    def acquire(self) -> tuple[int, TranscriptionProcessor]:
+        with self._lock:
+            minimum = min(self._active_sessions)
+            for offset in range(len(self._processors)):
+                index = (self._cursor + offset) % len(self._processors)
+                if self._active_sessions[index] == minimum:
+                    break
+            self._active_sessions[index] += 1
+            self._cursor = (index + 1) % len(self._processors)
+            return index, self._processors[index]
+
+    def release(self, index: int) -> None:
+        with self._lock:
+            if self._active_sessions[index] <= 0:
+                raise RuntimeError("processor selector release is unbalanced")
+            self._active_sessions[index] -= 1
+
+
+class _SessionTranscriptionProcessor:
+    def __init__(
+        self,
+        selector: _LeastActiveProcessorSelector,
+        category: Literal["sync", "async"],
+    ) -> None:
+        self._selector = selector
+        self._category = category
+
+    def process(
+        self,
+        input_path: Path,
+        canonical_options: CanonicalOptions,
+        cancellation: Cancellation,
+        progress_sink: ProgressSink,
+        segment_sink: SegmentSink,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
+    ) -> ProcessorResult:
+        index, processor = self._selector.acquire()
+        try:
+            with inference_session(self._category, cancellation):
+                return processor.process(
+                    input_path,
+                    canonical_options,
+                    cancellation,
+                    progress_sink,
+                    segment_sink,
+                    selected_speaker_snapshot=selected_speaker_snapshot,
+                    effective_max_audio_samples=effective_max_audio_samples,
+                    effective_direct_max_audio_samples=(
+                        effective_direct_max_audio_samples
+                    ),
+                )
+        finally:
+            self._selector.release(index)
+
+
+class TranscriptionProcessorPool:
+    def __init__(
+        self,
+        lane_processors: tuple[TranscriptionProcessor, ...],
+    ) -> None:
+        if type(lane_processors) is not tuple:
+            raise TypeError("lane processors must be a tuple")
+        if not lane_processors:
+            raise ValueError("lane processors must not be empty")
+        if any(
+            not callable(getattr(processor, "process", None))
+            for processor in lane_processors
+        ):
+            raise TypeError("each lane processor must have a callable process")
+        selector = _LeastActiveProcessorSelector(lane_processors)
+        self.sync_processor: TranscriptionProcessor = (
+            _SessionTranscriptionProcessor(selector, "sync")
+        )
+        self.async_processor: TranscriptionProcessor = (
+            _SessionTranscriptionProcessor(selector, "async")
+        )
 
 
 class ProjectionBuilder(Protocol):

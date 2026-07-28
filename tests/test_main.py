@@ -34,18 +34,30 @@ def install_fakes(
     fetcher = object()
     resolver = object()
     frontend = SimpleNamespace(probe=object())
-    asr = object()
-    vad = object()
-    speaker = object()
+    asrs = (object(), object())
+    vads = (object(), object())
+    speakers = (object(), object())
     speaker_embedding_policy = object()
-    bundle = SimpleNamespace(
-        asr=asr,
-        vad=vad,
-        speaker=speaker,
+    bundles = tuple(
+        SimpleNamespace(
+            asr=asr,
+            vad=vad,
+            speaker=speaker,
+        )
+        for asr, vad, speaker in zip(asrs, vads, speakers, strict=True)
+    )
+    model_pool = SimpleNamespace(
+        bundles=bundles,
         speaker_embedding_policy=speaker_embedding_policy,
         processor_fingerprint=PROCESSOR_FINGERPRINT,
     )
-    processor = object()
+    processors = (object(), object())
+    sync_processor = object()
+    async_processor = object()
+    processor_pool = SimpleNamespace(
+        sync_processor=sync_processor,
+        async_processor=async_processor,
+    )
     executor = SimpleNamespace(ready=False)
     executor_clocks: list[object] = []
     readiness = SimpleNamespace(
@@ -60,6 +72,7 @@ def install_fakes(
         runtime=SimpleNamespace(
             device="cpu",
             model_cache_dir=MODEL_CACHE_DIR,
+            inference_lanes=2,
         ),
         storage=SimpleNamespace(data_dir=DATA_DIR),
         limits=limits,
@@ -122,8 +135,8 @@ def install_fakes(
     )
     monkeypatch.setattr(
         main_module,
-        "load_funasr_model_bundle",
-        fake("load_funasr_model_bundle", bundle),
+        "load_funasr_model_pool",
+        fake("load_funasr_model_pool", model_pool),
         raising=False,
     )
     monkeypatch.setattr(
@@ -131,10 +144,21 @@ def install_fakes(
         "FfmpegAudioFrontend",
         fake("FfmpegAudioFrontend", frontend),
     )
+    next_processor = 0
+
+    def build_processor(*args: Any, **kwargs: Any) -> object:
+        nonlocal next_processor
+        events.append(("Processor", args, kwargs))
+        result = processors[next_processor]
+        next_processor += 1
+        return result
+
+    monkeypatch.setattr(main_module, "Processor", build_processor)
     monkeypatch.setattr(
         main_module,
-        "Processor",
-        fake("Processor", processor),
+        "TranscriptionProcessorPool",
+        fake("TranscriptionProcessorPool", processor_pool),
+        raising=False,
     )
 
     def generate_process_generation(*args: Any, **kwargs: Any) -> str:
@@ -213,11 +237,16 @@ def install_fakes(
         fetcher=fetcher,
         resolver=resolver,
         frontend=frontend,
-        asr=asr,
-        vad=vad,
-        speaker=speaker,
+        asrs=asrs,
+        vads=vads,
+        speakers=speakers,
         speaker_embedding_policy=speaker_embedding_policy,
-        processor=processor,
+        bundles=bundles,
+        model_pool=model_pool,
+        processors=processors,
+        processor_pool=processor_pool,
+        sync_processor=sync_processor,
+        async_processor=async_processor,
         executor=executor,
         executor_clocks=executor_clocks,
         readiness=readiness,
@@ -238,9 +267,9 @@ def expected_success_events(
             {},
         ),
         (
-            "load_funasr_model_bundle",
+            "load_funasr_model_pool",
             (scenario.resolver,),
-            {"device": "cpu"},
+            {"device": "cpu", "inference_lanes": 2},
         ),
         (
             "Storage",
@@ -250,18 +279,31 @@ def expected_success_events(
         ("FfmpegAudioFrontend", (), {}),
         (
             "Processor",
-            (scenario.frontend, scenario.asr),
+            (scenario.frontend, scenario.asrs[0]),
             {
-                "vad_adapter": scenario.vad,
+                "vad_adapter": scenario.vads[0],
                 "known_speaker_policy": None,
             },
+        ),
+        (
+            "Processor",
+            (scenario.frontend, scenario.asrs[1]),
+            {
+                "vad_adapter": scenario.vads[1],
+                "known_speaker_policy": None,
+            },
+        ),
+        (
+            "TranscriptionProcessorPool",
+            (scenario.processors,),
+            {},
         ),
         ("secrets.token_urlsafe", (), {}),
         (
             "JobExecutor",
             (
                 scenario.storage,
-                scenario.processor,
+                scenario.async_processor,
                 scenario.speaker_embedding_policy,
                 PROCESS_GENERATION,
             ),
@@ -279,7 +321,7 @@ def expected_success_events(
                 "api_key": API_KEY,
                 "readiness": scenario.readiness,
                 "storage": scenario.storage,
-                "processor": scenario.processor,
+                "processor": scenario.sync_processor,
                 "audio_prober": scenario.frontend.probe,
                 "processor_fingerprint": PROCESSOR_FINGERPRINT,
                 "speaker_embedding_policy": (scenario.speaker_embedding_policy),
@@ -315,13 +357,24 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
     ("failure_site", "expected_names"),
     [
         (
-            "load_funasr_model_bundle",
+            "Storage",
             [
                 "load_config",
                 "load_api_key",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
-                "load_funasr_model_bundle",
+                "load_funasr_model_pool",
+                "Storage",
+            ],
+        ),
+        (
+            "load_funasr_model_pool",
+            [
+                "load_config",
+                "load_api_key",
+                "HuggingFaceSnapshotFetcher",
+                "ModelArtifactResolver",
+                "load_funasr_model_pool",
             ],
         ),
         (
@@ -331,10 +384,12 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
                 "load_api_key",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
-                "load_funasr_model_bundle",
+                "load_funasr_model_pool",
                 "Storage",
                 "FfmpegAudioFrontend",
                 "Processor",
+                "Processor",
+                "TranscriptionProcessorPool",
                 "Readiness",
                 "create_app",
                 "storage.close",
@@ -347,10 +402,12 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
                 "load_api_key",
                 "HuggingFaceSnapshotFetcher",
                 "ModelArtifactResolver",
-                "load_funasr_model_bundle",
+                "load_funasr_model_pool",
                 "Storage",
                 "FfmpegAudioFrontend",
                 "Processor",
+                "Processor",
+                "TranscriptionProcessorPool",
                 "Readiness",
                 "create_app",
                 "uvicorn.run",
@@ -372,7 +429,7 @@ def test_main_propagates_startup_failures_and_closes_storage_once(
     assert caught.value is scenario.failure
     assert [name for name, _, _ in scenario.events] == expected_names
     assert scenario.storage.close_calls == (
-        0 if failure_site == "load_funasr_model_bundle" else 1
+        0 if failure_site in {"load_funasr_model_pool", "Storage"} else 1
     )
 
 

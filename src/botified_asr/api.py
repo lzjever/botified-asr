@@ -33,6 +33,7 @@ from botified_asr.composition import (
     prepare_sync_transcription,
 )
 from botified_asr.contracts import DIRECT_MAX_SAMPLES, CanonicalOptions
+from botified_asr.errors import InferenceSaturated
 from botified_asr.jobs import JobStatus, QueuedJobSpec
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
@@ -790,6 +791,13 @@ async def _prepare_while_watching_disconnect(
 def _processing_api_error(
     exc: AudioError | PipelineError | CanonicalArtifactError,
 ) -> ApiError:
+    if isinstance(exc, InferenceSaturated):
+        return ApiError(
+            429,
+            "inference_saturated",
+            "Inference capacity is temporarily unavailable",
+            error_type="rate_limit_error",
+        )
     if isinstance(exc, PipelineNotReady):
         return ApiError(
             503,

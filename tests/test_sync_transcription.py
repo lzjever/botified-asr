@@ -11,12 +11,15 @@ import numpy as np
 import pytest
 from starlette.testclient import TestClient
 
+from botified_asr import inference as inference_module
 from botified_asr import pipeline as pipeline_module
 from botified_asr import speaker_profiles, speakers
 from botified_asr.api import Readiness, create_app
-from botified_asr.audio import AudioError
+from botified_asr.audio import AudioError, Cancellation
+from botified_asr.composition import TranscriptionProcessorPool
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
+from botified_asr.inference import SerialInferenceLane, inference_session
 from botified_asr.pipeline import (
     PipelineError,
     PipelineNotReady,
@@ -323,6 +326,67 @@ def test_processing_and_prepare_errors_are_stable_redacted_and_clean(
     assert response.json()["error"]["param"] == param
     assert "/private" not in response.text
     assert "/usr/bin" not in response.text
+    _assert_no_resources(storage)
+
+
+def test_sync_inference_timeout_is_429_without_late_entry_or_resource_leak(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        inference_module,
+        "SYNC_INFERENCE_WAIT_SECONDS",
+        0.05,
+    )
+    lane = SerialInferenceLane()
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    processor_operation_entered = threading.Event()
+    delegate = SpyProcessor()
+
+    def hold_lane() -> None:
+        with inference_session("async", Cancellation()):
+            lane.invoke(
+                lambda: (
+                    holder_entered.set(),
+                    release_holder.wait(timeout=2),
+                )
+            )
+
+    class LaneProcessor:
+        def process(self, *args: Any, **kwargs: Any):
+            def process() -> object:
+                processor_operation_entered.set()
+                return delegate.process(*args, **kwargs)
+
+            return lane.invoke(process)
+
+    holder = threading.Thread(target=hold_lane, daemon=True)
+    holder.start()
+    assert holder_entered.wait(timeout=2)
+    processor = TranscriptionProcessorPool((LaneProcessor(),)).sync_processor
+    try:
+        with TestClient(_app(storage, processor)) as client:
+            response = client.post(
+                "/v1/audio/transcriptions",
+                headers={"Authorization": "Bearer test-secret"},
+                files=_files(),
+            )
+    finally:
+        release_holder.set()
+        holder.join(timeout=2)
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "error": {
+            "message": "Inference capacity is temporarily unavailable",
+            "type": "rate_limit_error",
+            "param": None,
+            "code": "inference_saturated",
+        }
+    }
+    assert not processor_operation_entered.is_set()
+    assert delegate.calls == 0
     _assert_no_resources(storage)
 
 

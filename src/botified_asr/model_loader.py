@@ -14,7 +14,7 @@ from botified_asr.funasr_adapter import (
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
 )
-from botified_asr.inference import SerialInferenceLane
+from botified_asr.inference import MAX_INFERENCE_LANES, SerialInferenceLane
 from botified_asr.model_artifacts import (
     CAMPLUS_SPEC,
     FSMN_VAD_SPEC,
@@ -61,6 +61,23 @@ class FunAsrModelBundle:
     processor_fingerprint: str
 
 
+@dataclass(frozen=True)
+class FunAsrModelPool:
+    bundles: tuple[FunAsrModelBundle, ...]
+
+    def __post_init__(self) -> None:
+        if not self.bundles:
+            raise ValueError("FunASR model pool must contain at least one bundle")
+
+    @property
+    def speaker_embedding_policy(self) -> SpeakerEmbeddingPolicy:
+        return self.bundles[0].speaker_embedding_policy
+
+    @property
+    def processor_fingerprint(self) -> str:
+        return self.bundles[0].processor_fingerprint
+
+
 def _build_processor_fingerprint(
     sensevoice_snapshot: ResolvedModelSnapshot,
     vad_snapshot: ResolvedModelSnapshot,
@@ -93,76 +110,31 @@ def load_funasr_model_bundle(
     device: str,
     auto_model_factory: AutoModelFactory | None = None,
 ) -> FunAsrModelBundle:
+    return load_funasr_model_pool(
+        resolver,
+        device=device,
+        inference_lanes=1,
+        auto_model_factory=auto_model_factory,
+    ).bundles[0]
+
+
+def load_funasr_model_pool(
+    resolver: _ModelArtifactResolver,
+    *,
+    device: str,
+    inference_lanes: int,
+    auto_model_factory: AutoModelFactory | None = None,
+) -> FunAsrModelPool:
+    if type(inference_lanes) is not int:
+        raise TypeError("inference lanes must be an integer")
+    if not 1 <= inference_lanes <= MAX_INFERENCE_LANES:
+        raise ValueError(
+            f"inference lanes must be from 1 to {MAX_INFERENCE_LANES}"
+        )
     sensevoice_snapshot = resolver.resolve(SENSEVOICE_SPEC)
     vad_snapshot = resolver.resolve(FSMN_VAD_SPEC)
     speaker_snapshot = resolver.resolve(CAMPLUS_SPEC)
 
-    try:
-        if auto_model_factory is None:
-            from funasr import AutoModel
-
-            auto_model_factory = AutoModel
-
-        sensevoice_root = str(sensevoice_snapshot.root.absolute())
-        vad_root = str(vad_snapshot.root.absolute())
-        speaker_root = str(speaker_snapshot.root.absolute())
-        asr_model = auto_model_factory(
-            model=sensevoice_root,
-            model_path=sensevoice_root,
-            hub="hf",
-            device=device,
-            disable_update=True,
-            trust_remote_code=False,
-            disable_pbar=True,
-            disable_log=True,
-        )
-        vad_model = auto_model_factory(
-            model=vad_root,
-            model_path=vad_root,
-            hub="hf",
-            device=device,
-            disable_update=True,
-            trust_remote_code=False,
-            disable_pbar=True,
-            disable_log=True,
-            max_single_segment_time=29_790,
-        )
-        speaker_model = auto_model_factory(
-            model=speaker_root,
-            model_path=speaker_root,
-            hub="hf",
-            device=device,
-            disable_update=True,
-            trust_remote_code=False,
-            disable_pbar=True,
-            disable_log=True,
-        )
-
-        inference_lane = SerialInferenceLane()
-        asr = FunAsrSenseVoiceBatchAdapter(
-            asr_model,
-            inference_lane=inference_lane,
-        )
-        vad = FunAsrStreamingVadAdapter(
-            vad_model,
-            inference_lane=inference_lane,
-        )
-        speaker = FunAsrCampPlusAdapter(
-            speaker_model,
-            inference_lane=inference_lane,
-        )
-        silence = np.zeros(_WARMUP_SAMPLES, dtype=np.int16)
-        asr.transcribe(silence)
-        markers = vad.generate(silence, cache={}, is_final=True)
-    except Exception as error:
-        raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE) from error
-
-    if markers:
-        raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE)
-    try:
-        speaker.embed_windows(np.zeros(24_000, dtype=np.int16))
-    except Exception as error:
-        raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE) from error
     speaker_embedding_policy = SpeakerEmbeddingPolicy(
         model_id=speaker_snapshot.spec.model_id,
         model_revision=speaker_snapshot.spec.revision,
@@ -182,10 +154,82 @@ def load_funasr_model_bundle(
         vad_snapshot,
         speaker_snapshot,
     )
-    return FunAsrModelBundle(
-        asr=asr,
-        vad=vad,
-        speaker=speaker,
-        speaker_embedding_policy=speaker_embedding_policy,
-        processor_fingerprint=processor_fingerprint,
+    bundles: list[FunAsrModelBundle] = []
+    try:
+        if auto_model_factory is None:
+            from funasr import AutoModel
+
+            auto_model_factory = AutoModel
+
+        sensevoice_root = str(sensevoice_snapshot.root.absolute())
+        vad_root = str(vad_snapshot.root.absolute())
+        speaker_root = str(speaker_snapshot.root.absolute())
+        for _ in range(inference_lanes):
+            asr_model = auto_model_factory(
+                model=sensevoice_root,
+                model_path=sensevoice_root,
+                hub="hf",
+                device=device,
+                disable_update=True,
+                trust_remote_code=False,
+                disable_pbar=True,
+                disable_log=True,
+            )
+            vad_model = auto_model_factory(
+                model=vad_root,
+                model_path=vad_root,
+                hub="hf",
+                device=device,
+                disable_update=True,
+                trust_remote_code=False,
+                disable_pbar=True,
+                disable_log=True,
+                max_single_segment_time=29_790,
+            )
+            speaker_model = auto_model_factory(
+                model=speaker_root,
+                model_path=speaker_root,
+                hub="hf",
+                device=device,
+                disable_update=True,
+                trust_remote_code=False,
+                disable_pbar=True,
+                disable_log=True,
+            )
+
+            inference_lane = SerialInferenceLane()
+            asr = FunAsrSenseVoiceBatchAdapter(
+                asr_model,
+                inference_lane=inference_lane,
+            )
+            vad = FunAsrStreamingVadAdapter(
+                vad_model,
+                inference_lane=inference_lane,
+            )
+            speaker = FunAsrCampPlusAdapter(
+                speaker_model,
+                inference_lane=inference_lane,
+            )
+            silence = np.zeros(_WARMUP_SAMPLES, dtype=np.int16)
+            asr.transcribe(silence)
+            markers = vad.generate(silence, cache={}, is_final=True)
+            if markers:
+                raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE)
+            speaker.embed_windows(np.zeros(24_000, dtype=np.int16))
+            bundles.append(
+                FunAsrModelBundle(
+                    asr=asr,
+                    vad=vad,
+                    speaker=speaker,
+                    speaker_embedding_policy=speaker_embedding_policy,
+                    processor_fingerprint=processor_fingerprint,
+                )
+            )
+    except FunAsrModelLoadError:
+        raise
+    except Exception as error:
+        raise FunAsrModelLoadError(_LOAD_ERROR_MESSAGE) from error
+
+    return FunAsrModelPool(
+        bundles=tuple(bundles),
     )

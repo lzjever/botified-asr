@@ -4,7 +4,7 @@ import builtins
 import importlib
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,7 @@ from botified_asr.funasr_adapter import (
     FunAsrSenseVoiceBatchAdapter,
     FunAsrStreamingVadAdapter,
 )
+from botified_asr.inference import MAX_INFERENCE_LANES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -96,19 +97,22 @@ class RecordingAutoModelFactory:
         *,
         construct_failure_role: str | None = None,
         warmup_failure_role: str | None = None,
+        warmup_failure_index: int | None = None,
         failure: Exception | None = None,
         vad_markers: list[list[int]] | None = None,
     ) -> None:
         self._events = events
         self._construct_failure_role = construct_failure_role
         self._warmup_failure_role = warmup_failure_role
+        self._warmup_failure_index = warmup_failure_index
         self._failure = failure
         self._vad_markers = vad_markers
         self.calls: list[dict[str, object]] = []
         self.models: list[RecordingAutoModel] = []
 
     def __call__(self, **kwargs: object) -> RecordingAutoModel:
-        role = ("asr", "vad", "speaker")[len(self.calls)]
+        index = len(self.calls)
+        role = ("asr", "vad", "speaker")[index % 3]
         self.calls.append(kwargs)
         self._events.append(("construct", role))
         if role == self._construct_failure_role:
@@ -117,7 +121,14 @@ class RecordingAutoModelFactory:
         model = RecordingAutoModel(
             role,
             self._events,
-            failure=self._failure if role == self._warmup_failure_role else None,
+            failure=(
+                self._failure
+                if (
+                    role == self._warmup_failure_role
+                    or index == self._warmup_failure_index
+                )
+                else None
+            ),
             vad_markers=self._vad_markers if role == "vad" else None,
         )
         self.models.append(model)
@@ -401,6 +412,140 @@ def test_loader_shares_one_lane_across_all_three_adapters(
     assert len(factory.models[0].calls) == 2
     assert len(factory.models[1].calls) == 2
     assert len(factory.models[2].calls) == 2
+
+
+def test_pool_resolves_once_and_builds_two_fully_independent_warmed_lanes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    snapshots = _snapshots(tmp_path)
+    resolver = RecordingResolver(snapshots, events)
+    factory = RecordingAutoModelFactory(events)
+    lanes: list[RecordingInferenceLane] = []
+
+    def lane_factory() -> RecordingInferenceLane:
+        lane = RecordingInferenceLane()
+        lanes.append(lane)
+        return lane
+
+    monkeypatch.setattr(loader, "SerialInferenceLane", lane_factory)
+
+    pool = loader.load_funasr_model_pool(
+        resolver,
+        device=DEVICE,
+        inference_lanes=MAX_INFERENCE_LANES,
+        auto_model_factory=factory,
+    )
+
+    assert isinstance(pool, loader.FunAsrModelPool)
+    assert resolver.calls == [
+        model_artifacts.SENSEVOICE_SPEC,
+        model_artifacts.FSMN_VAD_SPEC,
+        CAMPLUS_SPEC,
+    ]
+    assert len(pool.bundles) == 2
+    assert len(factory.models) == 6
+    assert len({id(model) for model in factory.models}) == 6
+    assert len(lanes) == 2
+    assert lanes[0] is not lanes[1]
+    for index, bundle in enumerate(pool.bundles):
+        lane = lanes[index]
+        assert bundle.asr._inference_lane is lane
+        assert bundle.vad._inference_lane is lane
+        assert bundle.speaker._inference_lane is lane
+        assert len(lane.operations) == 3
+        assert bundle.speaker_embedding_policy is pool.speaker_embedding_policy
+        assert bundle.processor_fingerprint == pool.processor_fingerprint
+    assert pool.processor_fingerprint == loader._build_processor_fingerprint(
+        snapshots[model_artifacts.SENSEVOICE_SPEC],
+        snapshots[model_artifacts.FSMN_VAD_SPEC],
+        snapshots[CAMPLUS_SPEC],
+    )
+    assert events == [
+        ("resolve", model_artifacts.SENSEVOICE_SPEC),
+        ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("resolve", CAMPLUS_SPEC),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("construct", "speaker"),
+        ("warmup", "asr"),
+        ("warmup", "vad"),
+        ("warmup", "speaker"),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("construct", "speaker"),
+        ("warmup", "asr"),
+        ("warmup", "vad"),
+        ("warmup", "speaker"),
+    ]
+
+
+def test_pool_stores_only_non_empty_bundles_and_derives_metadata(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    pool = loader.load_funasr_model_pool(
+        RecordingResolver(_snapshots(tmp_path), events),
+        device=DEVICE,
+        inference_lanes=MAX_INFERENCE_LANES,
+        auto_model_factory=RecordingAutoModelFactory(events),
+    )
+
+    assert tuple(field.name for field in fields(pool)) == ("bundles",)
+    assert vars(pool) == {"bundles": pool.bundles}
+    assert (
+        pool.speaker_embedding_policy
+        is pool.bundles[0].speaker_embedding_policy
+    )
+    assert pool.processor_fingerprint == pool.bundles[0].processor_fingerprint
+
+    with pytest.raises(ValueError, match="at least one bundle"):
+        loader.FunAsrModelPool(bundles=())
+
+
+def test_pool_later_lane_warmup_failure_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    loader = _model_loader()
+    events: list[object] = []
+    failure = RuntimeError("second lane ASR warmup failed")
+    factory = RecordingAutoModelFactory(
+        events,
+        warmup_failure_index=3,
+        failure=failure,
+    )
+    not_returned = object()
+    result: object = not_returned
+
+    with pytest.raises(loader.FunAsrModelLoadError) as caught:
+        result = loader.load_funasr_model_pool(
+            RecordingResolver(_snapshots(tmp_path), events),
+            device=DEVICE,
+            inference_lanes=MAX_INFERENCE_LANES,
+            auto_model_factory=factory,
+        )
+
+    assert result is not_returned
+    assert caught.value.__cause__ is failure
+    assert len(factory.models) == 6
+    assert events == [
+        ("resolve", model_artifacts.SENSEVOICE_SPEC),
+        ("resolve", model_artifacts.FSMN_VAD_SPEC),
+        ("resolve", CAMPLUS_SPEC),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("construct", "speaker"),
+        ("warmup", "asr"),
+        ("warmup", "vad"),
+        ("warmup", "speaker"),
+        ("construct", "asr"),
+        ("construct", "vad"),
+        ("construct", "speaker"),
+        ("warmup", "asr"),
+    ]
 
 
 def test_relative_snapshot_roots_are_passed_as_equal_absolute_model_paths() -> None:

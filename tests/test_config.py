@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from botified_asr.config import ConfigError, load_api_key, load_config
+from botified_asr.inference import MAX_INFERENCE_LANES
 
 
 MIB = 1024 * 1024
@@ -181,6 +182,46 @@ def test_cpu_runtime_normalizes_supported_device(
     path = write_config(tmp_path, f"runtime:\n  device: {device}\n")
 
     assert load_config(path).runtime.device == "cpu"
+
+
+@pytest.mark.parametrize("inference_lanes", (1, MAX_INFERENCE_LANES))
+def test_inference_lanes_defaults_to_one_and_accepts_supported_values(
+    tmp_path: Path,
+    inference_lanes: int,
+) -> None:
+    default = load_config(write_config(tmp_path, "{}\n"))
+    explicit = load_config(
+        write_config(
+            tmp_path,
+            f"runtime:\n  inference_lanes: {inference_lanes}\n",
+        )
+    )
+
+    assert default.runtime.inference_lanes == 1
+    assert explicit.runtime.inference_lanes == inference_lanes
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    ("true", "0", str(MAX_INFERENCE_LANES + 1), "1.0", "'1'"),
+)
+def test_inference_lanes_rejects_values_outside_exact_integer_one_to_two(
+    tmp_path: Path,
+    yaml_value: str,
+) -> None:
+    path = write_config(
+        tmp_path,
+        f"runtime:\n  inference_lanes: {yaml_value}\n",
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=(
+            rf"runtime\.inference_lanes.*integer from "
+            rf"1 to {MAX_INFERENCE_LANES}"
+        ),
+    ):
+        load_config(path)
 
 
 @pytest.mark.parametrize(

@@ -10,10 +10,11 @@ import uvicorn
 
 from botified_asr.api import Readiness, create_app
 from botified_asr.audio import FfmpegAudioFrontend
+from botified_asr.composition import TranscriptionProcessorPool
 from botified_asr.config import load_api_key, load_config
 from botified_asr.huggingface_fetcher import HuggingFaceSnapshotFetcher
 from botified_asr.model_artifacts import ModelArtifactResolver
-from botified_asr.model_loader import load_funasr_model_bundle
+from botified_asr.model_loader import load_funasr_model_pool
 from botified_asr.pipeline import Processor
 from botified_asr.runtime import JobExecutor
 from botified_asr.storage import Storage
@@ -34,27 +35,33 @@ def main() -> None:
             config.runtime.model_cache_dir,
             fetcher,
         )
-        bundle = load_funasr_model_bundle(
+        model_pool = load_funasr_model_pool(
             resolver,
             device=config.runtime.device,
+            inference_lanes=config.runtime.inference_lanes,
         )
         storage = Storage(
             config.storage.data_dir,
             config.limits,
-            current_processor_fingerprint=bundle.processor_fingerprint,
+            current_processor_fingerprint=model_pool.processor_fingerprint,
         )
         frontend = FfmpegAudioFrontend()
-        processor = Processor(
-            frontend,
-            bundle.asr,
-            vad_adapter=bundle.vad,
-            known_speaker_policy=None,
+        processor_pool = TranscriptionProcessorPool(
+            tuple(
+                Processor(
+                    frontend,
+                    bundle.asr,
+                    vad_adapter=bundle.vad,
+                    known_speaker_policy=None,
+                )
+                for bundle in model_pool.bundles
+            )
         )
         generation = secrets.token_urlsafe()
         job_executor = JobExecutor(
             storage,
-            processor,
-            bundle.speaker_embedding_policy,
+            processor_pool.async_processor,
+            model_pool.speaker_embedding_policy,
             generation,
             lambda: datetime.now(timezone.utc),
         )
@@ -67,10 +74,10 @@ def main() -> None:
             api_key=api_key,
             readiness=readiness,
             storage=storage,
-            processor=processor,
+            processor=processor_pool.sync_processor,
             audio_prober=frontend.probe,
-            processor_fingerprint=bundle.processor_fingerprint,
-            speaker_embedding_policy=bundle.speaker_embedding_policy,
+            processor_fingerprint=model_pool.processor_fingerprint,
+            speaker_embedding_policy=model_pool.speaker_embedding_policy,
             job_executor=job_executor,
             close_storage_on_shutdown=False,
         )

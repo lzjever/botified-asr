@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import wave
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ import numpy as np
 import pytest
 
 from botified_asr import composition as composition_module
+from botified_asr import inference as inference_module
 from botified_asr import jobs
 from botified_asr import pipeline as pipeline_module
 from botified_asr import speaker_profiles, speaker_snapshot, speakers
@@ -426,6 +429,371 @@ class ClaimedJobProcessor:
             ref,
             speaker_mapping,
         )
+
+
+class PoolRecordingProcessor:
+    def __init__(
+        self,
+        name: str,
+        lane: inference_module.SerialInferenceLane,
+        selected: list[str],
+        outcomes: list[object] | None = None,
+    ) -> None:
+        self.name = name
+        self.lane = lane
+        self.selected = selected
+        self.outcomes = [] if outcomes is None else outcomes
+        self.invocations: list[tuple[str, str]] = []
+
+    def process(
+        self,
+        _input_path: Path,
+        _options: CanonicalOptions,
+        _cancellation: Cancellation,
+        _progress: object,
+        _sink: object,
+        *,
+        selected_speaker_snapshot: SelectedSpeakerSnapshot,
+        effective_max_audio_samples: int,
+        effective_direct_max_audio_samples: int,
+    ) -> object:
+        assert selected_speaker_snapshot == SelectedSpeakerSnapshot(())
+        assert effective_max_audio_samples == 32_000
+        assert effective_direct_max_audio_samples == 16_000
+        self.selected.append(self.name)
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                return self.lane.invoke(lambda: (_ for _ in ()).throw(outcome))
+        for role in ("vad", "asr", "speaker"):
+            self.lane.invoke(
+                lambda role=role: self.invocations.append((self.name, role))
+            )
+        return self.name
+
+
+def _call_pooled_processor(
+    processor: object,
+    *,
+    cancellation: Cancellation | None = None,
+    input_path: Path = Path("input.ready"),
+) -> object:
+    return processor.process(  # type: ignore[attr-defined]
+        input_path,
+        _options(),
+        Cancellation() if cancellation is None else cancellation,
+        object(),
+        object(),
+        selected_speaker_snapshot=SelectedSpeakerSnapshot(()),
+        effective_max_audio_samples=32_000,
+        effective_direct_max_audio_samples=16_000,
+    )
+
+
+def _wait_for_pool_lane_waiters(
+    lane: inference_module.SerialInferenceLane,
+    category: str,
+    count: int,
+) -> None:
+    deadline = time.monotonic() + 2
+    waiters = getattr(lane, f"_{category}_waiters")
+    while len(waiters) != count:
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for inference waiter")
+        time.sleep(0.001)
+
+
+def test_processor_pool_sync_and_async_share_round_robin_and_request_affinity() -> (
+    None
+):
+    selected: list[str] = []
+    lanes = (
+        inference_module.SerialInferenceLane(),
+        inference_module.SerialInferenceLane(),
+    )
+    processors = tuple(
+        PoolRecordingProcessor(f"lane-{index}", lane, selected)
+        for index, lane in enumerate(lanes)
+    )
+    pool = composition_module.TranscriptionProcessorPool(processors)
+
+    assert _call_pooled_processor(pool.sync_processor) == "lane-0"
+    assert _call_pooled_processor(pool.async_processor) == "lane-1"
+    assert _call_pooled_processor(pool.async_processor) == "lane-0"
+    assert _call_pooled_processor(pool.sync_processor) == "lane-1"
+
+    assert selected == ["lane-0", "lane-1", "lane-0", "lane-1"]
+    for processor in processors:
+        assert processor.invocations == [
+            (processor.name, "vad"),
+            (processor.name, "asr"),
+            (processor.name, "speaker"),
+        ] * 2
+
+
+def test_processor_pool_routes_repeated_sync_to_idle_lane_not_busy_round_robin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        inference_module,
+        "SYNC_INFERENCE_WAIT_SECONDS",
+        0.05,
+    )
+    lanes = (
+        inference_module.SerialInferenceLane(),
+        inference_module.SerialInferenceLane(),
+    )
+    busy_entered = threading.Event()
+    release_busy = threading.Event()
+    selected: list[int] = []
+
+    class UnitProcessor:
+        def __init__(
+            self,
+            index: int,
+            lane: inference_module.SerialInferenceLane,
+        ) -> None:
+            self._index = index
+            self._lane = lane
+
+        def process(self, *_args: object, **_kwargs: object) -> int:
+            selected.append(self._index)
+            if self._index == 0:
+                return self._lane.invoke(
+                    lambda: (
+                        busy_entered.set(),
+                        release_busy.wait(timeout=2),
+                        self._index,
+                    )[-1]
+                )
+            return self._lane.invoke(lambda: self._index)
+
+    pool = composition_module.TranscriptionProcessorPool(
+        tuple(
+            UnitProcessor(index, lane)
+            for index, lane in enumerate(lanes)
+        )
+    )
+    async_errors: list[BaseException] = []
+
+    def run_long_async() -> None:
+        try:
+            _call_pooled_processor(pool.async_processor)
+        except BaseException as error:
+            async_errors.append(error)
+
+    long_async = threading.Thread(target=run_long_async, daemon=True)
+    long_async.start()
+    assert busy_entered.wait(timeout=1)
+    try:
+        assert _call_pooled_processor(pool.sync_processor) == 1
+        assert _call_pooled_processor(pool.sync_processor) == 1
+    finally:
+        release_busy.set()
+        long_async.join(timeout=1)
+
+    assert not long_async.is_alive()
+    assert selected == [0, 1, 1]
+    assert async_errors == []
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "error_type"),
+    (
+        ("delegate", RuntimeError),
+        ("cancellation", PipelineError),
+        ("session_enter", TypeError),
+    ),
+)
+def test_processor_pool_failed_session_releases_lane_load(
+    failure_mode: str,
+    error_type: type[BaseException],
+) -> None:
+    lanes = (
+        inference_module.SerialInferenceLane(),
+        inference_module.SerialInferenceLane(),
+    )
+    delegate_failure = RuntimeError("delegate failed")
+
+    class OutcomeProcessor:
+        def __init__(
+            self,
+            index: int,
+            lane: inference_module.SerialInferenceLane,
+        ) -> None:
+            self._index = index
+            self._lane = lane
+            self._failed = False
+
+        def process(self, *_args: object, **_kwargs: object) -> int:
+            if (
+                failure_mode == "delegate"
+                and self._index == 0
+                and not self._failed
+            ):
+                self._failed = True
+                return self._lane.invoke(
+                    lambda: (_ for _ in ()).throw(delegate_failure)
+                )
+            return self._lane.invoke(lambda: self._index)
+
+    pool = composition_module.TranscriptionProcessorPool(
+        tuple(
+            OutcomeProcessor(index, lane)
+            for index, lane in enumerate(lanes)
+        )
+    )
+    cancellation: object = Cancellation()
+    if failure_mode == "cancellation":
+        cancellation.cancel()  # type: ignore[union-attr]
+    elif failure_mode == "session_enter":
+        cancellation = object()
+
+    with pytest.raises(error_type):
+        _call_pooled_processor(
+            pool.sync_processor,
+            cancellation=cancellation,  # type: ignore[arg-type]
+        )
+
+    assert _call_pooled_processor(pool.async_processor) == 1
+    assert _call_pooled_processor(pool.async_processor) == 0
+    assert not hasattr(inference_module._session_local, "current")
+
+
+def test_processor_pool_facades_use_real_sync_async_lane_handoff() -> None:
+    lane = inference_module.SerialInferenceLane()
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    class LaneProcessor:
+        def process(self, input_path: Path, *_args: object, **_kwargs: object) -> str:
+            return lane.invoke(lambda: order.append(input_path.stem))
+
+    pool = composition_module.TranscriptionProcessorPool((LaneProcessor(),))
+
+    def hold_lane() -> None:
+        with inference_module.inference_session("async", Cancellation()):
+            lane.invoke(
+                lambda: (
+                    holder_entered.set(),
+                    release_holder.wait(timeout=2),
+                )
+            )
+
+    def run(processor: object, name: str) -> None:
+        try:
+            _call_pooled_processor(
+                processor,
+                input_path=Path(f"{name}.ready"),
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    holder = threading.Thread(target=hold_lane, daemon=True)
+    holder.start()
+    assert holder_entered.wait(timeout=1)
+    async_waiter = threading.Thread(
+        target=lambda: run(pool.async_processor, "async"),
+        daemon=True,
+    )
+    sync_waiter = threading.Thread(
+        target=lambda: run(pool.sync_processor, "sync"),
+        daemon=True,
+    )
+    try:
+        async_waiter.start()
+        _wait_for_pool_lane_waiters(lane, "async", 1)
+        sync_waiter.start()
+        _wait_for_pool_lane_waiters(lane, "sync", 1)
+        release_holder.set()
+    finally:
+        release_holder.set()
+        holder.join(timeout=1)
+        for waiter in (sync_waiter, async_waiter):
+            if waiter.ident is not None:
+                waiter.join(timeout=1)
+
+    assert not holder.is_alive()
+    assert not sync_waiter.is_alive()
+    assert not async_waiter.is_alive()
+    assert order == ["sync", "async"]
+    assert errors == []
+
+
+def test_processor_pool_does_not_hold_lane_while_delegate_decodes() -> None:
+    lane = inference_module.SerialInferenceLane()
+    first_decode_entered = threading.Event()
+    release_first_decode = threading.Event()
+    second_lane_entered = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+    operation_order: list[str] = []
+
+    class DecodeBlockingProcessor:
+        def process(self, *_args: object, **_kwargs: object) -> str:
+            nonlocal calls
+            with call_lock:
+                call_index = calls
+                calls += 1
+            if call_index == 0:
+                first_decode_entered.set()
+                assert release_first_decode.wait(timeout=2)
+                return lane.invoke(lambda: operation_order.append("first"))
+            return lane.invoke(
+                lambda: (
+                    operation_order.append("second"),
+                    second_lane_entered.set(),
+                )
+            )
+
+    pool = composition_module.TranscriptionProcessorPool(
+        (DecodeBlockingProcessor(),)
+    )
+    errors: list[BaseException] = []
+
+    def run(processor: object) -> None:
+        try:
+            _call_pooled_processor(processor)
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=lambda: run(pool.sync_processor), daemon=True)
+    second = threading.Thread(
+        target=lambda: run(pool.async_processor),
+        daemon=True,
+    )
+    first.start()
+    assert first_decode_entered.wait(timeout=1)
+    second.start()
+    try:
+        assert second_lane_entered.wait(timeout=1)
+    finally:
+        release_first_decode.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert operation_order == ["second", "first"]
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("processors", "error_type"),
+    (
+        ((), ValueError),
+        ([], TypeError),
+        ((object(),), TypeError),
+    ),
+)
+def test_processor_pool_rejects_invalid_lane_processors(
+    processors: object,
+    error_type: type[Exception],
+) -> None:
+    with pytest.raises(error_type):
+        composition_module.TranscriptionProcessorPool(processors)
 
 
 class RuntimeModel:

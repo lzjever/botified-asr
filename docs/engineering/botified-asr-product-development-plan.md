@@ -134,7 +134,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 接入 loader 前必须建立同等完整的 runtime manifest。
 - 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
-- SenseVoice、FSMN-VAD、CAM++ 各加载一个单例 adapter；所有 model call 共用唯一串行 inference lane。
+- `runtime.inference_lanes` 每个 lane 独立加载一套 SenseVoice、FSMN-VAD、CAM++ model bundle；同一 lane 的三个 adapter 共用该 lane 的串行执行器，跨 lane 不共享 model、adapter 或可变 cache。
 - 仓库代码采用 MIT license；每个 release 提供 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
 - SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由 installer 按固定来源/hash下载，不以技术便利替代许可判断。
 - SenseVoice 的预期 artifact hash 在 release 前必须由本地隔离下载重新计算并与 manifest 比较，不能只抄远端元数据。
@@ -673,7 +673,7 @@ SQLite 还保存 upload/job storage reservation、`cancel_requested`、attempt t
 - 一个进程内 worker 消费 SQLite queued jobs。
 - queued job 按 `created_at, id` 稳定 FIFO 选择。
 - 不增加第二个 broker。
-- sync 和 async 共用同一 inference admission semaphore。
+- sync 和 async 共用同一个 affinity-aware inference admission scheduler，其容量等于 `runtime.inference_lanes`；job worker 仍固定为一个，不以 worker 数代替推理并发。
 - 长 job 每处理一个有界 batch 释放 admission，让短同步请求有机会执行。
 - 一个 inference unit 同时限制总 speech 时长（默认 60 秒）、segment 数（默认 32）和 decoded wall-audio span（默认 5 分钟）。
 - inference lane 不跨 ffmpeg decode 持有；FSMN 每个 bounded PCM block 单独 acquire/release，SenseVoice/CAM++ 每个 unit acquire/release。
@@ -954,6 +954,7 @@ runtime:
   device: "auto"
   model_cache_dir: "~/.cache/botified-asr/models"
   max_speakers: 32
+  inference_lanes: 1
 
 storage:
   data_dir: "~/.local/share/botified-asr"
@@ -980,7 +981,7 @@ limits:
 - `storage.data_dir` 和 `runtime.model_cache_dir` 展开 `~` 后必须已经是 absolute path，再以 `resolve(strict=False)` 规范为 canonical path；两个 canonical root 相等、任一位于另一目录树内时均 fail closed。
 - model cache 只归 model artifact resolver 管理，不进入 `Storage` ledger、job data reservation、retention 或 orphan cleanup。
 - 未知字段 fail fast。
-- `limits` 下所有值均为正整数；`runtime.max_speakers` 是 `1..32` 的整数。
+- `limits` 下所有值均为正整数；`runtime.max_speakers` 是 `1..32` 的整数；`runtime.inference_lanes` 是默认值为 `1` 的 `1..2` 整数，`2` 是首版功能支持上限，不是任意目标硬件的容量承诺。
 - duration 必须满足 `direct_max_audio_duration_secs <= sync_max_audio_duration_secs <= max_audio_duration_secs <= 43200`。
 - upload bytes 必须满足 `sync_max_upload_bytes <= max_upload_bytes <= 1073741824`。
 - storage 必须满足 `max_job_storage_bytes >= ceil(max_upload_bytes / 8388608) * 8388608`，即将 `max_upload_bytes` 向上取整到 8 MiB reservation 量子的整数倍。
@@ -1108,8 +1109,8 @@ storage_leases(
 - 一个 ASGI 进程对应一个设备。
 - GPU 默认一个 Uvicorn worker，禁止通过 `--workers N` 在同一卡重复加载模型。
 - 阻塞模型调用必须离开 asyncio event loop。
-- 首版 inference lane 固定为 1，不提供配置项；FunASR adapter 的共享 kwargs/cache 不允许并发调用。
-- 未来并发推理必须每 lane 独立加载完整 model bundle，属于单独性能立项。
+- `runtime.inference_lanes` 默认值为 `1`，首版仅支持精确整数 `1..2`；它表示单进程内独立完整 model bundle 的数量，不是 Uvicorn worker 或 job worker 数。
+- 每个 inference lane 独立加载并 warmup 完整 SenseVoice、FSMN-VAD、CAM++ bundle，任一 lane 失败则启动 fail closed。模型内存随 lane 数近似线性增加，`2` 必须在目标环境验证 peak memory、启动时间和吞吐后再启用。
 - ffmpeg decode 可以与 GPU inference 重叠，但受有界 channel 控制。
 - API 上传、job worker 和模型推理不得各自建立无界队列。
 - 收到 SIGTERM 后立刻停止接收新请求和 claim job，写入 shutdown marker，并给当前工作 30 秒 grace 到达安全点。
@@ -1381,7 +1382,7 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 - 1、2、4 并发短请求；
 - 长 job 并行时短请求 p95。
 
-首版只测量单 lane 下的排队和吞吐，不用基准数据临时打开共享模型并发。
+首版分别测量 `inference_lanes=1` 和 `inference_lanes=2` 的排队、吞吐、启动时间与 peak host/device memory；`2` 只有通过目标环境验证后才启用，禁止为追逐单次基准临时共享 model 实例或增加 job worker。
 
 ## 18. 安全和隐私边界
 
