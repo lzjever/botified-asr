@@ -585,6 +585,10 @@ queued/running -> cancelled
 GET /v1/audio/transcriptions/{job_id}
 ```
 
+GET 仅以 HTTP 状态区分 job 是否仍 active：queued/running 返回 `202`，
+succeeded/failed/cancelled 返回 `200`。不存在的 job 和其他服务错误维持各自既有
+非 2xx 状态与 error envelope。
+
 queued/running：
 
 ```json
@@ -1277,7 +1281,23 @@ speaker-delete
 - wrapper 不保存 API Key。
 - wrapper 按 §10.3 的白名单规则读取 `client.env`，允许进程环境做显式覆盖。
 - helper 启动前检查 `curl`；缺少时返回稳定错误和安装前置条件，不擅自安装。
-- `job-wait` 有 timeout 和退避上限。
+- `job-wait JOB_ID TIMEOUT_SECONDS` 的 timeout 只接受十进制整数
+  `1..999999999`；否则返回 `invalid_timeout_seconds`，
+  `param=timeout_seconds`，exit 65。它把 Linux `/proc/uptime` 的第一个秒数字段
+  解析为厘秒整数，以 1 厘秒精度建立 monotonic deadline，允许最多 1 厘秒的
+  量化误差；文件缺失或字段畸形时返回 `job_wait_unavailable`，`param=null`，
+  exit 69。
+- `job-wait` 先立即 GET，此后按 `1/2/4/8` 秒退避且固定以 8 秒封顶，不加
+  jitter。每次传给 curl 或 sleep 的 duration 都取当时 remaining 与对应上限的
+  较小值，完成后重新读取时钟；不宣称进程调度绝不会 overshoot deadline。
+- curl exit 22 时原样输出服务响应并立即退出。curl exit 0 时，仅 HTTP `200`
+  是 terminal：原样输出 JSON 并 exit 0；HTTP `202` 是 active：丢弃该次 JSON，
+  重新读取 deadline 后才决定 timeout 或 sleep；包括 3xx 在内的其他最终 HTTP
+  状态返回 `unexpected_job_response`，`param=null`，exit 76。其他非 0/22 curl
+  状态立即返回 `curl_failed`；唯一例外是 curl exit 28 后重新读取时钟且
+  `now >= deadline`，此时返回 `job_wait_timeout`。
+- deadline 到期返回 `job_wait_timeout`，`param=timeout_seconds`，exit 75。
+  `job-wait` 只输出最终一次 JSON，不输出任何中间 active 响应。
 - 所有服务错误保留稳定 error code。
 - 输出 JSON 供 Agent 处理，不替 Agent 生成总结。
 

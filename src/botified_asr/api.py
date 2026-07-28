@@ -451,7 +451,8 @@ def create_app(
                             else job.total_samples / SAMPLE_RATE
                         ),
                     },
-                }
+                },
+                status_code=202,
             )
         if job.status is JobStatus.SUCCEEDED:
             try:

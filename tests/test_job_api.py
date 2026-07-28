@@ -950,7 +950,7 @@ def test_job_get_returns_exact_active_progress(
             headers=AUTH,
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json() == {
         "id": "7K3M9Q2W",
         "status": status.value,
@@ -985,7 +985,7 @@ def test_job_get_returns_null_total_until_decoder_eof(
             headers=AUTH,
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json() == {
         "id": "7K3M9Q2W",
         "status": status.value,
@@ -1032,6 +1032,7 @@ def test_job_get_returns_safe_failed_error(
             headers=AUTH,
         )
 
+    assert response.status_code == 200
     assert response.json() == {
         "id": "7K3M9Q2W",
         "status": "failed",
@@ -1049,6 +1050,7 @@ def test_job_get_returns_exact_cancelled_state() -> None:
             headers=AUTH,
         )
 
+    assert response.status_code == 200
     assert response.json() == {
         "id": "7K3M9Q2W",
         "status": "cancelled",
