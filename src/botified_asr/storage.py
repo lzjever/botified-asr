@@ -5064,6 +5064,18 @@ class Storage:
                 ).fetchone()[0]
             )
 
+    def probe_readiness(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                row = self._connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone()
+            except sqlite3.Error:
+                return False
+            return row is not None and row["version"] == SCHEMA_VERSION
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

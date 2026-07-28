@@ -197,22 +197,28 @@ def create_app(
                 error_type="authentication_error",
             )
 
+    def reject_not_ready() -> None:
+        raise ApiError(
+            503,
+            "service_not_ready",
+            "Service is not ready",
+            error_type="server_error",
+        )
+
     def require_ready() -> None:
         if job_executor is not None and not job_executor.ready:
             readiness.executor = False
         if not readiness.ready:
-            raise ApiError(
-                503,
-                "service_not_ready",
-                "Service is not ready",
-                error_type="server_error",
-            )
+            reject_not_ready()
 
     async def live(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
 
     async def ready(request: Request) -> Response:
         authenticate(request)
+        require_ready()
+        if not await run_in_threadpool(storage.probe_readiness):
+            reject_not_ready()
         require_ready()
         return JSONResponse({"status": "ready"})
 

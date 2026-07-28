@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 from pathlib import Path
 from typing import Callable, Iterable
@@ -187,14 +188,100 @@ def test_malformed_authorization_is_stable_and_redacted(
     assert "test-secret" not in json.dumps(body)
 
 
-def test_ready_is_503_until_database_models_and_executor_are_ready(
+@pytest.mark.parametrize(
+    "readiness",
+    [
+        Readiness(False, True, True),
+        Readiness(True, False, True),
+    ],
+)
+def test_ready_rejects_known_not_ready_state_before_database_probe(
     storage: Storage,
+    readiness: Readiness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with app_client(storage, readiness=Readiness(True, False, True)) as client:
+    probe_calls = 0
+
+    def probe_readiness() -> bool:
+        nonlocal probe_calls
+        probe_calls += 1
+        return True
+
+    monkeypatch.setattr(storage, "probe_readiness", probe_readiness)
+    with app_client(storage, readiness=readiness) as client:
         response = client.get("/health/ready", headers=AUTH)
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "service_not_ready"
+    assert readiness.ready is False
+    assert probe_calls == 0
+
+
+def test_ready_rechecks_state_after_database_probe(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readiness = Readiness(True, True, True)
+
+    def probe_readiness() -> bool:
+        readiness.models = False
+        return True
+
+    monkeypatch.setattr(storage, "probe_readiness", probe_readiness)
+    with app_client(storage, readiness=readiness) as client:
+        response = client.get("/health/ready", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_not_ready"
+
+
+def test_ready_reprobes_sqlite_while_live_ignores_closed_database(
+    storage: Storage,
+) -> None:
+    with app_client(storage) as client:
+        assert client.get("/health/ready", headers=AUTH).status_code == 200
+        storage.close()
+
+        unavailable = client.get("/health/ready", headers=AUTH)
+        live = client.get("/health/live")
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        "error": {
+            "message": "Service is not ready",
+            "type": "server_error",
+            "param": None,
+            "code": "service_not_ready",
+        }
+    }
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+
+
+def test_ready_maps_sqlite_probe_error_to_exact_not_ready_response(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedConnection:
+        def execute(self, _statement: str):
+            raise sqlite3.OperationalError("private database failure")
+
+    monkeypatch.setattr(storage, "_connection", FailedConnection())
+
+    assert storage.probe_readiness() is False
+    with app_client(storage) as client:
+        response = client.get("/health/ready", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "message": "Service is not ready",
+            "type": "server_error",
+            "param": None,
+            "code": "service_not_ready",
+        }
+    }
+    assert b"private database failure" not in response.content
 
 
 def test_job_executor_lifespan_drives_dynamic_readiness_and_closes_in_order(
@@ -205,6 +292,9 @@ def test_job_executor_lifespan_drives_dynamic_readiness_and_closes_in_order(
         def delete_next_expired_terminal_job(self, _sweep_at) -> bool:
             events.append("storage.sweep")
             return False
+
+        def probe_readiness(self) -> bool:
+            return True
 
         def close(self) -> None:
             events.append("storage.close")

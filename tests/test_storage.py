@@ -1113,6 +1113,31 @@ def test_unknown_schema_version_fails_closed(tmp_path: Path) -> None:
     assert sentinel.read_bytes() == b"keep"
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM schema_meta WHERE singleton = 1",
+        "UPDATE schema_meta SET version = 99 WHERE singleton = 1",
+    ],
+)
+def test_readiness_probe_rejects_missing_or_wrong_schema_version(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    try:
+        storage._connection.execute(statement)
+
+        assert storage.probe_readiness() is False
+    finally:
+        storage.close()
+
+
 def test_failed_v1_migration_rolls_back_structure_and_version(
     tmp_path: Path,
 ) -> None:
