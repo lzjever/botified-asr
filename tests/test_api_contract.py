@@ -18,6 +18,7 @@ from botified_asr.api import (
     canonicalize_options,
     create_app,
 )
+from botified_asr.audio import MediaProbe
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import CanonicalOptions
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
@@ -63,11 +64,13 @@ class FakeProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ):
         del (
             selected_speaker_snapshot,
             effective_max_audio_samples,
             effective_direct_max_audio_samples,
+            media_probe,
         )
         text = self.callback(input_path, options)
         processed_samples = 1 if text else 0
@@ -124,7 +127,7 @@ def app_client(
         readiness=readiness or Readiness(True, True, True),
         storage=storage,
         processor=processor or FakeProcessor(),
-        audio_prober=lambda _path, _cancellation: None,
+        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "wav"),
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
@@ -624,7 +627,7 @@ def test_success_is_independent_of_every_byte_boundary(storage: Storage) -> None
                 seen.append((path.read_bytes(), options)) or "same"
             )
         ),
-        audio_prober=lambda _path, _cancellation: None,
+        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "wav"),
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
@@ -866,7 +869,7 @@ def test_large_asgi_event_is_sliced_before_storage_append(tmp_path: Path) -> Non
         processor=FakeProcessor(
             lambda _path, _options: "ok"
         ),
-        audio_prober=lambda _path, _cancellation: None,
+        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "wav"),
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,

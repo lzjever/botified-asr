@@ -810,6 +810,7 @@ class Processor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> ProcessorResult:
         failed = True
         blocks: DecodedBlocks | None = None
@@ -868,7 +869,11 @@ class Processor:
                 )
             if cancellation.cancelled:
                 raise PipelineError("cancelled", "Audio processing was cancelled")
-            probe = self._frontend.probe(input_path, cancellation)
+            probe = (
+                self._frontend.probe(input_path, cancellation)
+                if media_probe is None
+                else media_probe
+            )
             blocks = self._frontend.decode(input_path, probe, cancellation)
             if is_vad:
                 vad_adapter = self._vad_adapter

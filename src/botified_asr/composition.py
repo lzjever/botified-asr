@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
-from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
+from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation, MediaProbe
 from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.contracts import (
     DIRECT_MAX_SAMPLES,
@@ -66,6 +66,7 @@ class TranscriptionProcessor(Protocol):
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> ProcessorResult: ...
 
 
@@ -117,6 +118,7 @@ class _SessionTranscriptionProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> ProcessorResult:
         index, processor = self._selector.acquire()
         try:
@@ -132,6 +134,7 @@ class _SessionTranscriptionProcessor:
                     effective_direct_max_audio_samples=(
                         effective_direct_max_audio_samples
                     ),
+                    media_probe=media_probe,
                 )
         finally:
             self._selector.release(index)
@@ -396,6 +399,7 @@ def prepare_sync_transcription(
     projector: ProjectionBuilder | None = None,
     *,
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    media_probe: MediaProbe,
 ) -> PreparedSyncResponse:
     effective_max_audio_samples = (
         storage.limits.max_audio_duration_secs * SAMPLE_RATE
@@ -429,6 +433,7 @@ def prepare_sync_transcription(
             selected_speaker_snapshot=selected_speaker_snapshot,
             effective_max_audio_samples=effective_max_audio_samples,
             effective_direct_max_audio_samples=effective_direct_max_audio_samples,
+            media_probe=media_probe,
         )
         speaker_mapping = _validate_processor_result(result, writer)
         total_samples = progress.finish()

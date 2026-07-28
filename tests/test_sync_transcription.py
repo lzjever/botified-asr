@@ -15,7 +15,7 @@ from botified_asr import inference as inference_module
 from botified_asr import pipeline as pipeline_module
 from botified_asr import speaker_profiles, speakers
 from botified_asr.api import Readiness, create_app
-from botified_asr.audio import AudioError, Cancellation
+from botified_asr.audio import AudioError, Cancellation, MediaProbe
 from botified_asr.composition import TranscriptionProcessorPool
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
@@ -86,6 +86,7 @@ class SpyProcessor:
         self.finalized_ref: ArtifactRef | None = None
         self.finished = threading.Event()
         self.effective_caps: list[tuple[int, int]] = []
+        self.media_probes: list[MediaProbe | None] = []
 
     def process(
         self,
@@ -98,6 +99,7 @@ class SpyProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ):
         del selected_speaker_snapshot
         self.calls += 1
@@ -107,6 +109,7 @@ class SpyProcessor:
                 effective_direct_max_audio_samples,
             )
         )
+        self.media_probes.append(media_probe)
         self.started.set()
         self.cancellation = cancellation
         self.input_bytes = input_path.read_bytes()
@@ -214,13 +217,46 @@ def storage(tmp_path: Path) -> Storage:
     value.close()
 
 
-def _app(storage: Storage, processor: Any):
+@pytest.fixture
+def preflight_storage(tmp_path: Path) -> Storage:
+    value = Storage(
+        tmp_path / "preflight",
+        LimitsConfig(
+            max_upload_bytes=1024,
+            max_audio_duration_secs=90,
+            direct_max_audio_duration_secs=7,
+            sync_max_upload_bytes=512,
+            sync_max_audio_duration_secs=60,
+            max_job_storage_bytes=2 * RESERVATION_QUANTUM,
+            min_filesystem_free_bytes=1,
+        ),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    yield value
+    value.close()
+
+
+def _app(
+    storage: Storage,
+    processor: Any,
+    *,
+    audio_prober: Any = None,
+):
+    if audio_prober is None:
+        def default_audio_prober(
+            _path: Path,
+            _cancellation: Cancellation,
+        ) -> MediaProbe:
+            return MediaProbe(1.0, "wav")
+
+        audio_prober = default_audio_prober
     return create_app(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=processor,
-        audio_prober=lambda _path, _cancellation: None,
+        audio_prober=audio_prober,
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=_speaker_embedding_policy(),
         close_storage_on_shutdown=False,
@@ -245,6 +281,153 @@ def _known_files() -> dict[str, tuple]:
     }
 
 
+@pytest.mark.parametrize(
+    ("duration", "chunking", "status", "code", "param"),
+    [
+        (91, "auto", 413, "audio_too_long", "file"),
+        (
+            61,
+            None,
+            422,
+            "long_audio_requires_vad",
+            "chunking_strategy",
+        ),
+        (61, "auto", 422, "async_required", "file"),
+    ],
+)
+def test_sync_probe_preflight_has_exact_error_priority_and_cleans(
+    preflight_storage: Storage,
+    duration: float,
+    chunking: str | None,
+    status: int,
+    code: str,
+    param: str,
+) -> None:
+    prober = RecordingProber(duration)
+    processor = SpyProcessor()
+    files = _files()
+    if chunking is not None:
+        files["chunking_strategy"] = (None, chunking)
+
+    with TestClient(
+        _app(
+            preflight_storage,
+            processor,
+            audio_prober=prober,
+        )
+    ) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=files,
+        )
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["param"] == param
+    assert len(prober.calls) == 1
+    assert prober.calls[0][0].suffix == ".ready"
+    assert prober.calls[0][2] == b"stored-input"
+    assert processor.calls == 0
+    _assert_no_resources(preflight_storage)
+
+
+def test_sync_duration_equal_to_the_limit_reuses_one_probe(
+    preflight_storage: Storage,
+) -> None:
+    prober = RecordingProber(60)
+    processor = SpyProcessor()
+    pooled_processor = TranscriptionProcessorPool(
+        (processor,)
+    ).sync_processor
+    files = _files()
+    files["chunking_strategy"] = (None, "auto")
+
+    with TestClient(
+        _app(
+            preflight_storage,
+            pooled_processor,
+            audio_prober=prober,
+        )
+    ) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=files,
+        )
+
+    assert response.status_code == 200
+    assert len(prober.calls) == 1
+    assert processor.calls == 1
+    assert processor.media_probes == [prober.probe]
+    assert processor.media_probes[0] is prober.probe
+    assert processor.cancellation is prober.calls[0][1]
+    assert processor.effective_caps == [(90 * 16_000, 7 * 16_000)]
+    _assert_no_resources(preflight_storage)
+
+
+def test_sync_probe_error_is_redacted_and_cleans_before_processing(
+    preflight_storage: Storage,
+) -> None:
+    prober = RecordingProber(
+        error=AudioError(
+            "audio_probe_timeout",
+            "private probe path /secret/audio.wav",
+        )
+    )
+    processor = SpyProcessor()
+
+    with TestClient(
+        _app(
+            preflight_storage,
+            processor,
+            audio_prober=prober,
+        ),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=_files(),
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "audio_probe_timeout"
+    assert "/secret" not in response.text
+    assert len(prober.calls) == 1
+    assert processor.calls == 0
+    _assert_no_resources(preflight_storage)
+
+
+def test_sync_upload_byte_error_precedes_probe(
+    preflight_storage: Storage,
+) -> None:
+    prober = RecordingProber()
+    processor = SpyProcessor()
+
+    with TestClient(
+        _app(
+            preflight_storage,
+            processor,
+            audio_prober=prober,
+        )
+    ) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files={
+                "file": ("audio.wav", b"x" * 513),
+                "model": (None, "sensevoice"),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "async_required"
+    assert prober.calls == []
+    assert processor.calls == 0
+    _assert_no_resources(preflight_storage)
+
+
 def _assert_no_resources(storage: Storage) -> None:
     assert storage.total_reserved_bytes() == 0
     assert not list(storage.staging_dir.iterdir())
@@ -253,6 +436,37 @@ def _assert_no_resources(storage: Storage) -> None:
         storage._connection.execute("SELECT COUNT(*) FROM storage_leases").fetchone()[0]
         == 0
     )
+
+
+class RecordingProber:
+    def __init__(
+        self,
+        duration: float = 1.0,
+        *,
+        error: AudioError | None = None,
+        block_until_cancelled: bool = False,
+    ) -> None:
+        self.probe = MediaProbe(duration, "wav")
+        self.error = error
+        self.block_until_cancelled = block_until_cancelled
+        self.calls: list[tuple[Path, Cancellation, bytes]] = []
+        self.entered = threading.Event()
+        self.cancelled = threading.Event()
+
+    def __call__(
+        self,
+        path: Path,
+        cancellation: Cancellation,
+    ) -> MediaProbe:
+        self.calls.append((path, cancellation, path.read_bytes()))
+        self.entered.set()
+        if self.block_until_cancelled:
+            assert cancellation._event.wait(timeout=2)
+            self.cancelled.set()
+            raise AudioError("audio_probe_timeout", "private cancelled probe")
+        if self.error is not None:
+            raise self.error
+        return self.probe
 
 
 @pytest.mark.parametrize(
@@ -722,6 +936,51 @@ def test_processing_disconnect_cancels_and_waits_for_cleanup(
 
     asyncio.run(run())
     _assert_no_resources(storage)
+
+
+def test_blocking_sync_probe_disconnect_cancels_and_cleans(
+    preflight_storage: Storage,
+) -> None:
+    async def run() -> None:
+        boundary, body = _multipart_body()
+        prober = RecordingProber(block_until_cancelled=True)
+        processor = SpyProcessor()
+        app = _app(
+            preflight_storage,
+            processor,
+            audio_prober=prober,
+        )
+        events = [
+            {
+                "type": "http.request",
+                "body": body,
+                "more_body": False,
+            },
+            {"type": "http.disconnect"},
+        ]
+        sent: list[dict[str, object]] = []
+
+        async def receive() -> dict[str, object]:
+            return events.pop(0)
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        try:
+            await app(_scope(boundary), receive, send)
+        except anyio.get_cancelled_exc_class():
+            pass
+        else:
+            pytest.fail("probe disconnect did not propagate cancellation")
+        assert prober.entered.is_set()
+        assert prober.cancelled.is_set()
+        assert len(prober.calls) == 1
+        assert prober.calls[0][1].cancelled
+        assert processor.calls == 0
+        assert sent == []
+
+    asyncio.run(run())
+    _assert_no_resources(preflight_storage)
 
 
 def test_processing_task_cancellation_triggers_token_and_waits(

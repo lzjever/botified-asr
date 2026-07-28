@@ -9,6 +9,7 @@ from starlette.testclient import TestClient
 
 from botified_asr import pipeline as pipeline_module, speakers
 from botified_asr.api import Readiness, create_app
+from botified_asr.audio import MediaProbe
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.pipeline import RichAnnotations, SegmentRecord
 from botified_asr.speaker_matching import SpeakerLabelMapping
@@ -31,11 +32,13 @@ class SdkProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ):
         del (
             selected_speaker_snapshot,
             effective_max_audio_samples,
             effective_direct_max_audio_samples,
+            media_probe,
         )
         sink.append(
             SegmentRecord(
@@ -71,7 +74,7 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=SdkProcessor(),
-        audio_prober=lambda _path, _cancellation: None,
+        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "wav"),
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=speakers.SpeakerEmbeddingPolicy(
             model_id="funasr/campplus",

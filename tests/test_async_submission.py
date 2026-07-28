@@ -241,6 +241,26 @@ def test_async_post_returns_exact_202_and_retains_queued_input(
     assert wake_calls == 1
 
 
+def test_async_duration_above_the_sync_limit_is_still_queued(
+    storage: Storage,
+) -> None:
+    prober = RecordingProber(duration=61)
+    client, processor = app_client(storage, prober)
+
+    with client:
+        response = post_async(
+            client,
+            extra_fields=(("chunking_strategy", "auto"),),
+        )
+
+    assert response.status_code == 202
+    assert_probe_only(prober, processor)
+    queued = storage.get_visible_job(response.json()["id"])
+    assert queued is not None
+    storage.delete_or_cancel_job(queued.id, CREATED_AT)
+    storage.cleanup_cancelled_job_input(queued.id)
+
+
 @pytest.mark.parametrize(
     ("prober", "extra_fields", "status", "code"),
     (

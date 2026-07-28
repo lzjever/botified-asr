@@ -174,6 +174,7 @@ class FakeFrontend:
         self.decoder = decoder
         self.probe_calls: list[Path] = []
         self.decode_calls: list[Path] = []
+        self.decode_probes: list[MediaProbe] = []
 
     def probe(self, input_path: Path, cancellation: Cancellation) -> MediaProbe:
         self.probe_calls.append(input_path)
@@ -186,6 +187,7 @@ class FakeFrontend:
         cancellation: Cancellation,
     ) -> FakeDecoder:
         self.decode_calls.append(input_path)
+        self.decode_probes.append(probe)
         return self.decoder
 
 
@@ -290,6 +292,34 @@ def test_processor_requires_per_job_effective_sample_caps() -> None:
         parameter = parameters[name]
         assert parameter.kind is Parameter.KEYWORD_ONLY
         assert parameter.default is Parameter.empty
+
+
+def test_processor_reuses_the_request_local_media_probe() -> None:
+    decoder = FakeDecoder([])
+    frontend = FakeFrontend(decoder)
+    media_probe = MediaProbe(60.0, "wav")
+    sink = RecordingSink()
+
+    result = Processor(
+        frontend,
+        FakeAdapter(),
+        known_speaker_policy=None,
+    ).process(
+        Path("/internal/input.ready"),
+        options(),
+        Cancellation(),
+        RecordingProgress(),
+        sink,
+        effective_max_audio_samples=MAX_AUDIO_SAMPLES,
+        effective_direct_max_audio_samples=DIRECT_MAX_SAMPLES,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        media_probe=media_probe,
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert frontend.probe_calls == []
+    assert frontend.decode_probes == [media_probe]
+    assert frontend.decode_probes[0] is media_probe
 
 
 @pytest.mark.parametrize(

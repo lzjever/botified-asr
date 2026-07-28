@@ -18,7 +18,12 @@ from botified_asr import inference as inference_module
 from botified_asr import jobs
 from botified_asr import pipeline as pipeline_module
 from botified_asr import speaker_profiles, speaker_snapshot, speakers
-from botified_asr.audio import AudioError, Cancellation, FfmpegAudioFrontend
+from botified_asr.audio import (
+    AudioError,
+    Cancellation,
+    FfmpegAudioFrontend,
+    MediaProbe,
+)
 from botified_asr.canonical_options import serialize_canonical_options
 from botified_asr.config import LimitsConfig, RESERVATION_QUANTUM
 from botified_asr.contracts import MAX_AUDIO_SAMPLES, CanonicalOptions
@@ -262,7 +267,9 @@ class EmittingProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> object:
+        assert media_probe is not None
         self.calls += 1
         self.selected_snapshots.append(selected_speaker_snapshot)
         self.effective_caps.append(
@@ -364,7 +371,9 @@ class ClaimedJobProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> object:
+        assert media_probe is None
         self.calls += 1
         self.input_paths.append(input_path)
         self.input_payloads.append(input_path.read_bytes())
@@ -456,7 +465,9 @@ class PoolRecordingProcessor:
         selected_speaker_snapshot: SelectedSpeakerSnapshot,
         effective_max_audio_samples: int,
         effective_direct_max_audio_samples: int,
+        media_probe: MediaProbe | None = None,
     ) -> object:
+        assert media_probe is None
         assert selected_speaker_snapshot == SelectedSpeakerSnapshot(())
         assert effective_max_audio_samples == 32_000
         assert effective_direct_max_audio_samples == 16_000
@@ -911,6 +922,13 @@ def test_sync_composition_protocol_and_current_effective_caps(
         "effective_direct_max_audio_samples",
     ):
         assert parameters[name].kind is Parameter.KEYWORD_ONLY
+    assert parameters["media_probe"].kind is Parameter.KEYWORD_ONLY
+    assert parameters["media_probe"].default is None
+    prepare_probe = signature(prepare_sync_transcription).parameters[
+        "media_probe"
+    ]
+    assert prepare_probe.kind is Parameter.KEYWORD_ONLY
+    assert prepare_probe.default is Parameter.empty
 
     storage = _storage(
         tmp_path,
@@ -928,6 +946,7 @@ def test_sync_composition_protocol_and_current_effective_caps(
             options=_options(),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
             projector=SpyProjector(),
         )
 
@@ -967,6 +986,7 @@ def test_real_wav_processor_storage_and_three_projections(
                 options=_options(response_format),
                 cancellation=Cancellation(),
                 speaker_embedding_policy=_speaker_embedding_policy(),
+                media_probe=MediaProbe(len(samples) / 16_000, "wav"),
             )
             body = b"".join(prepared.iter_body())
             if response_format == "text":
@@ -1046,6 +1066,7 @@ def test_composition_faults_discard_every_artifact(
                 options=_options(),
                 cancellation=Cancellation(),
                 speaker_embedding_policy=_speaker_embedding_policy(),
+                media_probe=MediaProbe(1.0, "wav"),
                 **({} if projector is None else {"projector": projector}),
             )
 
@@ -1073,6 +1094,7 @@ def test_composition_passes_the_identical_speaker_mapping_to_projector(
             options=_options(),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
             projector=projector,
         )
 
@@ -1116,6 +1138,7 @@ def test_anonymous_composition_skips_snapshot_read_and_passes_empty_snapshot(
             options=_options(),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
             projector=projector,
         )
 
@@ -1189,6 +1212,7 @@ def test_known_composition_reads_one_snapshot_before_processor(
             options=_options(known_speaker_ids=known_ids),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
             projector=projector,
         )
 
@@ -1250,6 +1274,7 @@ def test_known_snapshot_failure_precedes_artifact_and_processor(
                 ),
                 cancellation=Cancellation(),
                 speaker_embedding_policy=_speaker_embedding_policy(),
+                media_probe=MediaProbe(1.0, "wav"),
                 projector=SpyProjector(),
             )
 
@@ -1292,6 +1317,7 @@ def test_composition_rejects_invalid_mapping_before_projector_and_cleans(
                 options=_options(),
                 cancellation=Cancellation(),
                 speaker_embedding_policy=_speaker_embedding_policy(),
+                media_probe=MediaProbe(1.0, "wav"),
                 projector=projector,
             )
 
@@ -1316,6 +1342,7 @@ def test_zero_sample_response_is_owned_until_stream_finishes(
             options=_options(),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
         )
         assert len(tuple(storage.artifact_dir.iterdir())) == 1
         assert (
@@ -1348,6 +1375,7 @@ def test_prepared_response_is_one_shot_and_early_close_releases(
             options=_options(),
             cancellation=Cancellation(),
             speaker_embedding_policy=_speaker_embedding_policy(),
+            media_probe=MediaProbe(1.0, "wav"),
         )
         body = prepared.iter_body()
         with pytest.raises(RuntimeError, match="already"):
@@ -1377,6 +1405,7 @@ def test_prepared_response_close_retries_release_failure(
         options=_options(),
         cancellation=Cancellation(),
         speaker_embedding_policy=_speaker_embedding_policy(),
+        media_probe=MediaProbe(1.0, "wav"),
     )
     original_release = storage.release_artifact
     calls = 0

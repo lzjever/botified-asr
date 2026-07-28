@@ -375,6 +375,7 @@ def create_app(
                     options,
                     cancellation,
                     speaker_embedding_policy,
+                    audio_prober,
                 )
             except StorageAdmissionError:
                 raise
@@ -398,6 +399,8 @@ def create_app(
                 CanonicalArtifactError,
             ) as exc:
                 raise _processing_api_error(exc) from exc
+            except ApiError:
+                raise
             except Exception as exc:
                 raise ApiError(
                     500,
@@ -782,7 +785,12 @@ async def _submit_async_transcription(
             )
         except AudioError as exc:
             raise _processing_api_error(exc) from exc
-        _validate_async_preflight(storage, options, probe)
+        _validate_transcription_preflight(
+            storage,
+            options,
+            probe,
+            prefer_async=True,
+        )
         spec = QueuedJobSpec(
             canonical_options_json=serialize_canonical_options(options),
             effective_max_audio_samples=(
@@ -835,10 +843,12 @@ async def _submit_async_transcription(
             storage.abort_job_upload(cleanup_handle)
 
 
-def _validate_async_preflight(
+def _validate_transcription_preflight(
     storage: Storage,
     options: CanonicalOptions,
     probe: MediaProbe,
+    *,
+    prefer_async: bool,
 ) -> None:
     if probe.duration_seconds > storage.limits.max_audio_duration_secs:
         raise ApiError(
@@ -858,6 +868,17 @@ def _validate_async_preflight(
                 "chunking_strategy=auto is required for long audio",
                 param="chunking_strategy",
             )
+    if (
+        not prefer_async
+        and probe.duration_seconds
+        > storage.limits.sync_max_audio_duration_secs
+    ):
+        raise ApiError(
+            422,
+            "async_required",
+            "Prefer: respond-async is required for this audio duration",
+            param="file",
+        )
 
 
 async def _prepare_while_watching_disconnect(
@@ -869,6 +890,7 @@ async def _prepare_while_watching_disconnect(
     options: CanonicalOptions,
     cancellation: Cancellation,
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    audio_prober: Callable[[Path, Cancellation], MediaProbe],
 ) -> PreparedSyncResponse:
     prepared: PreparedSyncResponse | None = None
     worker_errors: list[BaseException] = []
@@ -880,6 +902,13 @@ async def _prepare_while_watching_disconnect(
     worker_finished = anyio.Event()
 
     def prepare_in_worker() -> PreparedSyncResponse:
+        media_probe = audio_prober(input_path, cancellation)
+        _validate_transcription_preflight(
+            storage,
+            options,
+            media_probe,
+            prefer_async=False,
+        )
         result = prepare_sync_transcription(
             storage,
             processor,
@@ -888,6 +917,7 @@ async def _prepare_while_watching_disconnect(
             options,
             cancellation,
             speaker_embedding_policy=speaker_embedding_policy,
+            media_probe=media_probe,
         )
         worker_result.append(result)
         return result
