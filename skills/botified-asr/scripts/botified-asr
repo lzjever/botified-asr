@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, speaker-put SPEAKER_ID NAME [DESCRIPTION], or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -210,7 +210,7 @@ classify_http_response() {
     case "$command_name:$http_code" in
         health:200 | transcribe:200 | transcribe-long:202 | \
             job-get:200 | job-get:202 | job-wait:200 | job-delete:202 | \
-            speaker-list:200 | speaker-get:200)
+            speaker-list:200 | speaker-get:200 | speaker-put:200)
             http_response_kind=body
             ;;
         job-wait:202)
@@ -228,6 +228,9 @@ classify_http_response() {
 audio_file=
 job_id=
 speaker_id=
+speaker_name=
+speaker_description=
+speaker_description_is_set=0
 wait_timeout=
 
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
@@ -253,6 +256,15 @@ elif [ "$#" -eq 1 ] && [ "$1" = "speaker-list" ]; then
 elif [ "$#" -eq 2 ] && [ "$1" = "speaker-get" ]; then
     command_name=speaker-get
     speaker_id=$2
+elif { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } &&
+    [ "$1" = "speaker-put" ]; then
+    command_name=speaker-put
+    speaker_id=$2
+    speaker_name=$3
+    if [ "$#" -eq 4 ]; then
+        speaker_description=$4
+        speaker_description_is_set=1
+    fi
 elif [ "$#" -eq 2 ] && [ "$1" = "speaker-delete" ]; then
     command_name=speaker-delete
     speaker_id=$2
@@ -420,7 +432,7 @@ done
 
 case "$command_name" in
     health | job-get | job-wait | job-delete | \
-        speaker-list | speaker-get | speaker-delete)
+        speaker-list | speaker-get | speaker-put | speaker-delete)
         request_input=/dev/null
         ;;
     transcribe | transcribe-long)
@@ -437,7 +449,7 @@ case "$command_name" in
             invalid_job_id
         fi
         ;;
-    speaker-get | speaker-delete)
+    speaker-get | speaker-put | speaker-delete)
         if ! is_crockford_id "$speaker_id"; then
             invalid_speaker_id
         fi
@@ -551,6 +563,20 @@ case "$command_name" in
         set -- \
             "$@" \
             --request GET \
+            --url "$origin/v1/speakers/$speaker_id"
+        ;;
+    speaker-put)
+        set -- \
+            "$@" \
+            --request PUT \
+            --form-string "name=$speaker_name"
+        if [ "$speaker_description_is_set" -eq 1 ]; then
+            set -- \
+                "$@" \
+                --form-string "description=$speaker_description"
+        fi
+        set -- \
+            "$@" \
             --url "$origin/v1/speakers/$speaker_id"
         ;;
     speaker-delete)

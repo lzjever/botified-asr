@@ -85,6 +85,11 @@ authenticated GET `/v1/speakers/{speaker_id}`. `SPEAKER_ID` must be exactly
 eight uppercase Crockford Base32 characters.
 
 List and get return HTTP 200 service JSON unchanged.
+`scripts/botified-asr speaker-put SPEAKER_ID NAME [DESCRIPTION]` sends an
+authenticated PUT `/v1/speakers/{speaker_id}`. It passes provided metadata with
+curl `--form-string` and submits no `samples[]` or `file` field. HTTP 200
+service JSON is returned unchanged.
+
 `scripts/botified-asr speaker-delete SPEAKER_ID` sends authenticated
 DELETE `/v1/speakers/{speaker_id}`, and HTTP 204 succeeds with no output. HTTP
 error bodies are returned unchanged.

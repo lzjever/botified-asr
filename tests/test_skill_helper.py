@@ -256,6 +256,10 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr job-delete JOB_ID" in body
     assert "scripts/botified-asr speaker-list" in body
     assert "scripts/botified-asr speaker-get SPEAKER_ID" in body
+    assert (
+        "scripts/botified-asr speaker-put SPEAKER_ID NAME [DESCRIPTION]"
+        in body
+    )
     assert "scripts/botified-asr speaker-delete SPEAKER_ID" in body
     assert (
         body.index("first run `scripts/botified-asr health`")
@@ -275,6 +279,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "DELETE `/v1/audio/transcriptions/{job_id}`" in reference
     assert "GET `/v1/speakers`" in reference
     assert "GET `/v1/speakers/{speaker_id}`" in reference
+    assert "PUT `/v1/speakers/{speaker_id}`" in reference
     assert "DELETE `/v1/speakers/{speaker_id}`" in reference
 
     assert yaml.safe_load(
@@ -288,7 +293,8 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
             "default_prompt": (
                 "Use $botified-asr to check readiness, transcribe local "
                 "audio, query submitted transcription jobs, list or query "
-                "existing speaker profiles, or delete a job or speaker "
+                "existing speaker profiles, update existing profile metadata "
+                "only when I explicitly ask, or delete a job or speaker "
                 "profile when I explicitly ask."
             ),
         }
@@ -315,6 +321,9 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("speaker-list", "extra"),
         ("speaker-get",),
         ("speaker-get", "7K3M9Q2W", "extra"),
+        ("speaker-put",),
+        ("speaker-put", "7K3M9Q2W"),
+        ("speaker-put", "7K3M9Q2W", "Ada", "description", "extra"),
         ("speaker-delete",),
         ("speaker-delete", "7K3M9Q2W", "extra"),
     ],
@@ -660,6 +669,7 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
         ("job-wait", "malformed/id", "invalid-timeout"),
         ("job-delete", "malformed/id"),
         ("speaker-get", "malformed/id"),
+        ("speaker-put", "malformed/id", "Ada"),
     ],
 )
 def test_client_configuration_errors_precede_local_input_validation(
@@ -1150,7 +1160,10 @@ def test_job_commands_reuse_strict_job_id_validation(
     assert not args_path.exists()
 
 
-@pytest.mark.parametrize("command_name", ["speaker-get", "speaker-delete"])
+@pytest.mark.parametrize(
+    "command_name",
+    ["speaker-get", "speaker-put", "speaker-delete"],
+)
 def test_speaker_commands_reject_dangerous_id_without_request_or_echo(
     tmp_path: Path,
     command_name: str,
@@ -1158,7 +1171,11 @@ def test_speaker_commands_reject_dangerous_id_without_request_or_echo(
     environment, args_path, _ = _install_fake_curl(tmp_path)
     _write_client_config(environment, _valid_config())
 
-    result = _run(environment, command_name, "../health")
+    if command_name == "speaker-put":
+        command_arguments = ("../health", "Ada")
+    else:
+        command_arguments = ("../health",)
+    result = _run(environment, command_name, *command_arguments)
 
     assert result.returncode == 65
     assert _error_code(result) == "invalid_speaker_id"
@@ -1457,6 +1474,7 @@ exec /usr/bin/sleep 30
         ("job-delete", "302"),
         ("speaker-list", "202"),
         ("speaker-get", "204"),
+        ("speaker-put", "204"),
         ("speaker-delete", "200"),
     ],
 )
@@ -1476,6 +1494,8 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
         audio_path = tmp_path / "audio.wav"
         audio_path.write_bytes(b"audio")
         arguments = (command_name, str(audio_path))
+    elif command_name == "speaker-put":
+        arguments = (command_name, "7K3M9Q2W", "Ada")
     elif command_name in {
         "job-get",
         "job-delete",
@@ -1497,6 +1517,91 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
     assert result.stderr == b""
     assert private_body not in result.stdout + result.stderr
     assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("description_arguments", "description_form"),
+    [
+        ((), []),
+        (("",), [b"--form-string", b"description="]),
+        (
+            ("@/private/voice.wav;type=audio/wav",),
+            [
+                b"--form-string",
+                b"description=@/private/voice.wav;type=audio/wav",
+            ],
+        ),
+    ],
+)
+def test_speaker_put_preserves_literal_description_tristate(
+    tmp_path: Path,
+    description_arguments: tuple[str, ...],
+    description_form: list[bytes],
+) -> None:
+    body = b'{"id":"7K3M9Q2W","name":"Ada Lovelace"}'
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        http_code="200",
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(
+        environment,
+        "speaker-put",
+        "7K3M9Q2W",
+        "Ada Lovelace",
+        *description_arguments,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == body
+    assert result.stderr == b""
+    arguments = args_path.read_bytes().split(b"\0")
+    request_arguments = [
+        b"--request",
+        b"PUT",
+        b"--form-string",
+        b"name=Ada Lovelace",
+        *description_form,
+        b"--url",
+        b"https://asr.example:17770/v1/speakers/7K3M9Q2W",
+    ]
+    assert arguments[10 : 10 + len(request_arguments)] == request_arguments
+    capture_index = 10 + len(request_arguments)
+    assert arguments[capture_index] == b"--output"
+    if not description_arguments:
+        assert arguments[:10] == [
+            b"--disable",
+            b"--globoff",
+            b"--config",
+            b"-",
+            b"--proto",
+            b"=http,https",
+            b"--silent",
+            b"--fail-with-body",
+            b"--connect-timeout",
+            b"5",
+        ]
+        assert arguments[capture_index + 2 :] == [
+            b"--write-out",
+            b"%{http_code}",
+            b"",
+        ]
+        assert b"--max-time" not in arguments
+        assert b"--header" not in arguments
+        assert b"--form" not in arguments
+        assert b"--location" not in arguments
+        assert b"-L" not in arguments
+        assert TOKEN.encode() not in args_path.read_bytes()
+        assert TOKEN.encode() not in result.stdout + result.stderr
+        assert stdin_path.read_bytes() == (
+            f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+        )
+        assert (tmp_path / "curl-upload").read_bytes() == b""
+        curl_environment = (tmp_path / "curl-env").read_bytes()
+        assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+        assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
 
 
 @pytest.mark.parametrize(

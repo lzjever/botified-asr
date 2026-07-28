@@ -1,6 +1,6 @@
 ---
 name: botified-asr
-description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long transcription jobs, list or query existing speaker profiles, or delete a job or speaker profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, check readiness, obtain a transcription, inspect an existing speaker profile, or work with a long transcription job.
+description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long transcription jobs, list or query existing speaker profiles, or update profile metadata or delete a job or profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, check readiness, obtain a transcription, inspect an existing speaker profile, explicitly update its metadata, or work with a long transcription job.
 ---
 
 # Botified ASR Client
@@ -19,13 +19,17 @@ request without waiting; terminal HTTP 204 produces no output.
 
 Use `scripts/botified-asr speaker-list` to list existing speaker profiles and
 `scripts/botified-asr speaker-get SPEAKER_ID` to query one. Only when the user
-explicitly asks to delete a speaker profile, run
+explicitly asks to update an existing profile's metadata, run
+`scripts/botified-asr speaker-put SPEAKER_ID NAME [DESCRIPTION]`. `NAME` is
+required. Omit `DESCRIPTION` to preserve it, pass an empty value to clear it,
+or pass a nonempty value to replace it. Only when the user explicitly asks to
+delete a speaker profile, run
 `scripts/botified-asr speaker-delete SPEAKER_ID`.
 
 Return the helper's JSON unchanged. Successful `job-delete` and
 `speaker-delete` HTTP 204 responses intentionally have no output. Treat a
 nonzero exit as a failed readiness check, transcription, submission, query,
-wait, or deletion and report its stable error code without exposing
-credentials, local paths, or raw configuration.
+metadata update, wait, or deletion and report its stable error code without
+exposing credentials, local paths, or raw configuration.
 
 Read `references/api.md` only when the request or response contract is needed.

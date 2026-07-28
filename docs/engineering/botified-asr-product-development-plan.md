@@ -1271,7 +1271,7 @@ job-delete
 speaker-add
 speaker-list
 speaker-get
-speaker-put
+speaker-put SPEAKER_ID NAME [DESCRIPTION]
 speaker-delete
 ```
 
@@ -1295,17 +1295,21 @@ speaker-delete
   `now >= deadline`，此时返回 `job_wait_timeout`。
 - curl exit 0 时按命令 fail-closed：`health` 仅允许 HTTP 200，`transcribe`
   仅允许 200，`transcribe-long` 仅允许 202，`job-get` 和 `job-wait` 仅允许
-  200/202，`job-delete` 仅允许 202/204，`speaker-list` 和 `speaker-get`
-  仅允许 200，`speaker-delete` 仅允许 204。包括 3xx、畸形状态和其他状态在
-  内的非白名单响应丢弃 body，返回 `unexpected_http_response`，
-  `param=null`，exit 76。
+  200/202，`job-delete` 仅允许 202/204，`speaker-list`、`speaker-get` 和
+  `speaker-put` 仅允许 200，`speaker-delete` 仅允许 204。包括 3xx、畸形状态
+  和其他状态在内的非白名单响应丢弃 body，返回
+  `unexpected_http_response`，`param=null`，exit 76。
 - `job-wait` 的 HTTP 200 是 terminal：原样输出 JSON 并 exit 0；HTTP 202 是
   active：丢弃该次 JSON，重新读取 deadline 后才决定 timeout 或 sleep。
 - `job-delete JOB_ID` 复用严格 job ID 校验，对同一 job URL 发送 DELETE；HTTP
   202 原样输出立即请求的 JSON 且不等待，terminal HTTP 204 成功且无输出。
-- `speaker-get SPEAKER_ID` 和 `speaker-delete SPEAKER_ID` 复用严格的八位大写
-  Crockford Base32 ID 校验；失败返回 `invalid_speaker_id`，
-  `param=speaker_id`，exit 65。
+- `speaker-get SPEAKER_ID`、`speaker-put SPEAKER_ID NAME [DESCRIPTION]` 和
+  `speaker-delete SPEAKER_ID` 复用严格的八位大写 Crockford Base32 ID 校验；
+  失败返回 `invalid_speaker_id`，`param=speaker_id`，exit 65。
+- `speaker-put` 只更新 metadata，对 item URL 发送 PUT；始终使用
+  `--form-string` 发送必填 `name`，仅在提供 `DESCRIPTION` 参数时使用
+  `--form-string` 发送 `description`：省略时保留、显式空值时清除、非空值时
+  替换。它不提交 `samples[]` 或 `file` 字段。
 - deadline 到期返回 `job_wait_timeout`，`param=timeout_seconds`，exit 75。
   `job-wait` 只输出最终一次 JSON，不输出任何中间 active 响应。
 - 所有服务错误保留稳定 error code。
