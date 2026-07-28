@@ -695,9 +695,9 @@ bounded upload
   -> ffprobe
   -> ffmpeg streaming decode: mono PCM16 16 kHz
   -> streaming FSMN-VAD
-  -> bounded speech segment buffer
-  -> SenseVoice batch
-  -> optional CAM++ embedding
+  -> bounded speech-island buffer
+  -> optional bounded diarization into non-overlapping subsegments predicted as single-speaker
+  -> one-time ASR/rich model processing per final segment
   -> incremental result writer
   -> optional speaker naming
   -> final response projection
@@ -766,10 +766,10 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 ### 8.3 VAD buffer
 
-- streaming VAD 输出绝对毫秒边界。
-- ring/spool 只保留当前未闭合语音和少量前置 padding。
-- 单段达到 30 秒时强制安全切分。
-- segment 是唯一 ASR、情感、事件和 speaker embedding 输入单位。
+- streaming VAD 输出绝对毫秒边界和 speech island；island 只界定连续语音，不声明 speaker 唯一。
+- ring/spool 只保留当前未闭合 speech island 和少量前置 padding。
+- 单个 speech island 达到 30 秒时强制安全切分。
+- 请求 diarization 时先把 island 切成有序、预测为单一说话人的非重叠 final subsegments；未请求时 island 就是 final segment；ASR、情感和事件对每个 final segment 各处理一次，禁止整岛转写后对子段重复转写。
 - 空白音频返回空字符串和空 segments，不生成模型幻觉文本。
 
 ### 8.4 Incremental result
@@ -786,16 +786,14 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 ### 8.5 Speaker state
 
-首版使用有界的稳定 centroid 状态：
+production speaker/diarization 在独立 held-out 的真实中文和英文数据、不同设备/麦克风上分别达到既定质量指标前必须 fail closed；校准数据本身不得作为过线依据，也不把未经验证的聚类或切分算法固化为首版设计。
 
-- 使用 FunASR `sv_chunk` 的固定 1.5 秒 window / 0.75 秒 shift 提取并归一化 CAM++ embedding。
-- 按绝对时间顺序与最多 32 个 centroid 做 cosine nearest；达到随 embedding policy 固定的 anonymous-cluster threshold 时更新最近 centroid，否则按首次出现顺序创建稳定 ID。
-- centroid 以累计 window count 做加权平均后重新归一化，永不 merge、split 或 renumber。
-- 一个 VAD segment 由 window 时长加权多数决定 speaker；tie 选择最小稳定 ID。
-- 第 33 个 unmatched centroid 直接失败 `too_many_speakers`，不合并成随机人物。
-- 状态只保存 32 个 centroid、count 和 label，不保存全历史 embedding。
+候选实现只接受以下边界：
 
-短音频和长会议不得使用两套 speaker label 算法。
+- 对 bounded speech island 继续切分，输出按时间排序、预测为单一说话人的非重叠最终 subsegment。
+- 短音频和最长 12 小时音频的公开 speaker label 语义与响应契约一致；内部可采用适合输入长度的有界实现。
+- request-local 状态有界，speaker 最多 32 个；超出时稳定失败，不把人物随机合并。
+- 不保存完整 PCM、全历史 embedding 或全局无界相似度矩阵，不为此增加外部 broker 或 segment checkpoint。
 
 ## 9. 已知人物注册
 
@@ -895,7 +893,7 @@ anonymous clustering
 
 - threshold 和 top-two margin 是服务级固定模型策略，不由每个客户端随意调整。
 - 阈值必须通过真实设备、普通话/英语和不同麦克风样本校准。
-- enrollment threshold、anonymous-cluster threshold、match threshold 和 top-two margin 与 embedding policy fingerprint 一起固定；变更任一值需要重新跑同一 identity 测试。
+- `embedding_policy_fingerprint` 只表示向量提取与聚合的兼容性，不包含 enrollment threshold、anonymous-cluster threshold、match threshold 或 top-two margin；变更这些决策阈值需要重新运行 identity 测试，但不得因此要求已有 speaker 重新 enrollment。
 - 相似度达到阈值但与第二名区分不足时保持 Unknown。
 - 多个 anonymous cluster 可以匹配同一已知人物，以容忍长会议 cluster fragmentation。
 - 匹配只使用声音；name 和 description 不进入模型。
