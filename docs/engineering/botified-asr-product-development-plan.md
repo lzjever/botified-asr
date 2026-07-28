@@ -1169,7 +1169,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 
 必须：
 
-1. 支持 `BOTIFIED_ASR_VERSION=vX.Y.Z`，默认最新稳定版。
+1. 支持显式 `BOTIFIED_ASR_VERSION=vMAJOR.MINOR.PATCH`；未设置时从 `botified-releases` `main` 根文件 `botified-asr-latest` 解析版本。两种来源都只接受 canonical `vMAJOR.MINOR.PATCH`，并按 §14.3 映射为 `asr-$version`。
 2. 检测 Linux x86_64/aarch64；不支持的平台在下载大资产前失败。
 3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
 4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
@@ -1213,7 +1213,8 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - `botified-asr` 使用独立 SemVer。
 - `BOTIFIED_ASR_VERSION` 不复用 `BOTIFIED_VERSION`。
 - `botified-releases` 使用 namespaced release tag `asr-vX.Y.Z`，避免与 Core/Gateway 的 `vX.Y.Z` tag 冲突。
-- `BOTIFIED_ASR_VERSION=vX.Y.Z` 由安装器解析为 `asr-vX.Y.Z` release，并拉取 `ghcr.io/lzjever/botified-asr:vX.Y.Z` 的固定 digest。
+- resolved version（显式 `BOTIFIED_ASR_VERSION` 或 `botified-asr-latest` pointer）必须是 canonical `vMAJOR.MINOR.PATCH`：每个十进制段只能是 `0` 或以非零数字开头的数字串，不接受 prerelease、build metadata 或空白；它映射到 `asr-$version` release 和该 release manifest 固定的 `ghcr.io/lzjever/botified-asr:$version` image digest。
+- `botified-asr-latest` 的唯一内容是该 canonical version 加单个 LF，不接受多行或缺少末尾 LF；它只定位当前 ASR 稳定 release，不复制 manifest 字段，并在对应 release assets 全部发布且校验完成后最后更新。
 - Botified Core、Gateway 和 ASR 不要求同版本发布。
 - `botified-releases` README 说明各组件独立安装，避免“全家桶”心智。
 - release manifest、image label 和 `botified-asr --version` 必须一致。
@@ -1319,6 +1320,8 @@ speaker-delete
 ### 15.4 独立安装
 
 `install-asr-skill.sh --target <runtime>` 使用同一个 skill tarball；每次必须明确且只接受一个 target，不自动检测后静默选择：
+
+`install-asr-skill.sh` 的版本选择与 release tag 解析完全复用 §14.2 第 1 项和 §14.3；不得使用仓库级 `releases/latest` 或维护第二个 latest pointer。
 
 | Runtime | 默认目录 |
 |---|---|
