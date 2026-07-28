@@ -18,12 +18,14 @@ from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
 from botified_asr.job_fingerprints import build_request_fingerprints
 from botified_asr.jobs import (
     DurableJob,
+    JobCancellationRequestedError,
     JobPhase,
     JobProgressOutcome,
     JobSuccessOutcome,
     JobStatus,
     JobTerminalOutcome,
     QueuedJobSpec,
+    StaleJobAttemptError,
     generate_attempt_token,
     generate_job_id,
     validate_job_id,
@@ -2360,6 +2362,108 @@ class Storage:
             raise TypeError("resolve_input requires an InputRef")
         return self._resolve_ref(ref, lease_type="upload")
 
+    def resolve_job_attempt_input(
+        self,
+        job_id: str,
+        attempt_token: str,
+    ) -> tuple[DurableJob, Path]:
+        validate_job_id(job_id)
+        _validate_nonempty_text(attempt_token, name="attempt token")
+        input_path = self.staging_dir / f"{job_id}.ready"
+        with self._transaction():
+            job_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
+                raise StaleJobAttemptError(
+                    "job attempt is no longer running"
+                )
+            job = _decode_transcription_job(job_row)
+            if (
+                job.phase is not JobPhase.VISIBLE
+                or job.status is not JobStatus.RUNNING
+                or job.attempt_token != attempt_token
+            ):
+                raise StaleJobAttemptError(
+                    "job attempt is no longer running"
+                )
+            if job.cancel_requested:
+                raise JobCancellationRequestedError(
+                    "job cancellation was requested"
+                )
+            if (
+                job.processor_fingerprint
+                != self._current_processor_fingerprint
+            ):
+                raise StorageSchemaError(
+                    "processor_fingerprint_mismatch"
+                )
+
+            lease_row = self._connection.execute(
+                "SELECT * FROM storage_leases WHERE id = ?",
+                (job.input_lease_id,),
+            ).fetchone()
+            content_sha256 = (
+                None
+                if lease_row is None
+                else lease_row["content_sha256"]
+            )
+            if (
+                job.input_lease_id != job_id
+                or lease_row is None
+                or lease_row["id"] != job_id
+                or lease_row["lease_type"] != "upload"
+                or lease_row["resource_kind"] != "transcription"
+                or lease_row["owner_kind"] != "job"
+                or lease_row["owner_id"] != job_id
+                or lease_row["phase"] != "sealed"
+                or lease_row["controlled_path"] != str(input_path)
+                or lease_row["reserved_bytes"]
+                != lease_row["actual_bytes"]
+                or lease_row["actual_bytes"] != job.input_size_bytes
+                or type(content_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", content_sha256)
+                is None
+                or not self._is_controlled_path(
+                    job_id,
+                    "upload",
+                    "sealed",
+                    input_path,
+                )
+                or not _is_regular_file_with_size(
+                    input_path,
+                    lease_row["actual_bytes"],
+                )
+            ):
+                raise StorageSchemaError(
+                    "job attempt input is corrupt"
+                )
+            assert job.canonical_options_json is not None
+            assert job.selected_speaker_snapshot is not None
+            try:
+                fingerprints = build_request_fingerprints(
+                    job.canonical_options_json,
+                    content_sha256,
+                    job.selected_speaker_snapshot,
+                )
+            except (TypeError, ValueError) as error:
+                raise StorageSchemaError(
+                    "job attempt fingerprints are corrupt"
+                ) from error
+            if (
+                fingerprints.snapshot_sha256 != job.snapshot_sha256
+                or fingerprints.request_fingerprint
+                != job.request_fingerprint
+            ):
+                raise StorageSchemaError(
+                    "job attempt fingerprints are corrupt"
+                )
+        return job, input_path
+
     def release_input(self, ref: InputRef) -> None:
         if not isinstance(ref, InputRef):
             raise TypeError("release_input requires an InputRef")
@@ -2369,10 +2473,34 @@ class Storage:
             directory=self.staging_dir,
         )
 
+    def begin_job_attempt_artifact(
+        self,
+        job_id: str,
+        attempt_token: str,
+    ) -> ReservedByteWriter:
+        return self._begin_job_artifact(
+            job_id,
+            attempt_token,
+            resource_kind="segment_jsonl",
+        )
+
     def begin_job_result_artifact(
         self,
         job_id: str,
         attempt_token: str,
+    ) -> ReservedByteWriter:
+        return self._begin_job_artifact(
+            job_id,
+            attempt_token,
+            resource_kind="result_complete",
+        )
+
+    def _begin_job_artifact(
+        self,
+        job_id: str,
+        attempt_token: str,
+        *,
+        resource_kind: str,
     ) -> ReservedByteWriter:
         validate_job_id(job_id)
         _validate_nonempty_text(attempt_token, name="attempt token")
@@ -2380,27 +2508,43 @@ class Storage:
         path = self.artifact_dir / f"{lease_id}.partial"
         reservation = RESERVATION_QUANTUM
         with self._transaction():
-            running = self._connection.execute(
-                """
-                SELECT 1 FROM transcription_jobs
-                WHERE id = ? AND phase = 'visible'
-                  AND status = 'running' AND attempt_token = ?
+            job_row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs WHERE id = ?
                 """,
-                (job_id, attempt_token),
+                (job_id,),
             ).fetchone()
-            if running is None:
-                raise RuntimeError("job attempt is no longer running")
+            if job_row is None:
+                raise StaleJobAttemptError(
+                    "job attempt is no longer running"
+                )
+            job = _decode_transcription_job(job_row)
+            if (
+                job.phase is not JobPhase.VISIBLE
+                or job.status is not JobStatus.RUNNING
+                or job.attempt_token != attempt_token
+            ):
+                raise StaleJobAttemptError(
+                    "job attempt is no longer running"
+                )
+            if job.cancel_requested:
+                raise JobCancellationRequestedError(
+                    "job cancellation was requested"
+                )
             duplicate = self._connection.execute(
                 """
                 SELECT 1 FROM storage_leases
                 WHERE lease_type = 'artifact'
-                  AND resource_kind = 'result_complete'
+                  AND resource_kind = ?
                   AND owner_kind = 'job' AND owner_id = ?
                 """,
-                (job_id,),
+                (resource_kind, job_id),
             ).fetchone()
             if duplicate is not None:
-                raise RuntimeError("job result artifact already exists")
+                raise RuntimeError(
+                    f"job {resource_kind} artifact already exists"
+                )
             self._admit_delta(reservation)
             self._connection.execute(
                 """
@@ -2408,11 +2552,17 @@ class Storage:
                     id, lease_type, resource_kind, owner_kind, owner_id,
                     phase, controlled_path, reserved_bytes, actual_bytes
                 ) VALUES (
-                    ?, 'artifact', 'result_complete', 'job', ?,
+                    ?, 'artifact', ?, 'job', ?,
                     'writing', ?, ?, 0
                 )
                 """,
-                (lease_id, job_id, str(path), reservation),
+                (
+                    lease_id,
+                    resource_kind,
+                    job_id,
+                    str(path),
+                    reservation,
+                ),
             )
         try:
             handle = path.open("xb")
@@ -2426,7 +2576,7 @@ class Storage:
         self._files[lease_id] = handle
         return ReservedByteWriter(
             lease_id,
-            "result_complete",
+            resource_kind,
             "job",
             job_id,
             path,
@@ -3634,6 +3784,7 @@ class Storage:
             if row["owner_kind"] in {"sync", "legacy"}:
                 generic_cleanup.append(row)
 
+        segment_rows_by_job: dict[str, list[sqlite3.Row]] = {}
         result_rows_by_job: dict[str, list[sqlite3.Row]] = {}
         for row in lease_rows:
             if (
@@ -3642,16 +3793,22 @@ class Storage:
             ):
                 if row["owner_id"] not in jobs_by_id:
                     raise StorageSchemaError(
-                        "job result owner is corrupt"
+                        "job artifact owner is corrupt"
                     )
-                result_rows_by_job.setdefault(
-                    row["owner_id"], []
-                ).append(row)
+                rows_by_job = (
+                    segment_rows_by_job
+                    if row["resource_kind"] == "segment_jsonl"
+                    else result_rows_by_job
+                )
+                rows_by_job.setdefault(row["owner_id"], []).append(row)
+        if any(len(rows) != 1 for rows in segment_rows_by_job.values()):
+            raise StorageSchemaError("duplicate job segment artifact")
         if any(len(rows) != 1 for rows in result_rows_by_job.values()):
             raise StorageSchemaError("duplicate job result artifact")
 
         receiving_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
         terminal_cleanup: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        segment_cleanup: list[sqlite3.Row] = []
         result_cleanup: list[sqlite3.Row] = []
         recoverable_results: dict[
             str, tuple[sqlite3.Row, ResultEnvelopeManifest]
@@ -3718,6 +3875,11 @@ class Storage:
                 terminal_cleanup.append((job_row, lease_row))
 
         for job_id, (_, job) in jobs_by_id.items():
+            segment_rows = segment_rows_by_job.get(job_id, [])
+            if segment_rows:
+                segment_row = segment_rows[0]
+                referenced_job_leases.add(segment_row["id"])
+                segment_cleanup.append(segment_row)
             result_rows = result_rows_by_job.get(job_id, [])
             result_row = result_rows[0] if result_rows else None
             if job.status is JobStatus.SUCCEEDED:
@@ -3830,6 +3992,13 @@ class Storage:
                     }
                 )
         for row in result_cleanup:
+            preflight_paths.update(
+                {
+                    self.artifact_dir / f"{row['id']}.partial",
+                    self.artifact_dir / f"{row['id']}.complete",
+                }
+            )
+        for row in segment_cleanup:
             preflight_paths.update(
                 {
                     self.artifact_dir / f"{row['id']}.partial",
@@ -4105,6 +4274,13 @@ class Storage:
                     self.artifact_dir / f"{row['id']}.complete",
                 }
             )
+        for row in segment_cleanup:
+            cleanup_paths.update(
+                {
+                    self.artifact_dir / f"{row['id']}.partial",
+                    self.artifact_dir / f"{row['id']}.complete",
+                }
+            )
         for row in generic_cleanup:
             directory = (
                 self.staging_dir
@@ -4144,6 +4320,7 @@ class Storage:
         if (
             receiving_cleanup
             or terminal_cleanup
+            or segment_cleanup
             or result_cleanup
             or generic_cleanup
         ):
@@ -4240,6 +4417,19 @@ class Storage:
                             "terminal job disappeared during cleanup"
                         )
                     _decode_transcription_job(cleaned_row)
+                for row in segment_cleanup:
+                    current = self._connection.execute(
+                        "SELECT * FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    if current is None or tuple(current) != tuple(row):
+                        raise StorageSchemaError(
+                            "job segment lease changed during startup"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM storage_leases WHERE id = ?",
+                        (row["id"],),
+                    )
                 for row in result_cleanup:
                     current = self._connection.execute(
                         "SELECT * FROM storage_leases WHERE id = ?",
@@ -4321,7 +4511,8 @@ class Storage:
                         )
                         or (
                             lease_type == "artifact"
-                            and resource_kind == "result_complete"
+                            and resource_kind
+                            in {"segment_jsonl", "result_complete"}
                             and re.fullmatch(
                                 r"[0-9a-f]{32}", lease_id
                             )

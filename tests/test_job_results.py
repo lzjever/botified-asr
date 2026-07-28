@@ -1236,7 +1236,7 @@ def test_job_result_begin_is_token_fenced_and_unique_across_connections(
         running = queue_and_claim(first)
         assert running.attempt_token is not None
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(jobs.StaleJobAttemptError):
             first.begin_job_result_artifact(running.id, "stale-token")
         writer = first.begin_job_result_artifact(
             running.id,
@@ -1248,9 +1248,329 @@ def test_job_result_begin_is_token_fenced_and_unique_across_connections(
                 running.attempt_token,
             )
         first.abort_artifact(writer)
+        request_cancel(first, running.id)
+        with pytest.raises(jobs.JobCancellationRequestedError):
+            first.begin_job_result_artifact(
+                running.id,
+                running.attempt_token,
+            )
     finally:
         second.close()
         first.close()
+
+
+def test_resolve_job_attempt_input_returns_fresh_job_and_ready_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        assert (
+            storage.update_job_progress(
+                running.id,
+                running.attempt_token,
+                10,
+            )
+            is jobs.JobProgressOutcome.UPDATED
+        )
+
+        resolved, input_path = storage.resolve_job_attempt_input(
+            running.id,
+            running.attempt_token,
+        )
+
+        assert resolved == storage.get_visible_job(running.id)
+        assert resolved.processed_samples == 10
+        assert resolved.status is jobs.JobStatus.RUNNING
+        assert resolved.attempt_token == running.attempt_token
+        assert input_path == storage.staging_dir / f"{running.id}.ready"
+        assert input_path.read_bytes() == b"audio"
+
+
+@pytest.mark.parametrize(
+    ("operation", "attempt_state"),
+    (
+        ("resolve", "wrong-token"),
+        ("resolve", "missing-job"),
+        ("resolve", "cancel"),
+        ("segment", "wrong-token"),
+        ("segment", "cancel"),
+    ),
+)
+def test_job_attempt_storage_operations_are_typed_fenced_and_cancel_aware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    attempt_state: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        job_id = running.id
+        token = running.attempt_token
+        expected_error = (
+            jobs.JobCancellationRequestedError
+            if attempt_state == "cancel"
+            else jobs.StaleJobAttemptError
+        )
+        if attempt_state == "wrong-token":
+            token = "stale-token"
+        elif attempt_state == "missing-job":
+            job_id = "ABCDEFGH"
+        else:
+            request_cancel(storage, running.id)
+        before = recovery_snapshot(tmp_path)
+
+        with pytest.raises(expected_error):
+            if operation == "resolve":
+                storage.resolve_job_attempt_input(job_id, token)
+            else:
+                storage.begin_job_attempt_artifact(job_id, token)
+
+        assert recovery_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "job-input-ref",
+        "missing-lease",
+        "controlled-path",
+        "input-size",
+        "content-digest",
+        "request-fingerprint",
+        "processor-fingerprint",
+    ),
+)
+def test_resolve_job_attempt_input_fails_closed_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        if corruption == "job-input-ref":
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs SET input_lease_id = ?
+                WHERE id = ?
+                """,
+                ("b" * 32, running.id),
+            )
+        elif corruption == "missing-lease":
+            storage._connection.execute(
+                "DELETE FROM storage_leases WHERE id = ?",
+                (running.id,),
+            )
+        elif corruption == "controlled-path":
+            storage._connection.execute(
+                """
+                UPDATE storage_leases SET controlled_path = ?
+                WHERE id = ?
+                """,
+                (
+                    str(storage.staging_dir / f"{running.id}.partial"),
+                    running.id,
+                ),
+            )
+        elif corruption == "input-size":
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs
+                SET input_size_bytes = input_size_bytes + 1
+                WHERE id = ?
+                """,
+                (running.id,),
+            )
+        elif corruption == "content-digest":
+            storage._connection.execute(
+                """
+                UPDATE storage_leases SET content_sha256 = ?
+                WHERE id = ?
+                """,
+                ("f" * 64, running.id),
+            )
+        elif corruption == "request-fingerprint":
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs SET request_fingerprint = ?
+                WHERE id = ?
+                """,
+                ("f" * 64, running.id),
+            )
+        else:
+            storage._connection.execute(
+                """
+                UPDATE transcription_jobs SET processor_fingerprint = ?
+                WHERE id = ?
+                """,
+                ("4" * 64, running.id),
+            )
+        before = recovery_snapshot(tmp_path)
+
+        with pytest.raises(StorageSchemaError):
+            storage.resolve_job_attempt_input(
+                running.id,
+                running.attempt_token,
+            )
+
+        assert recovery_snapshot(tmp_path) == before
+
+
+def test_job_attempt_segment_is_unique_and_can_coexist_with_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert running.attempt_token is not None
+        segment = storage.begin_job_attempt_artifact(
+            running.id,
+            running.attempt_token,
+        )
+        storage.append_artifact(segment, b'{"index":0}\n')
+        segment_ref = storage.seal_artifact(segment)
+
+        with pytest.raises(RuntimeError, match="already exists"):
+            storage.begin_job_attempt_artifact(
+                running.id,
+                running.attempt_token,
+            )
+
+        result = storage.begin_job_result_artifact(
+            running.id,
+            running.attempt_token,
+        )
+        kinds = tuple(
+            row[0]
+            for row in storage._connection.execute(
+                """
+                SELECT resource_kind FROM storage_leases
+                WHERE lease_type = 'artifact'
+                  AND owner_kind = 'job' AND owner_id = ?
+                ORDER BY resource_kind
+                """,
+                (running.id,),
+            )
+        )
+        assert kinds == ("result_complete", "segment_jsonl")
+
+        storage.abort_artifact(result)
+        storage.release_artifact(segment_ref)
+
+
+@pytest.mark.parametrize(
+    "restart_state",
+    ("writing", "sealed", "sealed-with-result"),
+)
+def test_startup_cleans_attempt_segment_without_treating_it_as_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restart_state: str,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    running = queue_and_claim(storage)
+    assert running.attempt_token is not None
+    segment = storage.begin_job_attempt_artifact(
+        running.id,
+        running.attempt_token,
+    )
+    storage.append_artifact(segment, b'{"index":0}\n')
+    segment_id = segment.id
+    segment_paths = (
+        segment.path,
+        segment.path.with_suffix(".complete"),
+    )
+    result_ref = None
+    if restart_state != "writing":
+        storage.seal_artifact(segment)
+    if restart_state == "sealed-with-result":
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+    storage.close()
+
+    reopened = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    try:
+        recovered = reopened.get_visible_job(running.id)
+        assert recovered is not None
+        if result_ref is None:
+            assert recovered.status is jobs.JobStatus.QUEUED
+            assert recovered.crash_recoveries == 1
+            assert recovered.result_lease_id is None
+        else:
+            assert recovered.status is jobs.JobStatus.SUCCEEDED
+            assert recovered.result_lease_id == result_ref.id
+            assert reopened.resolve_artifact(result_ref).is_file()
+        assert all(not path.exists() for path in segment_paths)
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM storage_leases WHERE id = ?",
+                (segment_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        reopened.close()
+
+
+def test_startup_rejects_duplicate_attempt_segments_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    assert running.attempt_token is not None
+    segment = storage.begin_job_attempt_artifact(
+        running.id,
+        running.attempt_token,
+    )
+    storage.append_artifact(segment, b'{"index":0}\n')
+    first_ref = storage.seal_artifact(segment)
+    duplicate_id = "b" * 32
+    duplicate_path = storage.artifact_dir / f"{duplicate_id}.complete"
+    duplicate_path.write_bytes(first_ref.path.read_bytes())
+    storage._connection.execute(
+        """
+        INSERT INTO storage_leases(
+            id, lease_type, resource_kind, owner_kind, owner_id,
+            phase, controlled_path, reserved_bytes, actual_bytes,
+            content_sha256
+        ) VALUES (?, 'artifact', 'segment_jsonl', 'job', ?,
+                  'sealed', ?, ?, ?, ?)
+        """,
+        (
+            duplicate_id,
+            running.id,
+            str(duplicate_path),
+            first_ref.actual_bytes,
+            first_ref.actual_bytes,
+            first_ref.content_sha256,
+        ),
+    )
+    storage.close()
+    before = recovery_snapshot(tmp_path)
+
+    with pytest.raises(StorageSchemaError):
+        Storage(
+            tmp_path,
+            limits(),
+            current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+            free_bytes=lambda _: 1 << 40,
+        )
+
+    assert recovery_snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize(
