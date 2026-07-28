@@ -70,6 +70,10 @@ def validate_job_id(value: object) -> str:
 
 
 def generate_job_id() -> str:
+    return generate_public_id()
+
+
+def generate_public_id() -> str:
     return "".join(secrets.choice(_CROCKFORD_ALPHABET) for _ in range(8))
 
 

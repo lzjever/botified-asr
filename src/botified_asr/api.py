@@ -30,6 +30,7 @@ from botified_asr.canonical_options import (
 )
 from botified_asr.composition import (
     PreparedSyncResponse,
+    SpeakerEnrollmentProcessor,
     TranscriptionProcessor,
     prepare_sync_transcription,
 )
@@ -39,6 +40,7 @@ from botified_asr.jobs import (
     JobDeletionOutcome,
     JobStatus,
     QueuedJobSpec,
+    generate_public_id,
     validate_job_id,
 )
 from botified_asr.pipeline import PipelineError, PipelineNotReady
@@ -46,7 +48,10 @@ from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.runtime import JobExecutor
 from botified_asr.speaker_profiles import (
     KEEP_EXISTING,
+    MAX_SPEAKER_SAMPLES,
+    MIN_SPEAKER_SAMPLES,
     ReservedSpeakerProfileNameError,
+    SpeakerEmbeddingReplacement,
     SpeakerProfile,
     SpeakerProfileUpdate,
     canonicalize_speaker_profile_name,
@@ -57,10 +62,14 @@ from botified_asr.speaker_snapshot import (
 )
 from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import (
+    InputRef,
+    SpeakerProfileIdCollisionError,
+    SpeakerProfileLimitReachedError,
     SpeakerProfileNameConflictError,
     Storage,
     StorageAdmissionError,
     StoredJobResult,
+    UploadLease,
     JobInputRef,
     JobUploadLease,
 )
@@ -79,7 +88,10 @@ SCALAR_FIELDS = {
 ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
 SPEAKER_METADATA_FIELDS = {"name", "description"}
+SPEAKER_FIELDS = SPEAKER_METADATA_FIELDS | {"samples[]"}
 SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
+MAX_SPEAKER_SAMPLE_BYTES = 20 * 1024 * 1024
+SPEAKER_ID_GENERATION_ATTEMPTS = 16
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _RETENTION_SWEEP_BATCH_SIZE = 32
 _RETENTION_SWEEP_INTERVAL_SECONDS = 60.0
@@ -157,6 +169,7 @@ def create_app(
     processor_fingerprint: str,
     job_executor: JobExecutor | None = None,
     close_storage_on_shutdown: bool = True,
+    speaker_enrollment_processor: SpeakerEnrollmentProcessor | None = None,
 ) -> Starlette:
     if not api_key:
         raise ValueError("api_key must not be empty")
@@ -168,6 +181,11 @@ def create_app(
         raise TypeError("processor fingerprint must be a string")
     if _LOWERCASE_SHA256.fullmatch(processor_fingerprint) is None:
         raise ValueError("processor fingerprint is invalid")
+    if speaker_enrollment_processor is not None and (
+        not hasattr(speaker_enrollment_processor, "process")
+        or not callable(speaker_enrollment_processor.process)
+    ):
+        raise TypeError("speaker enrollment processor is invalid")
     expected_api_key_digest = hashlib.sha256(api_key.encode("utf-8")).digest()
 
     def authenticate(request: Request) -> None:
@@ -258,71 +276,87 @@ def create_app(
             raise _speaker_not_found()
         return JSONResponse(_speaker_profile_object(profile))
 
+    def require_speaker_enrollment() -> SpeakerEnrollmentProcessor:
+        if speaker_enrollment_processor is None:
+            raise _speaker_enrollment_unavailable()
+        return speaker_enrollment_processor
+
+    async def create_speaker(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        enrollment_processor = require_speaker_enrollment()
+        prepared = await _prepare_speaker_change(
+            request,
+            storage,
+            enrollment_processor,
+            speaker_embedding_policy,
+            require_samples=True,
+            description_default=None,
+        )
+        now = datetime.now(timezone.utc)
+        for _ in range(SPEAKER_ID_GENERATION_ATTEMPTS):
+            replacement = prepared.embedding
+            assert isinstance(replacement, SpeakerEmbeddingReplacement)
+            profile = SpeakerProfile(
+                id=generate_public_id(),
+                name=prepared.name,
+                description=prepared.description,
+                embedding=replacement.embedding,
+                embedding_model_id=replacement.embedding_model_id,
+                embedding_model_revision=replacement.embedding_model_revision,
+                embedding_dimension=replacement.embedding_dimension,
+                embedding_policy_fingerprint=(replacement.embedding_policy_fingerprint),
+                sample_count=replacement.sample_count,
+                created_at=now,
+                updated_at=now,
+            )
+            try:
+                created = storage.create_speaker_profile(profile)
+            except SpeakerProfileIdCollisionError:
+                continue
+            except SpeakerProfileNameConflictError as error:
+                raise _speaker_name_conflict() from error
+            except SpeakerProfileLimitReachedError as error:
+                raise ApiError(
+                    409,
+                    "speaker_profile_limit_reached",
+                    "Speaker profile limit reached",
+                ) from error
+            return JSONResponse(
+                _speaker_profile_object(created),
+                status_code=201,
+            )
+        raise ApiError(
+            500,
+            "internal_error",
+            "Internal server error",
+            error_type="server_error",
+        )
+
     async def update_speaker(request: Request) -> Response:
         authenticate(request)
         require_ready()
-        fields = await _ingest_multipart(
+        prepared = await _prepare_speaker_change(
             request,
             storage,
-            None,
-            prefer_async=False,
-            allowed_fields=SPEAKER_METADATA_FIELDS,
-            require_file=False,
+            speaker_enrollment_processor,
+            speaker_embedding_policy,
+            require_samples=False,
+            description_default=KEEP_EXISTING,
         )
-        if "name" not in fields:
-            raise ApiError(
-                400,
-                "invalid_speaker_name",
-                "Speaker name is required",
-                param="name",
-            )
-        try:
-            name = canonicalize_speaker_profile_name(_one(fields, "name"))
-        except ReservedSpeakerProfileNameError as error:
-            raise ApiError(
-                400,
-                "reserved_speaker_name",
-                "Speaker name is reserved",
-                param="name",
-            ) from error
-        except (TypeError, ValueError) as error:
-            raise ApiError(
-                400,
-                "invalid_speaker_name",
-                "Speaker name must contain 1 to 80 characters",
-                param="name",
-            ) from error
-
-        if "description" not in fields:
-            description = KEEP_EXISTING
-        else:
-            raw_description = _one(fields, "description")
-            if len(raw_description) > 500:
-                raise ApiError(
-                    400,
-                    "invalid_speaker_description",
-                    "Speaker description must not exceed 500 characters",
-                    param="description",
-                )
-            description = None if raw_description == "" else raw_description
 
         try:
             profile = storage.update_speaker_profile(
                 request.path_params["speaker_id"],
                 SpeakerProfileUpdate(
-                    name=name,
-                    description=description,
-                    embedding=KEEP_EXISTING,
+                    name=prepared.name,
+                    description=prepared.description,
+                    embedding=prepared.embedding,
                     updated_at=datetime.now(timezone.utc),
                 ),
             )
         except SpeakerProfileNameConflictError as error:
-            raise ApiError(
-                409,
-                "speaker_name_conflict",
-                "Speaker name already exists",
-                param="name",
-            ) from error
+            raise _speaker_name_conflict() from error
         if profile is None:
             raise _speaker_not_found()
         return JSONResponse(_speaker_profile_object(profile))
@@ -615,6 +649,7 @@ def create_app(
             Route("/v1/models", list_models, methods=["GET"]),
             Route("/v1/models/{model_id}", get_model, methods=["GET"]),
             Route("/v1/speakers", list_speakers, methods=["GET"]),
+            Route("/v1/speakers", create_speaker, methods=["POST"]),
             Route(
                 "/v1/speakers/{speaker_id}",
                 get_speaker,
@@ -691,6 +726,291 @@ def _speaker_not_found() -> ApiError:
         "speaker_not_found",
         "Speaker not found",
         param="speaker_id",
+    )
+
+
+def _speaker_name_conflict() -> ApiError:
+    return ApiError(
+        409,
+        "speaker_name_conflict",
+        "Speaker name already exists",
+        param="name",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSpeakerChange:
+    name: str
+    description: object
+    embedding: object
+
+
+class _SpeakerSampleUploads:
+    def __init__(self, storage: Storage) -> None:
+        self.storage = storage
+        self.current: UploadLease | None = None
+        self.refs: list[InputRef] = []
+
+    def begin(self) -> None:
+        self.current = self.storage.begin_upload(
+            "speaker_sample",
+            owner_kind="sync",
+        )
+
+    def append(self, payload: bytes) -> None:
+        assert self.current is not None
+        self.storage.append(self.current, payload)
+
+    def finish(self, size: int) -> None:
+        if size == 0:
+            raise _invalid_speaker_samples()
+        assert self.current is not None
+        self.refs.append(self.storage.seal_upload(self.current))
+        self.current = None
+
+    def paths(self) -> tuple[Path, ...]:
+        return tuple(self.storage.resolve_input(ref) for ref in self.refs)
+
+    def cleanup(self) -> None:
+        cleanup_error: BaseException | None = None
+        try:
+            if self.current is not None:
+                try:
+                    self.storage.abort_upload(self.current)
+                except BaseException as error:
+                    cleanup_error = error
+            for ref in self.refs:
+                try:
+                    self.storage.release_input(ref)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        finally:
+            self.current = None
+            self.refs.clear()
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+async def _prepare_speaker_change(
+    request: Request,
+    storage: Storage,
+    enrollment_processor: SpeakerEnrollmentProcessor | None,
+    speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    *,
+    require_samples: bool,
+    description_default: object,
+) -> _PreparedSpeakerChange:
+    uploads = _SpeakerSampleUploads(storage)
+
+    def begin_sample_upload() -> None:
+        if enrollment_processor is None:
+            raise _speaker_enrollment_unavailable()
+        uploads.begin()
+
+    handler = _MultipartFileHandler(
+        field_name="samples[]",
+        minimum=MIN_SPEAKER_SAMPLES,
+        maximum=MAX_SPEAKER_SAMPLES,
+        byte_limit=MAX_SPEAKER_SAMPLE_BYTES,
+        required=require_samples,
+        begin=begin_sample_upload,
+        append=uploads.append,
+        finish=uploads.finish,
+        cardinality_error=_invalid_speaker_samples,
+        too_large_error=lambda: ApiError(
+            413,
+            "upload_too_large",
+            "Speaker sample exceeds 20 MiB",
+            param="samples[]",
+        ),
+    )
+    try:
+        try:
+            fields = await _ingest_multipart(
+                request,
+                storage,
+                None,
+                prefer_async=False,
+                allowed_fields=SPEAKER_FIELDS,
+                require_file=False,
+                file_handler=handler,
+            )
+        except StorageAdmissionError as error:
+            raise _storage_admission_error(error) from error
+        name, description = _speaker_metadata(
+            fields,
+            description_default=description_default,
+        )
+        embedding: object = KEEP_EXISTING
+        if uploads.refs:
+            if enrollment_processor is None:
+                raise _speaker_enrollment_unavailable()
+            cancellation = Cancellation()
+            try:
+                sample_paths = uploads.paths()
+                embedding = await _run_blocking_while_watching_disconnect(
+                    request,
+                    cancellation,
+                    lambda: enrollment_processor.process(
+                        sample_paths,
+                        cancellation,
+                        effective_max_audio_samples=(
+                            storage.limits.sync_max_audio_duration_secs * SAMPLE_RATE
+                        ),
+                    ),
+                )
+            except (AudioError, PipelineError) as error:
+                raise _speaker_processing_api_error(error) from error
+            if not (
+                isinstance(embedding, SpeakerEmbeddingReplacement)
+                and _speaker_replacement_matches_policy(
+                    embedding,
+                    speaker_embedding_policy,
+                )
+            ):
+                raise ApiError(
+                    500,
+                    "internal_error",
+                    "Internal server error",
+                    error_type="server_error",
+                )
+        return _PreparedSpeakerChange(name, description, embedding)
+    finally:
+        uploads.cleanup()
+
+
+def _speaker_replacement_matches_policy(
+    replacement: SpeakerEmbeddingReplacement,
+    policy: SpeakerEmbeddingPolicy,
+) -> bool:
+    return (
+        replacement.embedding_model_id == policy.model_id
+        and replacement.embedding_model_revision == policy.model_revision
+        and replacement.embedding_dimension == policy.embedding_dimension
+        and replacement.embedding_policy_fingerprint == policy.fingerprint
+    )
+
+
+def _speaker_metadata(
+    fields: Mapping[str, Sequence[str]],
+    *,
+    description_default: object,
+) -> tuple[str, object]:
+    if "name" not in fields:
+        raise ApiError(
+            400,
+            "invalid_speaker_name",
+            "Speaker name is required",
+            param="name",
+        )
+    try:
+        name = canonicalize_speaker_profile_name(_one(fields, "name"))
+    except ReservedSpeakerProfileNameError as error:
+        raise ApiError(
+            400,
+            "reserved_speaker_name",
+            "Speaker name is reserved",
+            param="name",
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise ApiError(
+            400,
+            "invalid_speaker_name",
+            "Speaker name must contain 1 to 80 characters",
+            param="name",
+        ) from error
+
+    if "description" not in fields:
+        description = description_default
+    else:
+        raw_description = _one(fields, "description")
+        if len(raw_description) > 500:
+            raise ApiError(
+                400,
+                "invalid_speaker_description",
+                "Speaker description must not exceed 500 characters",
+                param="description",
+            )
+        description = None if raw_description == "" else raw_description
+    return name, description
+
+
+def _invalid_speaker_samples() -> ApiError:
+    return ApiError(
+        400,
+        "invalid_speaker_samples",
+        "Speaker enrollment requires 2 to 5 non-empty samples",
+        param="samples[]",
+    )
+
+
+def _speaker_enrollment_unavailable() -> ApiError:
+    return ApiError(
+        503,
+        "pipeline_not_ready",
+        "The requested audio pipeline is not ready",
+        error_type="server_error",
+    )
+
+
+def _speaker_processing_api_error(
+    error: AudioError | PipelineError,
+) -> ApiError:
+    if isinstance(error, InferenceSaturated):
+        return ApiError(
+            429,
+            "inference_saturated",
+            "Inference capacity is temporarily unavailable",
+            error_type="rate_limit_error",
+        )
+    if isinstance(error, PipelineNotReady):
+        return ApiError(
+            503,
+            "pipeline_not_ready",
+            "The requested audio pipeline is not ready",
+            error_type="server_error",
+        )
+    invalid_messages = {
+        "invalid_audio": "Speaker sample is not valid audio",
+        "invalid_speaker_samples": "Speaker enrollment samples are invalid",
+        "invalid_speaker_sample_duration": "Speaker sample duration is invalid",
+        "no_speech": "Speaker sample contains no speech",
+        "invalid_speaker_embedding": (
+            "Speaker enrollment produced an invalid embedding"
+        ),
+        "speaker_samples_inconsistent": "Speaker samples are inconsistent",
+    }
+    if error.code in invalid_messages:
+        return ApiError(
+            400,
+            error.code,
+            invalid_messages[error.code],
+            param="samples[]",
+        )
+    if error.code == "audio_too_long":
+        return ApiError(
+            413,
+            error.code,
+            "Speaker sample exceeds the configured audio duration limit",
+            param="samples[]",
+        )
+    if isinstance(error, AudioError) and error.code in {
+        "audio_tool_unavailable",
+        "audio_probe_timeout",
+        "audio_decode_timeout",
+    }:
+        return ApiError(
+            503,
+            error.code,
+            "Audio processing is unavailable",
+            error_type="server_error",
+        )
+    return ApiError(
+        500,
+        "internal_error",
+        "Internal server error",
+        error_type="server_error",
     )
 
 
@@ -899,15 +1219,6 @@ async def _prepare_while_watching_disconnect(
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
     audio_prober: Callable[[Path, Cancellation], MediaProbe],
 ) -> PreparedSyncResponse:
-    prepared: PreparedSyncResponse | None = None
-    worker_errors: list[BaseException] = []
-    propagated_cancellation: BaseException | None = None
-    disconnected = False
-    preparation_finished = False
-    ownership_transferred = False
-    worker_result: list[PreparedSyncResponse] = []
-    worker_finished = anyio.Event()
-
     def prepare_in_worker() -> PreparedSyncResponse:
         media_probe = audio_prober(input_path, cancellation)
         _validate_transcription_preflight(
@@ -926,14 +1237,43 @@ async def _prepare_while_watching_disconnect(
             speaker_embedding_policy=speaker_embedding_policy,
             media_probe=media_probe,
         )
-        worker_result.append(result)
         return result
+
+    def discard_prepared(value: object) -> None:
+        if isinstance(value, PreparedSyncResponse):
+            _close_prepared(value)
+
+    result = await _run_blocking_while_watching_disconnect(
+        request,
+        cancellation,
+        prepare_in_worker,
+        discard=discard_prepared,
+    )
+    if not isinstance(result, PreparedSyncResponse):
+        raise RuntimeError("transcription preparation returned an invalid response")
+    return result
+
+
+async def _run_blocking_while_watching_disconnect(
+    request: Request,
+    cancellation: Cancellation,
+    work: Callable[[], object],
+    *,
+    discard: Callable[[object], None] | None = None,
+) -> object:
+    result: list[object] = []
+    worker_errors: list[BaseException] = []
+    worker_finished = anyio.Event()
+    propagated_cancellation: BaseException | None = None
+    disconnected = False
+    work_finished = False
+    ownership_transferred = False
 
     async def run_worker() -> None:
         try:
-            await run_in_threadpool(prepare_in_worker)
-        except BaseException as exc:
-            worker_errors.append(exc)
+            result.append(await run_in_threadpool(work))
+        except BaseException as error:
+            worker_errors.append(error)
         finally:
             worker_finished.set()
 
@@ -947,7 +1287,7 @@ async def _prepare_while_watching_disconnect(
                     cancellation.cancel()
                     return
         finally:
-            if not preparation_finished:
+            if not work_finished:
                 cancellation.cancel()
 
     try:
@@ -956,50 +1296,42 @@ async def _prepare_while_watching_disconnect(
             task_group.start_soon(run_worker)
             try:
                 await worker_finished.wait()
-            except anyio.get_cancelled_exc_class() as exc:
-                propagated_cancellation = exc
+            except anyio.get_cancelled_exc_class() as error:
+                propagated_cancellation = error
                 cancellation.cancel()
                 with anyio.CancelScope(shield=True):
                     await worker_finished.wait()
             finally:
-                if worker_result:
-                    prepared = worker_result[0]
-                preparation_finished = True
+                work_finished = True
                 task_group.cancel_scope.cancel()
                 if disconnected and propagated_cancellation is None:
                     try:
                         await anyio.lowlevel.checkpoint()
-                    except anyio.get_cancelled_exc_class() as exc:
-                        propagated_cancellation = exc
+                    except anyio.get_cancelled_exc_class() as error:
+                        propagated_cancellation = error
 
         if propagated_cancellation is not None:
             raise propagated_cancellation
         if disconnected:
-            raise RuntimeError(
-                "disconnect cancellation was not propagated"
-            )
+            raise RuntimeError("disconnect cancellation was not propagated")
         if worker_errors:
             raise worker_errors[0]
-        if prepared is None:
-            raise RuntimeError(
-                "transcription preparation returned no response"
-            )
+        if not result:
+            raise RuntimeError("blocking worker returned no result")
         try:
             await anyio.lowlevel.checkpoint_if_cancelled()
         except anyio.get_cancelled_exc_class():
             cancellation.cancel()
             raise
         ownership_transferred = True
-        return prepared
+        return result[0]
     finally:
         if not worker_finished.is_set():
             cancellation.cancel()
             with anyio.CancelScope(shield=True):
                 await worker_finished.wait()
-        if prepared is None and worker_result:
-            prepared = worker_result[0]
-        if prepared is not None and not ownership_transferred:
-            _close_prepared(prepared)
+        if result and not ownership_transferred and discard is not None:
+            discard(result[0])
 
 
 def _processing_api_error(
@@ -1089,6 +1421,7 @@ async def _ingest_multipart(
     prefer_async: bool,
     allowed_fields: Collection[str] = ALL_FIELDS,
     require_file: bool = True,
+    file_handler: _MultipartFileHandler | None = None,
 ) -> dict[str, list[str]]:
     content_type = request.headers.get("content-type", "")
     media_type, options = parse_options_header(content_type)
@@ -1096,18 +1429,54 @@ async def _ingest_multipart(
     if media_type != b"multipart/form-data" or not boundary:
         raise _invalid_multipart("multipart/form-data with a boundary is required")
 
+    if file_handler is not None and append_file is not None:
+        raise TypeError("multipart accepts only one file handler")
+    if file_handler is None and append_file is not None:
+        limits = storage.limits
+        if prefer_async or (limits.sync_max_upload_bytes == limits.max_upload_bytes):
+            byte_limit = limits.max_upload_bytes
+            too_large_status = 413
+            too_large_code = "upload_too_large"
+            too_large_message = "Upload exceeds max_upload_bytes"
+        else:
+            byte_limit = limits.sync_max_upload_bytes
+            too_large_status = 422
+            too_large_code = "async_required"
+            too_large_message = "Prefer: respond-async is required for this upload size"
+
+        def too_large_error() -> ApiError:
+            return ApiError(
+                too_large_status,
+                too_large_code,
+                too_large_message,
+                param="file",
+            )
+
+        file_handler = _MultipartFileHandler(
+            field_name="file",
+            minimum=1,
+            maximum=1,
+            byte_limit=byte_limit,
+            required=require_file,
+            begin=lambda: None,
+            append=append_file,
+            finish=lambda _size: None,
+            cardinality_error=lambda: _invalid_multipart(
+                "Exactly one file part is required"
+            ),
+            too_large_error=too_large_error,
+        )
+
     state = _MultipartState(
-        storage,
-        append_file,
-        prefer_async=prefer_async,
+        file_handler,
         allowed_fields=allowed_fields,
-        require_file=require_file,
     )
     parser = MultipartParser(boundary, state.callbacks)
     raw_body_limit = (
-        (state.file_byte_limit if state.require_file else 0)
-        + MAX_MULTIPART_OVERHEAD_BYTES
-    )
+        file_handler.maximum * file_handler.byte_limit
+        if file_handler is not None
+        else 0
+    ) + MAX_MULTIPART_OVERHEAD_BYTES
     try:
         async for chunk in request.stream():
             offset = 0
@@ -1135,36 +1504,47 @@ async def _ingest_multipart(
         raise ApiError(
             400, "client_disconnected", "Client disconnected during upload"
         ) from exc
+    except StorageAdmissionError:
+        raise
     except ApiError:
         raise
     except Exception as exc:
         raise _invalid_multipart("Malformed multipart body") from exc
 
-    if not state.ended or (state.require_file and not state.file_seen):
-        raise _invalid_multipart("Exactly one file part is required")
-    if state.body_bytes - state.file_bytes > MAX_MULTIPART_OVERHEAD_BYTES:
+    if not state.ended:
+        raise _invalid_multipart("Multipart body did not terminate")
+    state.validate_file_count()
+    if state.body_bytes - state.total_file_bytes > MAX_MULTIPART_OVERHEAD_BYTES:
         raise _invalid_multipart("Multipart overhead exceeds 1 MiB")
     return state.fields
+
+
+@dataclass(frozen=True, slots=True)
+class _MultipartFileHandler:
+    field_name: str
+    minimum: int
+    maximum: int
+    byte_limit: int
+    required: bool
+    begin: Callable[[], None]
+    append: Callable[[bytes], None]
+    finish: Callable[[int], None]
+    cardinality_error: Callable[[], ApiError]
+    too_large_error: Callable[[], ApiError]
 
 
 class _MultipartState:
     def __init__(
         self,
-        storage: Storage,
-        append_file: Callable[[bytes], None] | None,
+        file_handler: _MultipartFileHandler | None,
         *,
-        prefer_async: bool,
         allowed_fields: Collection[str],
-        require_file: bool,
     ) -> None:
-        self.storage = storage
-        self.append_file = append_file
-        self.prefer_async = prefer_async
+        self.file_handler = file_handler
         self.allowed_fields = frozenset(allowed_fields)
-        self.require_file = require_file
         self.body_bytes = 0
-        self.file_bytes = 0
-        self.file_seen = False
+        self.total_file_bytes = 0
+        self.file_count = 0
         self.scalar_bytes = 0
         self.part_count = 0
         self.ended = False
@@ -1175,6 +1555,7 @@ class _MultipartState:
         self._header_bytes = 0
         self._name: str | None = None
         self._is_file = False
+        self._file_bytes = 0
         self._value = bytearray()
         self.callbacks = {
             "on_part_begin": self.on_part_begin,
@@ -1197,6 +1578,7 @@ class _MultipartState:
         self._header_bytes = 2
         self._name = None
         self._is_file = False
+        self._file_bytes = 0
         self._value.clear()
 
     def on_header_field(self, data: bytes, start: int, end: int) -> None:
@@ -1233,13 +1615,16 @@ class _MultipartState:
         if name not in self.allowed_fields:
             raise _invalid_multipart("Unknown multipart part")
         filename = options.get(b"filename")
-        if name == "file":
-            if filename is None or self.file_seen:
-                raise _invalid_multipart("Exactly one file part is allowed")
-            self.file_seen = True
+        if self.file_handler is not None and name == self.file_handler.field_name:
+            if filename is None:
+                raise _invalid_multipart("File part requires a filename")
+            if self.file_count >= self.file_handler.maximum:
+                raise self.file_handler.cardinality_error()
+            self.file_count += 1
             self._is_file = True
+            self.file_handler.begin()
         elif filename is not None:
-            raise _invalid_multipart("Only file may be a file part")
+            raise _invalid_multipart("Unexpected file part")
         elif name not in ARRAY_FIELDS and name in self.fields:
             raise _invalid_multipart("Scalar fields must not be repeated")
         self._name = name
@@ -1260,6 +1645,8 @@ class _MultipartState:
         if self._name is None:
             raise _invalid_multipart("Part headers were not completed")
         if self._is_file:
+            assert self.file_handler is not None
+            self.file_handler.finish(self._file_bytes)
             return
         try:
             value = self._value.decode("utf-8")
@@ -1272,39 +1659,26 @@ class _MultipartState:
         self.ended = True
 
     def _append_file(self, payload: bytes) -> None:
-        assert self.append_file is not None
-        limits = self.storage.limits
-        if self.prefer_async or (
-            limits.sync_max_upload_bytes == limits.max_upload_bytes
-        ):
-            byte_limit = limits.max_upload_bytes
-            status = 413
-            code = "upload_too_large"
-            message = "Upload exceeds max_upload_bytes"
-        else:
-            byte_limit = limits.sync_max_upload_bytes
-            status = 422
-            code = "async_required"
-            message = "Prefer: respond-async is required for this upload size"
-
-        remaining = byte_limit - self.file_bytes
+        assert self.file_handler is not None
+        remaining = self.file_handler.byte_limit - self._file_bytes
         if len(payload) > remaining:
             if remaining > 0:
                 prefix = payload[:remaining]
-                self.append_file(prefix)
-                self.file_bytes += len(prefix)
-            raise ApiError(status, code, message, param="file")
-        self.append_file(payload)
-        self.file_bytes += len(payload)
+                self.file_handler.append(prefix)
+                self._file_bytes += len(prefix)
+                self.total_file_bytes += len(prefix)
+            raise self.file_handler.too_large_error()
+        self.file_handler.append(payload)
+        self._file_bytes += len(payload)
+        self.total_file_bytes += len(payload)
 
-    @property
-    def file_byte_limit(self) -> int:
-        limits = self.storage.limits
-        if self.prefer_async or (
-            limits.sync_max_upload_bytes == limits.max_upload_bytes
-        ):
-            return limits.max_upload_bytes
-        return limits.sync_max_upload_bytes
+    def validate_file_count(self) -> None:
+        if self.file_handler is None:
+            return
+        if self.file_count == 0 and not self.file_handler.required:
+            return
+        if self.file_count < self.file_handler.minimum:
+            raise self.file_handler.cardinality_error()
 
     def _check_header_size(self) -> None:
         current = (
