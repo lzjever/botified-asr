@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, or job-wait JOB_ID TIMEOUT_SECONDS","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, or job-delete JOB_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -42,9 +42,9 @@ job_wait_timeout() {
     exit 75
 }
 
-unexpected_job_response() {
+unexpected_http_response() {
     printf '%s\n' \
-        '{"error":{"message":"Botified ASR job wait received an unexpected response","type":"client_error","param":null,"code":"unexpected_job_response"}}'
+        '{"error":{"message":"Botified ASR received an unexpected HTTP response","type":"client_error","param":null,"code":"unexpected_http_response"}}'
     exit 76
 }
 
@@ -174,6 +174,35 @@ execute_sleep() {
     wait_for_active_child
 }
 
+perform_request() {
+    execute_curl \
+        "$@" \
+        --output "$response_body" \
+        --write-out '%{http_code}' \
+        >"$http_status_body"
+    curl_status=$?
+    http_code=
+    IFS= read -r http_code <"$http_status_body" || :
+}
+
+classify_http_response() {
+    case "$command_name:$http_code" in
+        health:200 | transcribe:200 | transcribe-long:202 | \
+            job-get:200 | job-get:202 | job-wait:200 | job-delete:202)
+            http_response_kind=body
+            ;;
+        job-wait:202)
+            http_response_kind=active
+            ;;
+        job-delete:204)
+            http_response_kind=empty
+            ;;
+        *)
+            unexpected_http_response
+            ;;
+    esac
+}
+
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
     command_name=health
     audio_file=
@@ -191,6 +220,11 @@ elif [ "$#" -eq 2 ] && [ "$1" = "transcribe-long" ]; then
     wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "job-get" ]; then
     command_name=job-get
+    audio_file=
+    job_id=$2
+    wait_timeout=
+elif [ "$#" -eq 2 ] && [ "$1" = "job-delete" ]; then
+    command_name=job-delete
     audio_file=
     job_id=$2
     wait_timeout=
@@ -362,7 +396,7 @@ while [ -n "$key_padding" ]; do
 done
 
 case "$command_name" in
-    health | job-get | job-wait)
+    health | job-get | job-wait | job-delete)
         request_input=/dev/null
         ;;
     transcribe | transcribe-long)
@@ -374,7 +408,7 @@ case "$command_name" in
 esac
 
 case "$command_name" in
-    job-get | job-wait)
+    job-get | job-wait | job-delete)
         case "$job_id" in
             ????????)
                 case "$job_id" in
@@ -430,11 +464,9 @@ trap 'terminate_active_child_and_exit 143' TERM
 response_body=$(
     mktemp "$temporary_root/botified-asr-body.XXXXXX" 2>/dev/null
 ) || local_io_error
-if [ "$command_name" = "job-wait" ]; then
-    http_status_body=$(
-        mktemp "$temporary_root/botified-asr-http.XXXXXX" 2>/dev/null
-    ) || local_io_error
-fi
+http_status_body=$(
+    mktemp "$temporary_root/botified-asr-http.XXXXXX" 2>/dev/null
+) || local_io_error
 
 set -- \
     --disable \
@@ -483,6 +515,12 @@ case "$command_name" in
             --request GET \
             --url "$origin/v1/audio/transcriptions/$job_id"
         ;;
+    job-delete)
+        set -- \
+            "$@" \
+            --request DELETE \
+            --url "$origin/v1/audio/transcriptions/$job_id"
+        ;;
 esac
 
 if ! { command exec 3<"$request_input"; } 2>/dev/null; then
@@ -497,15 +535,7 @@ if [ "$command_name" = "job-wait" ]; then
             job_wait_timeout
         fi
         format_centiseconds "$remaining_centiseconds"
-        execute_curl \
-            "$@" \
-            --max-time "$formatted_duration" \
-            --output "$response_body" \
-            --write-out '%{http_code}' \
-            >"$http_status_body"
-        curl_status=$?
-        http_code=
-        IFS= read -r http_code <"$http_status_body" || :
+        perform_request "$@" --max-time "$formatted_duration"
 
         if [ "$curl_status" -eq 22 ]; then
             cat "$response_body"
@@ -518,12 +548,13 @@ if [ "$command_name" = "job-wait" ]; then
             curl_failed "$curl_status"
         fi
 
-        case "$http_code" in
-            200)
+        classify_http_response
+        case "$http_response_kind" in
+            body)
                 cat "$response_body"
                 exit 0
                 ;;
-            202)
+            active)
                 read_wait_clock_before_deadline
                 remaining_centiseconds=$((deadline_centiseconds - now_centiseconds))
                 sleep_centiseconds=$backoff_centiseconds
@@ -539,19 +570,22 @@ if [ "$command_name" = "job-wait" ]; then
                     backoff_centiseconds=$((backoff_centiseconds * 2))
                 fi
                 ;;
-            *)
-                unexpected_job_response
-                ;;
         esac
     done
 fi
 
-execute_curl "$@" >"$response_body"
-curl_status=$?
+perform_request "$@"
 
-if [ "$curl_status" -eq 0 ] || [ "$curl_status" -eq 22 ]; then
+if [ "$curl_status" -eq 22 ]; then
     cat "$response_body"
-    exit "$curl_status"
+    exit 22
+fi
+if [ "$curl_status" -ne 0 ]; then
+    curl_failed "$curl_status"
 fi
 
-curl_failed "$curl_status"
+classify_http_response
+if [ "$http_response_kind" = "body" ]; then
+    cat "$response_body"
+fi
+exit 0

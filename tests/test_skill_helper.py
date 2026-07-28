@@ -23,6 +23,7 @@ def _install_fake_curl(
     body: bytes = b'{"status":"ready"}',
     stderr: bytes = b"",
     exit_code: int = 0,
+    http_code: str = "200",
 ) -> tuple[dict[str, str], Path, Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -30,13 +31,35 @@ def _install_fake_curl(
     curl.write_text(
         """#!/bin/sh
 : >"$FAKE_CURL_ARGS"
+output_path=
+capture_output=0
+write_out=
+capture_write_out=0
 for argument do
     printf '%s\\0' "$argument" >>"$FAKE_CURL_ARGS"
+    if [ "$capture_output" -eq 1 ]; then
+        output_path=$argument
+        capture_output=0
+    elif [ "$capture_write_out" -eq 1 ]; then
+        write_out=$argument
+        capture_write_out=0
+    elif [ "$argument" = "--output" ]; then
+        capture_output=1
+    elif [ "$argument" = "--write-out" ]; then
+        capture_write_out=1
+    fi
 done
 /bin/cat >"$FAKE_CURL_STDIN"
 /bin/cat <&3 >"$FAKE_CURL_UPLOAD"
 /usr/bin/env >"$FAKE_CURL_ENV"
-/bin/cat "$FAKE_CURL_BODY"
+if [ -n "$output_path" ]; then
+    /bin/cat "$FAKE_CURL_BODY" >"$output_path"
+else
+    /bin/cat "$FAKE_CURL_BODY"
+fi
+if [ "$write_out" = "%{http_code}" ]; then
+    printf '%s' "$FAKE_CURL_HTTP_CODE"
+fi
 /bin/cat "$FAKE_CURL_STDERR" >&2
 exit "$FAKE_CURL_EXIT"
 """,
@@ -63,6 +86,7 @@ exit "$FAKE_CURL_EXIT"
             "FAKE_CURL_BODY": str(body_path),
             "FAKE_CURL_STDERR": str(stderr_path),
             "FAKE_CURL_EXIT": str(exit_code),
+            "FAKE_CURL_HTTP_CODE": http_code,
             "FAKE_CURL_ENV": str(tmp_path / "curl-env"),
             "FAKE_CURL_UPLOAD": str(tmp_path / "curl-upload"),
         }
@@ -198,6 +222,14 @@ def _error_code(result: subprocess.CompletedProcess[bytes]) -> str:
     return payload["error"]["code"]
 
 
+def _without_http_capture_suffix(arguments: list[bytes]) -> list[bytes]:
+    assert arguments[-5] == b"--output"
+    response_path = Path(os.fsdecode(arguments[-4]))
+    assert arguments[-3:] == [b"--write-out", b"%{http_code}", b""]
+    assert not response_path.exists()
+    return [*arguments[:-5], b""]
+
+
 def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     files = {
         path.relative_to(SKILL_ROOT).as_posix()
@@ -221,6 +253,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr transcribe-long AUDIO_FILE" in body
     assert "scripts/botified-asr job-get JOB_ID" in body
     assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in body
+    assert "scripts/botified-asr job-delete JOB_ID" in body
     assert (
         body.index("first run `scripts/botified-asr health`")
         < body.index("Only after it returns ready")
@@ -236,6 +269,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "`chunking_strategy=auto`" in reference
     assert "GET `/v1/audio/transcriptions/{job_id}`" in reference
     assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in reference
+    assert "DELETE `/v1/audio/transcriptions/{job_id}`" in reference
 
     assert yaml.safe_load(
         (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -243,11 +277,12 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         "interface": {
             "display_name": "Botified ASR",
             "short_description": (
-                "Check readiness and run transcription jobs"
+                "Check readiness and manage transcription jobs"
             ),
             "default_prompt": (
                 "Use $botified-asr to check readiness, transcribe local "
-                "audio, or query a submitted transcription job."
+                "audio, query submitted transcription jobs, or delete a "
+                "job when I explicitly ask."
             ),
         }
     }
@@ -268,6 +303,8 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("job-wait",),
         ("job-wait", "7K3M9Q2W"),
         ("job-wait", "7K3M9Q2W", "1", "extra"),
+        ("job-delete",),
+        ("job-delete", "7K3M9Q2W", "extra"),
     ],
 )
 def test_invalid_command_precedes_the_curl_dependency_check(
@@ -609,6 +646,7 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
         ("transcribe-long", "missing.wav"),
         ("job-get", "malformed/id"),
         ("job-wait", "malformed/id", "invalid-timeout"),
+        ("job-delete", "malformed/id"),
     ],
 )
 def test_client_configuration_errors_precede_local_input_validation(
@@ -736,13 +774,14 @@ def test_job_get_rejects_invalid_job_id_without_request_or_echo(
 
 
 @pytest.mark.parametrize(
-    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    ("body", "curl_stderr", "curl_exit", "http_code", "expected_stdout"),
     [
         (
             b'{"id":"7K3M9Q2W","status":"queued",'
             b'"created_at":"2026-07-27T12:00:00Z"}',
             b"",
             0,
+            "202",
             b'{"id":"7K3M9Q2W","status":"queued",'
             b'"created_at":"2026-07-27T12:00:00Z"}',
         ),
@@ -750,12 +789,14 @@ def test_job_get_rejects_invalid_job_id_without_request_or_echo(
             b'{"error":{"code":"audio_too_long"}}',
             b"curl http 413 detail",
             22,
+            "413",
             b'{"error":{"code":"audio_too_long"}}',
         ),
         (
             b"partial private upload response",
             f"upload failed using {TOKEN}".encode(),
             28,
+            "000",
             (
                 b'{"error":{"message":"Botified ASR request failed",'
                 b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
@@ -768,6 +809,7 @@ def test_transcribe_long_submits_one_private_async_request(
     body: bytes,
     curl_stderr: bytes,
     curl_exit: int,
+    http_code: str,
     expected_stdout: bytes,
 ) -> None:
     environment, args_path, stdin_path = _install_fake_curl(
@@ -775,6 +817,7 @@ def test_transcribe_long_submits_one_private_async_request(
         body=body,
         stderr=curl_stderr,
         exit_code=curl_exit,
+        http_code=http_code,
     )
     _write_client_config(environment, _valid_config())
     target = tmp_path / "real-long-audio.wav"
@@ -788,7 +831,9 @@ def test_transcribe_long_submits_one_private_async_request(
     assert result.returncode == curl_exit
     assert result.stdout == expected_stdout
     assert result.stderr == b""
-    arguments = args_path.read_bytes().split(b"\0")
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
     assert arguments == [
         b"--disable",
         b"--globoff",
@@ -835,13 +880,14 @@ def test_transcribe_long_submits_one_private_async_request(
 
 
 @pytest.mark.parametrize(
-    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    ("body", "curl_stderr", "curl_exit", "http_code", "expected_stdout"),
     [
         (
             b'{"id":"7K3M9Q2W","status":"queued","progress":'
             b'{"processed_audio_secs":0.0,"total_audio_secs":null}}',
             b"",
             0,
+            "202",
             b'{"id":"7K3M9Q2W","status":"queued","progress":'
             b'{"processed_audio_secs":0.0,"total_audio_secs":null}}',
         ),
@@ -850,6 +896,7 @@ def test_transcribe_long_submits_one_private_async_request(
             b'"result":{"text":"hello"}}',
             b"",
             0,
+            "200",
             b'{"id":"7K3M9Q2W","status":"succeeded",'
             b'"result":{"text":"hello"}}',
         ),
@@ -857,12 +904,14 @@ def test_transcribe_long_submits_one_private_async_request(
             b'{"error":{"code":"job_not_found"}}',
             b"curl http 404 detail",
             22,
+            "404",
             b'{"error":{"code":"job_not_found"}}',
         ),
         (
             b"partial private job response",
             f"job lookup failed using {TOKEN}".encode(),
             28,
+            "000",
             (
                 b'{"error":{"message":"Botified ASR request failed",'
                 b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
@@ -875,6 +924,7 @@ def test_job_get_preserves_responses_and_shared_errors(
     body: bytes,
     curl_stderr: bytes,
     curl_exit: int,
+    http_code: str,
     expected_stdout: bytes,
 ) -> None:
     environment, args_path, stdin_path = _install_fake_curl(
@@ -882,6 +932,7 @@ def test_job_get_preserves_responses_and_shared_errors(
         body=body,
         stderr=curl_stderr,
         exit_code=curl_exit,
+        http_code=http_code,
     )
     _write_client_config(environment, _valid_config())
 
@@ -890,7 +941,9 @@ def test_job_get_preserves_responses_and_shared_errors(
     assert result.returncode == curl_exit
     assert result.stdout == expected_stdout
     assert result.stderr == b""
-    arguments = args_path.read_bytes().split(b"\0")
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
     assert arguments == [
         b"--disable",
         b"--globoff",
@@ -1061,11 +1114,21 @@ def test_job_wait_rejects_invalid_timeout_after_configuration(
     assert not args_path.exists()
 
 
-def test_job_wait_reuses_strict_job_id_validation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("job-wait", "../health", "1"),
+        ("job-delete", "../health"),
+    ],
+)
+def test_job_commands_reuse_strict_job_id_validation(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
     _write_client_config(environment, _valid_config())
 
-    result = _run(environment, "job-wait", "../health", "1")
+    result = _run(environment, *arguments)
 
     assert result.returncode == 65
     assert _error_code(result) == "invalid_job_id"
@@ -1089,9 +1152,9 @@ def test_job_wait_reuses_strict_job_id_validation(tmp_path: Path) -> None:
             0,
             76,
             (
-                b'{"error":{"message":"Botified ASR job wait received an '
-                b'unexpected response","type":"client_error","param":null,'
-                b'"code":"unexpected_job_response"}}\n'
+                b'{"error":{"message":"Botified ASR received an unexpected '
+                b'HTTP response","type":"client_error","param":null,'
+                b'"code":"unexpected_http_response"}}\n'
             ),
         ),
         (
@@ -1100,9 +1163,9 @@ def test_job_wait_reuses_strict_job_id_validation(tmp_path: Path) -> None:
             0,
             76,
             (
-                b'{"error":{"message":"Botified ASR job wait received an '
-                b'unexpected response","type":"client_error","param":null,'
-                b'"code":"unexpected_job_response"}}\n'
+                b'{"error":{"message":"Botified ASR received an unexpected '
+                b'HTTP response","type":"client_error","param":null,'
+                b'"code":"unexpected_http_response"}}\n'
             ),
         ),
         (
@@ -1111,9 +1174,9 @@ def test_job_wait_reuses_strict_job_id_validation(tmp_path: Path) -> None:
             0,
             76,
             (
-                b'{"error":{"message":"Botified ASR job wait received an '
-                b'unexpected response","type":"client_error","param":null,'
-                b'"code":"unexpected_job_response"}}\n'
+                b'{"error":{"message":"Botified ASR received an unexpected '
+                b'HTTP response","type":"client_error","param":null,'
+                b'"code":"unexpected_http_response"}}\n'
             ),
         ),
         (
@@ -1354,19 +1417,162 @@ exec /usr/bin/sleep 30
 
 
 @pytest.mark.parametrize(
-    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    ("command_name", "http_code"),
     [
-        (b'{"text":"hello"}', b"", 0, b'{"text":"hello"}'),
+        ("health", "202"),
+        ("transcribe", "202"),
+        ("transcribe-long", "200"),
+        ("job-get", "204"),
+        ("job-delete", "302"),
+    ],
+)
+def test_one_shot_commands_fail_closed_on_unexpected_http_status(
+    tmp_path: Path,
+    command_name: str,
+    http_code: str,
+) -> None:
+    private_body = b"private mismatched response body"
+    environment, _, _ = _install_fake_curl(
+        tmp_path,
+        body=private_body,
+        http_code=http_code,
+    )
+    _write_client_config(environment, _valid_config())
+    if command_name in {"transcribe", "transcribe-long"}:
+        audio_path = tmp_path / "audio.wav"
+        audio_path.write_bytes(b"audio")
+        arguments = (command_name, str(audio_path))
+    elif command_name in {"job-get", "job-delete"}:
+        arguments = (command_name, "7K3M9Q2W")
+    else:
+        arguments = (command_name,)
+
+    result = _run(environment, *arguments)
+
+    assert result.returncode == 76
+    assert result.stdout == (
+        b'{"error":{"message":"Botified ASR received an unexpected HTTP '
+        b'response","type":"client_error","param":null,'
+        b'"code":"unexpected_http_response"}}\n'
+    )
+    assert result.stderr == b""
+    assert private_body not in result.stdout + result.stderr
+    assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    (
+        "body",
+        "http_code",
+        "curl_exit",
+        "expected_exit",
+        "expected_stdout",
+    ),
+    [
+        (
+            b'{"id":"7K3M9Q2W","status":"running"}',
+            "202",
+            0,
+            0,
+            b'{"id":"7K3M9Q2W","status":"running"}',
+        ),
+        (b"must be discarded", "204", 0, 0, b""),
+        (
+            b'{"error":{"code":"job_not_found"}}',
+            "404",
+            22,
+            22,
+            b'{"error":{"code":"job_not_found"}}',
+        ),
+        (
+            b"private transport body",
+            "000",
+            7,
+            7,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+    ],
+)
+def test_job_delete_uses_one_delete_request_and_shared_boundaries(
+    tmp_path: Path,
+    body: bytes,
+    http_code: str,
+    curl_exit: int,
+    expected_exit: int,
+    expected_stdout: bytes,
+) -> None:
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        exit_code=curl_exit,
+        http_code=http_code,
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-delete", "7K3M9Q2W")
+
+    assert result.returncode == expected_exit
+    assert result.stdout == expected_stdout
+    assert result.stderr == b""
+    if http_code == "202":
+        arguments = args_path.read_bytes().split(b"\0")
+        assert arguments[:14] == [
+            b"--disable",
+            b"--globoff",
+            b"--config",
+            b"-",
+            b"--proto",
+            b"=http,https",
+            b"--silent",
+            b"--fail-with-body",
+            b"--connect-timeout",
+            b"5",
+            b"--request",
+            b"DELETE",
+            b"--url",
+            (
+                b"https://asr.example:17770/v1/audio/"
+                b"transcriptions/7K3M9Q2W"
+            ),
+        ]
+        assert arguments[14] == b"--output"
+        assert arguments[16:] == [b"--write-out", b"%{http_code}", b""]
+        assert b"--max-time" not in arguments
+        assert b"--header" not in arguments
+        assert b"--form" not in arguments
+        assert b"--form-string" not in arguments
+        assert b"--location" not in arguments
+        assert b"-L" not in arguments
+        assert TOKEN.encode() not in args_path.read_bytes()
+        assert TOKEN.encode() not in result.stdout + result.stderr
+        assert stdin_path.read_bytes() == (
+            f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+        )
+        assert (tmp_path / "curl-upload").read_bytes() == b""
+        curl_environment = (tmp_path / "curl-env").read_bytes()
+        assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+        assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
+
+
+@pytest.mark.parametrize(
+    ("body", "curl_stderr", "curl_exit", "http_code", "expected_stdout"),
+    [
+        (b'{"text":"hello"}', b"", 0, "200", b'{"text":"hello"}'),
         (
             b'{"error":{"code":"invalid_audio"}}',
             b"curl http 400 detail",
             22,
+            "400",
             b'{"error":{"code":"invalid_audio"}}',
         ),
         (
             b"partial sensitive transport body",
             f"timed out using {TOKEN}".encode(),
             28,
+            "000",
             (
                 b'{"error":{"message":"Botified ASR request failed",'
                 b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
@@ -1379,6 +1585,7 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
     body: bytes,
     curl_stderr: bytes,
     curl_exit: int,
+    http_code: str,
     expected_stdout: bytes,
 ) -> None:
     environment, args_path, stdin_path = _install_fake_curl(
@@ -1386,6 +1593,7 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
         body=body,
         stderr=curl_stderr,
         exit_code=curl_exit,
+        http_code=http_code,
     )
     _write_client_config(environment, _valid_config())
     target = tmp_path / "real-audio.wav"
@@ -1399,7 +1607,9 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
     assert result.returncode == curl_exit
     assert result.stdout == expected_stdout
     assert result.stderr == b""
-    arguments = args_path.read_bytes().split(b"\0")
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
     assert arguments == [
         b"--disable",
         b"--globoff",
@@ -1442,25 +1652,34 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
 
 
 @pytest.mark.parametrize(
-    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    ("body", "curl_stderr", "curl_exit", "http_code", "expected_stdout"),
     [
-        (b'{"status":"ready"}', b"", 0, b'{"status":"ready"}'),
+        (
+            b'{"status":"ready"}',
+            b"",
+            0,
+            "200",
+            b'{"status":"ready"}',
+        ),
         (
             b'{"error":{"code":"invalid_api_key"}}',
             b"curl http 401 detail",
             22,
+            "401",
             b'{"error":{"code":"invalid_api_key"}}',
         ),
         (
             b'{"error":{"code":"service_not_ready"}}',
             b"curl http 503 detail",
             22,
+            "503",
             b'{"error":{"code":"service_not_ready"}}',
         ),
         (
             b"partial sensitive transport body",
             f"could not connect using {TOKEN}".encode(),
             7,
+            "000",
             (
                 b'{"error":{"message":"Botified ASR request failed",'
                 b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
@@ -1470,6 +1689,7 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
             b"timeout detail",
             f"timed out using {TOKEN}".encode(),
             28,
+            "000",
             (
                 b'{"error":{"message":"Botified ASR request failed",'
                 b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
@@ -1482,6 +1702,7 @@ def test_health_curl_boundary_is_private_and_preserves_public_results(
     body: bytes,
     curl_stderr: bytes,
     curl_exit: int,
+    http_code: str,
     expected_stdout: bytes,
 ) -> None:
     environment, args_path, stdin_path = _install_fake_curl(
@@ -1489,6 +1710,7 @@ def test_health_curl_boundary_is_private_and_preserves_public_results(
         body=body,
         stderr=curl_stderr,
         exit_code=curl_exit,
+        http_code=http_code,
     )
     _write_client_config(environment, _valid_config())
 
@@ -1497,7 +1719,9 @@ def test_health_curl_boundary_is_private_and_preserves_public_results(
     assert result.returncode == curl_exit
     assert result.stdout == expected_stdout
     assert result.stderr == b""
-    arguments = args_path.read_bytes().split(b"\0")
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
     assert arguments == [
         b"--disable",
         b"--globoff",

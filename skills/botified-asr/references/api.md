@@ -65,3 +65,15 @@ seconds must be a decimal integer from 1 through 999999999.
 The command emits no intermediate active responses. It returns the terminal
 HTTP 200 JSON unchanged, or one final service or helper error JSON. A local
 deadline expiry returns `job_wait_timeout`.
+
+# Delete or cancel a transcription job
+
+Only when the user explicitly asks to cancel or delete a job, run
+`scripts/botified-asr job-delete JOB_ID`. It sends an authenticated
+DELETE `/v1/audio/transcriptions/{job_id}` request with the same strict job ID
+validation as the query commands.
+
+HTTP 202 returns the service JSON unchanged as the immediate cancellation
+request and does not wait. Terminal HTTP 204 succeeds with no output. HTTP error
+bodies are returned unchanged; transport and helper-local failures return JSON
+with a stable `error.code`.

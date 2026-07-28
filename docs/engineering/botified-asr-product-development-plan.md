@@ -1290,16 +1290,23 @@ speaker-delete
 - `job-wait` 先立即 GET，此后按 `1/2/4/8` 秒退避且固定以 8 秒封顶，不加
   jitter。每次传给 curl 或 sleep 的 duration 都取当时 remaining 与对应上限的
   较小值，完成后重新读取时钟；不宣称进程调度绝不会 overshoot deadline。
-- curl exit 22 时原样输出服务响应并立即退出。curl exit 0 时，仅 HTTP `200`
-  是 terminal：原样输出 JSON 并 exit 0；HTTP `202` 是 active：丢弃该次 JSON，
-  重新读取 deadline 后才决定 timeout 或 sleep；包括 3xx 在内的其他最终 HTTP
-  状态返回 `unexpected_job_response`，`param=null`，exit 76。其他非 0/22 curl
-  状态立即返回 `curl_failed`；唯一例外是 curl exit 28 后重新读取时钟且
+- curl exit 22 时原样输出服务响应并立即退出。其他非 0/22 curl 状态立即返回
+  `curl_failed`；唯一例外是 `job-wait` 的 curl exit 28 后重新读取时钟且
   `now >= deadline`，此时返回 `job_wait_timeout`。
+- curl exit 0 时按命令 fail-closed：`health` 仅允许 HTTP 200，`transcribe`
+  仅允许 200，`transcribe-long` 仅允许 202，`job-get` 和 `job-wait` 仅允许
+  200/202，`job-delete` 仅允许 202/204。包括 3xx、畸形状态和其他状态在内的
+  非白名单响应丢弃 body，返回 `unexpected_http_response`，`param=null`，
+  exit 76。
+- `job-wait` 的 HTTP 200 是 terminal：原样输出 JSON 并 exit 0；HTTP 202 是
+  active：丢弃该次 JSON，重新读取 deadline 后才决定 timeout 或 sleep。
+- `job-delete JOB_ID` 复用严格 job ID 校验，对同一 job URL 发送 DELETE；HTTP
+  202 原样输出立即请求的 JSON 且不等待，terminal HTTP 204 成功且无输出。
 - deadline 到期返回 `job_wait_timeout`，`param=timeout_seconds`，exit 75。
   `job-wait` 只输出最终一次 JSON，不输出任何中间 active 响应。
 - 所有服务错误保留稳定 error code。
-- 输出 JSON 供 Agent 处理，不替 Agent 生成总结。
+- 除 `job-delete` terminal HTTP 204 无输出外，输出 JSON 供 Agent 处理，不替
+  Agent 生成总结。
 
 ### 15.4 独立安装
 
