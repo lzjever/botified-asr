@@ -15,6 +15,7 @@ from typing import BinaryIO, Callable, Iterator
 
 from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.config import RESERVATION_QUANTUM, LimitsConfig
+from botified_asr.contracts import PUBLIC_ID_PATTERN
 from botified_asr.job_fingerprints import build_request_fingerprints
 from botified_asr.jobs import (
     DurableJob,
@@ -51,14 +52,13 @@ from botified_asr.speakers import SpeakerEmbeddingPolicy
 
 SCHEMA_VERSION = 5
 MAX_SPEAKER_PROFILES = 256
-LEASE_ID_PATTERN = re.compile(
-    r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})$"
-)
+_LEASE_ID_VALUE_PATTERN = rf"(?:[0-9a-f]{{32}}|{PUBLIC_ID_PATTERN})"
+LEASE_ID_PATTERN = re.compile(rf"^{_LEASE_ID_VALUE_PATTERN}$")
 STAGING_NAME_PATTERN = re.compile(
-    r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})\.(?:partial|ready)$"
+    rf"^{_LEASE_ID_VALUE_PATTERN}\.(?:partial|ready)$"
 )
 ARTIFACT_NAME_PATTERN = re.compile(
-    r"^(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{8})\.(?:partial|complete)$"
+    rf"^{_LEASE_ID_VALUE_PATTERN}\.(?:partial|complete)$"
 )
 LEASE_TYPES = {"upload", "artifact"}
 ARTIFACT_KINDS = {"segment_jsonl", "result_complete"}
@@ -5001,9 +5001,7 @@ class Storage:
                                 r"[0-9a-f]{32}", lease_id
                             )
                             is not None
-                            and re.fullmatch(
-                                r"[0-9A-HJKMNP-TV-Z]{8}", owner_id
-                            )
+                            and re.fullmatch(PUBLIC_ID_PATTERN, owner_id)
                             is not None
                         )
                     )

@@ -4,9 +4,14 @@ import json
 import re
 from collections.abc import Sequence
 
-from botified_asr.contracts import CanonicalOptions
+from botified_asr.contracts import CanonicalOptions, PUBLIC_ID_PATTERN
 
 MAX_CANONICAL_OPTIONS_JSON_BYTES = 4096
+MODEL_VALUES = ("sensevoice", "sensevoice-diarize")
+LANGUAGE_VALUES = ("auto", "zh", "en", "yue", "ja", "ko")
+RESPONSE_FORMAT_VALUES = ("json", "text", "verbose_json", "diarized_json")
+CHUNKING_STRATEGY_VALUES = ("auto",)
+INCLUDE_VALUES = ("funasr.emotion", "funasr.audio_events")
 
 _CANONICAL_KEYS = {
     "chunking_strategy",
@@ -16,8 +21,6 @@ _CANONICAL_KEYS = {
     "model",
     "response_format",
 }
-_INCLUDE_ORDER = ("funasr.emotion", "funasr.audio_events")
-_SPEAKER_ID_PATTERN = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 
 
 class CanonicalOptionsValidationError(ValueError):
@@ -74,26 +77,17 @@ def canonicalize_option_values(
     include: object = (),
     known_speaker_ids: object = (),
 ) -> CanonicalOptions:
-    if type(model) is not str or model not in {
-        "sensevoice",
-        "sensevoice-diarize",
-    }:
+    if type(model) is not str or model not in MODEL_VALUES:
         _error(
             "invalid_model",
             "model must be sensevoice or sensevoice-diarize",
             "model",
         )
-    if type(language) is not str or language not in {
-        "auto",
-        "zh",
-        "en",
-        "yue",
-        "ja",
-        "ko",
-    }:
+    if type(language) is not str or language not in LANGUAGE_VALUES:
         _error("invalid_language", "unsupported language", "language")
     if chunking_strategy is not None and (
-        type(chunking_strategy) is not str or chunking_strategy != "auto"
+        type(chunking_strategy) is not str
+        or chunking_strategy not in CHUNKING_STRATEGY_VALUES
     ):
         _error(
             "invalid_chunking_strategy",
@@ -124,12 +118,10 @@ def canonicalize_option_values(
                 "response_format",
             )
 
-    if type(response_format) is not str or response_format not in {
-        "json",
-        "text",
-        "verbose_json",
-        "diarized_json",
-    }:
+    if (
+        type(response_format) is not str
+        or response_format not in RESPONSE_FORMAT_VALUES
+    ):
         _error(
             "invalid_response_format",
             "unsupported response_format",
@@ -143,12 +135,12 @@ def canonicalize_option_values(
         param="include[]",
     )
     invalid_include = next(
-        (value for value in include_values if value not in _INCLUDE_ORDER),
+        (value for value in include_values if value not in INCLUDE_VALUES),
         None,
     )
     if invalid_include is not None:
         _error("invalid_include", "unsupported include value", "include[]")
-    includes = tuple(value for value in _INCLUDE_ORDER if value in include_values)
+    includes = tuple(value for value in INCLUDE_VALUES if value in include_values)
     if response_format == "text" and includes:
         _error(
             "incompatible_response_format",
@@ -169,7 +161,8 @@ def canonicalize_option_values(
             "known_speaker_ids[]",
         )
     if len(known_ids) > 32 or any(
-        _SPEAKER_ID_PATTERN.fullmatch(value) is None for value in known_ids
+        re.fullmatch(PUBLIC_ID_PATTERN, value) is None
+        for value in known_ids
     ):
         _error(
             "invalid_known_speaker_ids",

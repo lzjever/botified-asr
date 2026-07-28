@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+
+JSON = "application/json"
+MULTIPART = "multipart/form-data"
+ERROR_CONTENT = {
+    JSON: {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}
+}
+
+
+def _project_version(project_root: Path) -> str:
+    with (project_root / "pyproject.toml").open("rb") as source:
+        version = tomllib.load(source)["project"]["version"]
+    if not isinstance(version, str) or re.fullmatch(
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
+        version,
+    ) is None:
+        raise RuntimeError("project.version must be canonical X.Y.Z")
+    return version
+
+
+def _validate_runtime_routes(
+    project_root: Path,
+    document: dict[str, object],
+) -> None:
+    from botified_asr.api import Readiness, create_app
+    from botified_asr.config import LimitsConfig
+    from botified_asr.speakers import SpeakerEmbeddingPolicy
+    from botified_asr.storage import Storage
+
+    class InertProcessor:
+        def process(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("OpenAPI generation must not run inference")
+
+    with tempfile.TemporaryDirectory(prefix="botified-asr-openapi-") as directory:
+        storage = Storage(
+            Path(directory),
+            LimitsConfig(),
+            current_processor_fingerprint="0" * 64,
+            free_bytes=lambda _path: 1 << 60,
+        )
+        try:
+            app = create_app(
+                api_key="openapi-generation",
+                readiness=Readiness(True, True, True),
+                storage=storage,
+                processor=InertProcessor(),
+                speaker_embedding_policy=SpeakerEmbeddingPolicy(
+                    model_id="funasr/campplus",
+                    model_revision="0" * 40,
+                    embedding_dimension=192,
+                    sample_rate=16_000,
+                    downmix_policy_version="ffmpeg-first-audio-stream-ac1-v1",
+                    window_samples=24_000,
+                    window_shift_samples=12_000,
+                    padding_policy_version="right-zero-pad-v1",
+                    normalization_policy_version="int16-div-32768-l2-v1",
+                    enrollment_aggregation_policy_version=(
+                        "sample-centroid-equal-average-v1"
+                    ),
+                ),
+                audio_prober=lambda *_args: None,
+                processor_fingerprint="0" * 64,
+                close_storage_on_shutdown=False,
+            )
+            actual = {
+                (method, route.path)
+                for route in app.routes
+                for method in (route.methods or ())
+                if method != "HEAD"
+            }
+        finally:
+            storage.close()
+    documented = {
+        (method.upper(), path)
+        for path, path_item in document["paths"].items()
+        for method in path_item
+    }
+    if actual != documented:
+        missing = sorted(documented - actual)
+        unexpected = sorted(actual - documented)
+        raise RuntimeError(
+            f"OpenAPI route drift: missing={missing!r}, unexpected={unexpected!r}"
+        )
+
+
+def _response(schema: str, description: str = "Success") -> dict[str, object]:
+    return {
+        "description": description,
+        "content": {JSON: {"schema": {"$ref": f"#/components/schemas/{schema}"}}},
+    }
+
+
+def _error(description: str) -> dict[str, object]:
+    return {"description": description, "content": ERROR_CONTENT}
+
+
+def _path_parameter(name: str, schema: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": name,
+        "in": "path",
+        "required": True,
+        "schema": schema,
+    }
+
+
+def _public_id_schema() -> dict[str, object]:
+    from botified_asr.contracts import PUBLIC_ID_PATTERN
+
+    return {"type": "string", "pattern": f"^{PUBLIC_ID_PATTERN}$"}
+
+
+def _model_truth() -> tuple[list[str], int, str]:
+    from botified_asr.api import _model_objects
+
+    models = _model_objects()
+    model_ids = [model["id"] for model in models]
+    created_values = {model["created"] for model in models}
+    owner_values = {model["owned_by"] for model in models}
+    if (
+        any(type(model_id) is not str for model_id in model_ids)
+        or len(created_values) != 1
+        or len(owner_values) != 1
+    ):
+        raise RuntimeError("model metadata is not representable in OpenAPI")
+    created = created_values.pop()
+    owner = owner_values.pop()
+    if type(created) is not int or type(owner) is not str:
+        raise RuntimeError("model metadata is invalid")
+    return model_ids, created, owner
+
+
+def _speaker_form(*, samples_required: bool) -> dict[str, object]:
+    from botified_asr.api import MAX_SPEAKER_SAMPLE_BYTES
+    from botified_asr.speaker_profiles import (
+        MAX_SPEAKER_SAMPLES,
+        MIN_SPEAKER_SAMPLES,
+        SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS,
+        SPEAKER_PROFILE_NAME_MAX_CHARS,
+    )
+
+    required = ["name"]
+    if samples_required:
+        required.append("samples[]")
+    description = (
+        "Optional description. Omit or send an empty value for no description."
+        if samples_required
+        else "Omit to preserve the current description; send an empty value to clear it."
+    )
+    return {
+        "type": "object",
+        "required": required,
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "After surrounding whitespace is trimmed, must contain "
+                    f"1 to {SPEAKER_PROFILE_NAME_MAX_CHARS} characters."
+                ),
+            },
+            "description": {
+                "type": "string",
+                "maxLength": SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS,
+                "description": description,
+            },
+            "samples[]": {
+                "type": "array",
+                "minItems": MIN_SPEAKER_SAMPLES,
+                "maxItems": MAX_SPEAKER_SAMPLES,
+                "items": {
+                    "type": "string",
+                    "format": "binary",
+                    "minLength": 1,
+                    "maxLength": MAX_SPEAKER_SAMPLE_BYTES,
+                    "description": (
+                        "A non-empty audio sample with a 20 MiB byte limit."
+                    ),
+                },
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def _schemas() -> dict[str, object]:
+    from botified_asr.speaker_profiles import (
+        MAX_SPEAKER_SAMPLES,
+        MIN_SPEAKER_SAMPLES,
+        SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS,
+        SPEAKER_PROFILE_NAME_MAX_CHARS,
+    )
+
+    model_ids, model_created, model_owner = _model_truth()
+    timed_annotation = {
+        "type": "object",
+        "required": ["label", "start", "end"],
+        "properties": {
+            "label": {"type": "string"},
+            "start": {"type": "number", "minimum": 0},
+            "end": {"type": "number", "minimum": 0},
+        },
+        "additionalProperties": False,
+    }
+    return {
+        "ErrorDetail": {
+            "type": "object",
+            "required": ["message", "type", "param", "code"],
+            "properties": {
+                "message": {"type": "string"},
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "authentication_error",
+                        "invalid_request_error",
+                        "rate_limit_error",
+                        "server_error",
+                    ],
+                },
+                "param": {"type": ["string", "null"]},
+                "code": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "ErrorResponse": {
+            "type": "object",
+            "required": ["error"],
+            "properties": {
+                "error": {"$ref": "#/components/schemas/ErrorDetail"}
+            },
+            "additionalProperties": False,
+        },
+        "LiveHealth": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"type": "string", "const": "ok"}},
+            "additionalProperties": False,
+        },
+        "ReadyHealth": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"type": "string", "const": "ready"}},
+            "additionalProperties": False,
+        },
+        "Model": {
+            "type": "object",
+            "required": ["id", "object", "created", "owned_by"],
+            "properties": {
+                "id": {"type": "string", "enum": model_ids},
+                "object": {"type": "string", "const": "model"},
+                "created": {"type": "integer", "const": model_created},
+                "owned_by": {"type": "string", "const": model_owner},
+            },
+            "additionalProperties": False,
+        },
+        "ModelList": {
+            "type": "object",
+            "required": ["object", "data"],
+            "properties": {
+                "object": {"type": "string", "const": "list"},
+                "data": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/Model"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "SpeakerEmbeddingModel": {
+            "type": "object",
+            "required": ["id", "revision", "dimension", "policy_fingerprint"],
+            "properties": {
+                "id": {"type": "string", "const": "cam++"},
+                "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                "dimension": {"type": "integer", "minimum": 1},
+                "policy_fingerprint": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "Speaker": {
+            "type": "object",
+            "required": [
+                "id",
+                "object",
+                "name",
+                "description",
+                "sample_count",
+                "embedding_model",
+                "created_at",
+                "updated_at",
+            ],
+            "properties": {
+                "id": _public_id_schema(),
+                "object": {"type": "string", "const": "speaker"},
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": SPEAKER_PROFILE_NAME_MAX_CHARS,
+                },
+                "description": {
+                    "type": ["string", "null"],
+                    "maxLength": SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS,
+                },
+                "sample_count": {
+                    "type": "integer",
+                    "minimum": MIN_SPEAKER_SAMPLES,
+                    "maximum": MAX_SPEAKER_SAMPLES,
+                },
+                "embedding_model": {
+                    "$ref": "#/components/schemas/SpeakerEmbeddingModel"
+                },
+                "created_at": {"type": "string", "format": "date-time"},
+                "updated_at": {"type": "string", "format": "date-time"},
+            },
+            "additionalProperties": False,
+        },
+        "SpeakerList": {
+            "type": "object",
+            "required": ["object", "data"],
+            "properties": {
+                "object": {"type": "string", "const": "list"},
+                "data": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/Speaker"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "JobAccepted": {
+            "type": "object",
+            "required": ["id", "status", "created_at"],
+            "properties": {
+                "id": _public_id_schema(),
+                "status": {"type": "string", "const": "queued"},
+                "created_at": {"type": "string", "format": "date-time"},
+            },
+            "additionalProperties": False,
+        },
+        "JobProgress": {
+            "type": "object",
+            "required": ["processed_audio_secs", "total_audio_secs"],
+            "properties": {
+                "processed_audio_secs": {"type": "number", "minimum": 0},
+                "total_audio_secs": {"type": ["number", "null"], "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        "QueuedJob": _active_job_schema("queued"),
+        "RunningJob": _active_job_schema("running"),
+        "ActiveJob": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/QueuedJob"},
+                {"$ref": "#/components/schemas/RunningJob"},
+            ]
+        },
+        "SucceededJob": {
+            "type": "object",
+            "required": ["id", "status", "result"],
+            "properties": {
+                "id": _public_id_schema(),
+                "status": {"type": "string", "const": "succeeded"},
+                "result": {
+                    "$ref": "#/components/schemas/JsonTranscriptionResult"
+                },
+            },
+            "additionalProperties": False,
+        },
+        "FailedJob": {
+            "type": "object",
+            "required": ["id", "status", "error", "finished_at"],
+            "properties": {
+                "id": _public_id_schema(),
+                "status": {"type": "string", "const": "failed"},
+                "error": {"$ref": "#/components/schemas/ErrorDetail"},
+                "finished_at": {"type": "string", "format": "date-time"},
+            },
+            "additionalProperties": False,
+        },
+        "CancelledJob": {
+            "type": "object",
+            "required": ["id", "status", "finished_at"],
+            "properties": {
+                "id": _public_id_schema(),
+                "status": {"type": "string", "const": "cancelled"},
+                "finished_at": {"type": "string", "format": "date-time"},
+            },
+            "additionalProperties": False,
+        },
+        "TerminalJob": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/SucceededJob"},
+                {"$ref": "#/components/schemas/FailedJob"},
+                {"$ref": "#/components/schemas/CancelledJob"},
+            ]
+        },
+        "CancellationAccepted": {
+            "type": "object",
+            "required": ["id", "status"],
+            "properties": {
+                "id": _public_id_schema(),
+                "status": {"type": "string", "enum": ["cancelled", "running"]},
+            },
+            "additionalProperties": False,
+        },
+        "TimedAnnotation": timed_annotation,
+        "FunASRAnnotations": {
+            "type": "object",
+            "properties": {
+                "emotion": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/TimedAnnotation"},
+                },
+                "audio_events": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/TimedAnnotation"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "FunASRSpeakerMatch": {
+            "type": "object",
+            "required": ["speaker_id", "anonymous_speaker", "similarity"],
+            "properties": {
+                "speaker_id": _public_id_schema(),
+                "anonymous_speaker": {
+                    "type": "string",
+                    "pattern": "^[A-Z]+$",
+                },
+                "similarity": {"type": "number", "minimum": -1, "maximum": 1},
+            },
+            "additionalProperties": False,
+        },
+        "TranscriptionSegment": {
+            "type": "object",
+            "required": ["id", "start", "end", "text"],
+            "properties": {
+                "id": {"type": "string", "pattern": "^[0-9]+$"},
+                "start": {"type": "number", "minimum": 0},
+                "end": {"type": "number", "minimum": 0},
+                "text": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "DiarizedTranscriptionSegment": {
+            "type": "object",
+            "required": ["id", "type", "start", "end", "speaker", "text"],
+            "properties": {
+                "id": {"type": "string", "pattern": "^[0-9]+$"},
+                "type": {
+                    "type": "string",
+                    "const": "transcript.text.segment",
+                },
+                "start": {"type": "number", "minimum": 0},
+                "end": {"type": "number", "minimum": 0},
+                "speaker": {"type": "string"},
+                "text": {"type": "string"},
+                "funasr": {"$ref": "#/components/schemas/FunASRSpeakerMatch"},
+            },
+            "additionalProperties": False,
+        },
+        "SimpleTranscriptionResult": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+                "text": {"type": "string"},
+                "funasr": {"$ref": "#/components/schemas/FunASRAnnotations"},
+            },
+            "additionalProperties": False,
+        },
+        "VerboseTranscriptionResult": {
+            "type": "object",
+            "required": ["task", "language", "duration", "text", "segments"],
+            "properties": {
+                "task": {"type": "string", "const": "transcribe"},
+                "language": {"type": "string"},
+                "duration": {"type": "number", "minimum": 0},
+                "text": {"type": "string"},
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/components/schemas/TranscriptionSegment"
+                    },
+                },
+                "funasr": {"$ref": "#/components/schemas/FunASRAnnotations"},
+            },
+            "additionalProperties": False,
+        },
+        "DiarizedTranscriptionResult": {
+            "type": "object",
+            "required": ["task", "duration", "text", "segments"],
+            "properties": {
+                "task": {"type": "string", "const": "transcribe"},
+                "duration": {"type": "number", "minimum": 0},
+                "text": {"type": "string"},
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "$ref": (
+                            "#/components/schemas/DiarizedTranscriptionSegment"
+                        )
+                    },
+                },
+                "funasr": {"$ref": "#/components/schemas/FunASRAnnotations"},
+            },
+            "additionalProperties": False,
+        },
+        "JsonTranscriptionResult": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/SimpleTranscriptionResult"},
+                {"$ref": "#/components/schemas/VerboseTranscriptionResult"},
+                {"$ref": "#/components/schemas/DiarizedTranscriptionResult"},
+            ]
+        },
+    }
+
+
+def _active_job_schema(status: str) -> dict[str, object]:
+    return {
+        "type": "object",
+        "required": ["id", "status", "progress"],
+        "properties": {
+            "id": _public_id_schema(),
+            "status": {"type": "string", "const": status},
+            "progress": {"$ref": "#/components/schemas/JobProgress"},
+        },
+        "additionalProperties": False,
+    }
+
+
+def _transcription_form() -> dict[str, object]:
+    from botified_asr.canonical_options import (
+        CHUNKING_STRATEGY_VALUES,
+        INCLUDE_VALUES,
+        LANGUAGE_VALUES,
+        MODEL_VALUES,
+        RESPONSE_FORMAT_VALUES,
+    )
+    from botified_asr.contracts import PUBLIC_ID_PATTERN
+
+    file_schema = {
+        "type": "string",
+        "format": "binary",
+        "description": (
+            "Audio input; upload-size and duration limits are deployment-configured."
+        ),
+    }
+    language_schema = {
+        "type": "string",
+        "enum": list(LANGUAGE_VALUES),
+    }
+    chunking_schema = {
+        "type": "string",
+        "enum": list(CHUNKING_STRATEGY_VALUES),
+    }
+    include_schema = {
+        "type": "array",
+        "items": {"type": "string", "enum": list(INCLUDE_VALUES)},
+    }
+    known_speakers_schema = {
+        "type": "array",
+        "maxItems": 32,
+        "uniqueItems": True,
+        "items": {
+            "type": "string",
+            "pattern": f"^{PUBLIC_ID_PATTERN}$",
+        },
+    }
+    sensevoice_model, diarized_model = MODEL_VALUES
+    json_format, text_format, verbose_format, diarized_format = (
+        RESPONSE_FORMAT_VALUES
+    )
+    (auto_chunking,) = CHUNKING_STRATEGY_VALUES
+    common = {
+        "file": file_schema,
+        "language": language_schema,
+        "chunking_strategy": chunking_schema,
+    }
+    return {
+        "description": (
+            "sensevoice-diarize requires explicit chunking_strategy=auto and "
+            "response_format=diarized_json; known_speaker_ids[] is only valid "
+            "for that model. response_format=text cannot be combined with "
+            "include[]."
+        ),
+        "oneOf": [
+            {
+                "title": "SenseVoice JSON request",
+                "type": "object",
+                "required": ["file", "model"],
+                "properties": {
+                    **common,
+                    "model": {"type": "string", "const": sensevoice_model},
+                    "response_format": {
+                        "type": "string",
+                        "enum": [json_format, verbose_format],
+                    },
+                    "include[]": include_schema,
+                },
+                "additionalProperties": False,
+            },
+            {
+                "title": "SenseVoice text request",
+                "type": "object",
+                "required": ["file", "model", "response_format"],
+                "properties": {
+                    **common,
+                    "model": {"type": "string", "const": sensevoice_model},
+                    "response_format": {
+                        "type": "string",
+                        "const": text_format,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            {
+                "title": "SenseVoice diarized request",
+                "type": "object",
+                "required": [
+                    "file",
+                    "model",
+                    "response_format",
+                    "chunking_strategy",
+                ],
+                "properties": {
+                    **common,
+                    "model": {
+                        "type": "string",
+                        "const": diarized_model,
+                    },
+                    "response_format": {
+                        "type": "string",
+                        "const": diarized_format,
+                    },
+                    "chunking_strategy": {
+                        "type": "string",
+                        "const": auto_chunking,
+                    },
+                    "include[]": include_schema,
+                    "known_speaker_ids[]": known_speakers_schema,
+                },
+                "additionalProperties": False,
+            },
+        ],
+    }
+
+
+def _document(version: str) -> dict[str, object]:
+    common_errors = {
+        "400": _error("Invalid request"),
+        "401": _error("Authentication failed"),
+        "404": _error("Not found"),
+        "409": _error("Conflict"),
+        "413": _error("Request too large"),
+        "422": _error("Request cannot be processed"),
+        "429": _error("Capacity is temporarily unavailable"),
+        "500": _error("Internal server error"),
+        "503": _error("Service is unavailable"),
+    }
+    speaker_id = _path_parameter("speaker_id", _public_id_schema())
+    job_id = _path_parameter("job_id", _public_id_schema())
+    model_ids, _, _ = _model_truth()
+    model_id = _path_parameter(
+        "model_id",
+        {"type": "string", "enum": model_ids},
+    )
+    speaker_post = _speaker_form(samples_required=True)
+    speaker_put = _speaker_form(samples_required=False)
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Botified ASR API", "version": version},
+        "security": [{"BearerAuth": []}],
+        "paths": {
+            "/health/live": {
+                "get": {
+                    "operationId": "getHealthLive",
+                    "security": [],
+                    "responses": {"200": _response("LiveHealth")},
+                }
+            },
+            "/health/ready": {
+                "get": {
+                    "operationId": "getHealthReady",
+                    "responses": {
+                        "200": _response("ReadyHealth"),
+                        "401": common_errors["401"],
+                        "503": common_errors["503"],
+                    },
+                }
+            },
+            "/v1/models": {
+                "get": {
+                    "operationId": "listModels",
+                    "responses": {
+                        "200": _response("ModelList"),
+                        "401": common_errors["401"],
+                    },
+                }
+            },
+            "/v1/models/{model_id}": {
+                "get": {
+                    "operationId": "getModel",
+                    "parameters": [model_id],
+                    "responses": {
+                        "200": _response("Model"),
+                        "401": common_errors["401"],
+                        "404": common_errors["404"],
+                    },
+                }
+            },
+            "/v1/speakers": {
+                "get": {
+                    "operationId": "listSpeakers",
+                    "responses": {
+                        "200": _response("SpeakerList"),
+                        "401": common_errors["401"],
+                        "500": common_errors["500"],
+                        "503": common_errors["503"],
+                    },
+                },
+                "post": {
+                    "operationId": "createSpeaker",
+                    "requestBody": {
+                        "required": True,
+                        "content": {MULTIPART: {"schema": speaker_post}},
+                    },
+                    "responses": {
+                        "201": _response("Speaker", "Speaker created"),
+                        **{
+                            status: common_errors[status]
+                            for status in (
+                                "400",
+                                "401",
+                                "409",
+                                "413",
+                                "429",
+                                "500",
+                                "503",
+                            )
+                        },
+                    },
+                },
+            },
+            "/v1/speakers/{speaker_id}": {
+                "get": {
+                    "operationId": "getSpeaker",
+                    "parameters": [speaker_id],
+                    "responses": {
+                        "200": _response("Speaker"),
+                        "401": common_errors["401"],
+                        "404": common_errors["404"],
+                        "500": common_errors["500"],
+                        "503": common_errors["503"],
+                    },
+                },
+                "put": {
+                    "operationId": "updateSpeaker",
+                    "parameters": [speaker_id],
+                    "requestBody": {
+                        "required": True,
+                        "content": {MULTIPART: {"schema": speaker_put}},
+                    },
+                    "responses": {
+                        "200": _response("Speaker"),
+                        **{
+                            status: common_errors[status]
+                            for status in (
+                                "400",
+                                "401",
+                                "404",
+                                "409",
+                                "413",
+                                "429",
+                                "500",
+                                "503",
+                            )
+                        },
+                    },
+                },
+                "delete": {
+                    "operationId": "deleteSpeaker",
+                    "parameters": [speaker_id],
+                    "responses": {
+                        "204": {"description": "Speaker deleted"},
+                        "401": common_errors["401"],
+                        "404": common_errors["404"],
+                        "500": common_errors["500"],
+                        "503": common_errors["503"],
+                    },
+                },
+            },
+            "/v1/audio/transcriptions": {
+                "post": {
+                    "operationId": "createTranscription",
+                    "description": (
+                        "Transcribes synchronously unless Prefer contains "
+                        "respond-async. Upload-size and duration limits are "
+                        "deployment-configured."
+                    ),
+                    "parameters": [
+                        {
+                            "name": "Prefer",
+                            "in": "header",
+                            "required": False,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            MULTIPART: {"schema": _transcription_form()}
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Synchronous transcription",
+                            "content": {
+                                JSON: {
+                                    "schema": {
+                                        "$ref": (
+                                            "#/components/schemas/"
+                                            "JsonTranscriptionResult"
+                                        )
+                                    }
+                                },
+                                "text/plain": {"schema": {"type": "string"}},
+                            },
+                        },
+                        "202": {
+                            **_response("JobAccepted", "Job accepted"),
+                            "headers": {
+                                "Location": {
+                                    "required": True,
+                                    "schema": {"type": "string"},
+                                },
+                                "Preference-Applied": {
+                                    "required": True,
+                                    "schema": {
+                                        "type": "string",
+                                        "const": "respond-async",
+                                    },
+                                },
+                            },
+                        },
+                        **common_errors,
+                    },
+                }
+            },
+            "/v1/audio/transcriptions/{job_id}": {
+                "get": {
+                    "operationId": "getTranscriptionJob",
+                    "parameters": [job_id],
+                    "responses": {
+                        "200": _response("TerminalJob"),
+                        "202": _response("ActiveJob", "Job is active"),
+                        "401": common_errors["401"],
+                        "404": common_errors["404"],
+                        "500": common_errors["500"],
+                        "503": common_errors["503"],
+                    },
+                },
+                "delete": {
+                    "operationId": "deleteTranscriptionJob",
+                    "parameters": [job_id],
+                    "responses": {
+                        "202": _response(
+                            "CancellationAccepted",
+                            "Cancellation accepted",
+                        ),
+                        "204": {"description": "Terminal job deleted"},
+                        "401": common_errors["401"],
+                        "404": common_errors["404"],
+                        "500": common_errors["500"],
+                        "503": common_errors["503"],
+                    },
+                },
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {"type": "http", "scheme": "bearer"}
+            },
+            "schemas": _schemas(),
+        },
+    }
+
+
+def _write_atomic(output: Path, content: bytes) -> None:
+    if output.is_symlink():
+        raise RuntimeError("Output must not be a symbolic link")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(content)
+            os.fchmod(temporary.fileno(), 0o644)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, output)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: generate-openapi OUTPUT")
+    project_root = Path(__file__).resolve(strict=True).parent.parent
+    output = Path(sys.argv[1])
+    sys.path.insert(0, str(project_root / "src"))
+    document = _document(_project_version(project_root))
+    _validate_runtime_routes(project_root, document)
+    content = (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    _write_atomic(output, content)
+
+
+if __name__ == "__main__":
+    main()

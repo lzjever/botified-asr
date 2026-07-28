@@ -25,6 +25,7 @@ from starlette.routing import Route
 from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation, MediaProbe
 from botified_asr.canonical_options import (
     CanonicalOptionsValidationError,
+    MODEL_VALUES,
     canonicalize_option_values,
     serialize_canonical_options,
 )
@@ -51,6 +52,8 @@ from botified_asr.speaker_profiles import (
     MAX_SPEAKER_SAMPLES,
     MIN_SPEAKER_SAMPLES,
     ReservedSpeakerProfileNameError,
+    SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS,
+    SPEAKER_PROFILE_NAME_MAX_CHARS,
     SpeakerEmbeddingReplacement,
     SpeakerProfile,
     SpeakerProfileUpdate,
@@ -917,7 +920,8 @@ def _speaker_metadata(
         raise ApiError(
             400,
             "invalid_speaker_name",
-            "Speaker name must contain 1 to 80 characters",
+            "Speaker name must contain 1 to "
+            f"{SPEAKER_PROFILE_NAME_MAX_CHARS} characters",
             param="name",
         ) from error
 
@@ -925,11 +929,12 @@ def _speaker_metadata(
         description = description_default
     else:
         raw_description = _one(fields, "description")
-        if len(raw_description) > 500:
+        if len(raw_description) > SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS:
             raise ApiError(
                 400,
                 "invalid_speaker_description",
-                "Speaker description must not exceed 500 characters",
+                "Speaker description must not exceed "
+                f"{SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS} characters",
                 param="description",
             )
         description = None if raw_description == "" else raw_description
@@ -1706,7 +1711,7 @@ def _model_objects() -> list[dict[str, object]]:
             "created": MODEL_CREATED,
             "owned_by": "botified-asr",
         }
-        for model_id in ("sensevoice", "sensevoice-diarize")
+        for model_id in MODEL_VALUES
     ]
 
 

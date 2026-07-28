@@ -7,9 +7,12 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from botified_asr.canonical_options import parse_canonical_options_json
-from botified_asr.contracts import DIRECT_MAX_SAMPLES, MAX_AUDIO_SAMPLES
+from botified_asr.contracts import (
+    DIRECT_MAX_SAMPLES,
+    MAX_AUDIO_SAMPLES,
+    PUBLIC_ID_PATTERN,
+)
 
-_JOB_ID = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -64,7 +67,7 @@ class JobCancellationRequestedError(RuntimeError):
 def validate_job_id(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("job ID must be a string")
-    if _JOB_ID.fullmatch(value) is None:
+    if re.fullmatch(PUBLIC_ID_PATTERN, value) is None:
         raise ValueError("job ID is invalid")
     return value
 

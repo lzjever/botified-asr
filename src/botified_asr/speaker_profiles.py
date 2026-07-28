@@ -8,6 +8,7 @@ from enum import Enum
 
 import numpy as np
 
+from botified_asr.contracts import PUBLIC_ID_PATTERN
 from botified_asr.speakers import (
     SPEAKER_EMBEDDING_NORM_TOLERANCE,
     SpeakerEmbeddingPolicy,
@@ -15,7 +16,6 @@ from botified_asr.speakers import (
     validate_speaker_model_revision,
 )
 
-_SPEAKER_ID = re.compile(r"\A[0-9A-HJKMNP-TV-Z]{8}\Z")
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _ANONYMOUS_LABEL_NAME = re.compile(r"\A[A-Z]+\Z")
 _UNKNOWN_LABEL_NAME = re.compile(
@@ -25,6 +25,8 @@ _UNKNOWN_LABEL_NAME = re.compile(
 _LITTLE_ENDIAN_FLOAT32 = np.dtype("<f4")
 MIN_SPEAKER_SAMPLES = 2
 MAX_SPEAKER_SAMPLES = 5
+SPEAKER_PROFILE_NAME_MAX_CHARS = 80
+SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS = 500
 
 
 class ReservedSpeakerProfileNameError(ValueError):
@@ -34,7 +36,7 @@ class ReservedSpeakerProfileNameError(ValueError):
 def validate_speaker_profile_id(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("speaker profile ID must be a string")
-    if _SPEAKER_ID.fullmatch(value) is None:
+    if re.fullmatch(PUBLIC_ID_PATTERN, value) is None:
         raise ValueError("speaker profile ID is invalid")
     return value
 
@@ -43,8 +45,11 @@ def canonicalize_speaker_profile_name(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("speaker profile name must be a string")
     name = value.strip()
-    if not 1 <= len(name) <= 80:
-        raise ValueError("speaker profile name must contain 1 to 80 characters")
+    if not 1 <= len(name) <= SPEAKER_PROFILE_NAME_MAX_CHARS:
+        raise ValueError(
+            "speaker profile name must contain 1 to "
+            f"{SPEAKER_PROFILE_NAME_MAX_CHARS} characters"
+        )
     if (
         _ANONYMOUS_LABEL_NAME.fullmatch(name) is not None
         or _UNKNOWN_LABEL_NAME.fullmatch(name) is not None
@@ -129,9 +134,13 @@ class SpeakerProfile:
         description = self.description
         if description is not None and not isinstance(description, str):
             raise TypeError("speaker profile description must be a string or None")
-        if description is not None and len(description) > 500:
+        if (
+            description is not None
+            and len(description) > SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS
+        ):
             raise ValueError(
-                "speaker profile description must not exceed 500 characters"
+                "speaker profile description must not exceed "
+                f"{SPEAKER_PROFILE_DESCRIPTION_MAX_CHARS} characters"
             )
 
         _validate_profile_embedding_fields(
