@@ -109,6 +109,16 @@ def _embedding_state(profile: speaker_profiles.SpeakerProfile) -> tuple[object, 
     )
 
 
+@pytest.mark.parametrize("name", ("A", "Unknown A"))
+def test_reserved_profile_name_has_a_typed_value_error(name: str) -> None:
+    with pytest.raises(
+        speaker_profiles.ReservedSpeakerProfileNameError
+    ) as caught:
+        speaker_profiles.canonicalize_speaker_profile_name(name)
+
+    assert isinstance(caught.value, ValueError)
+
+
 def test_round_trip_reopen_canonical_utc_and_stable_list_order(
     tmp_path: Path,
 ) -> None:
@@ -360,9 +370,18 @@ def test_update_commands_require_complete_fields_and_reject_invalid_changes(
             description="must roll back",
             updated_at=CREATED_AT + timedelta(seconds=30),
         )
-        with pytest.raises(ValueError):
-            storage.update_speaker_profile(original.id, stale)
-        assert storage.get_speaker_profile(original.id) == original
+        clamped = storage.update_speaker_profile(original.id, stale)
+        assert clamped.description == "must roll back"
+        assert clamped.updated_at == original.updated_at
+
+        invalid_time = _update(
+            "Alice",
+            description="must not commit",
+            updated_at=datetime(2026, 7, 27, 12, 2),
+        )
+        with pytest.raises(TypeError):
+            storage.update_speaker_profile(original.id, invalid_time)
+        assert storage.get_speaker_profile(original.id) == clamped
     finally:
         storage.close()
 

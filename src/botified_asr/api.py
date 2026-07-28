@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import re
 from asyncio import Event, Task, create_task, wait_for
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,13 +44,20 @@ from botified_asr.jobs import (
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
 from botified_asr.runtime import JobExecutor
-from botified_asr.speaker_profiles import SpeakerProfile
+from botified_asr.speaker_profiles import (
+    KEEP_EXISTING,
+    ReservedSpeakerProfileNameError,
+    SpeakerProfile,
+    SpeakerProfileUpdate,
+    canonicalize_speaker_profile_name,
+)
 from botified_asr.speaker_snapshot import (
     SelectedSpeakerIncompatibleError,
     SelectedSpeakerNotFoundError,
 )
 from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import (
+    SpeakerProfileNameConflictError,
     Storage,
     StorageAdmissionError,
     StoredJobResult,
@@ -71,6 +78,7 @@ SCALAR_FIELDS = {
 }
 ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
+SPEAKER_METADATA_FIELDS = {"name", "description"}
 SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _RETENTION_SWEEP_BATCH_SIZE = 32
@@ -240,6 +248,75 @@ def create_app(
         authenticate(request)
         require_ready()
         profile = storage.get_speaker_profile(request.path_params["speaker_id"])
+        if profile is None:
+            raise _speaker_not_found()
+        return JSONResponse(_speaker_profile_object(profile))
+
+    async def update_speaker(request: Request) -> Response:
+        authenticate(request)
+        require_ready()
+        fields = await _ingest_multipart(
+            request,
+            storage,
+            None,
+            prefer_async=False,
+            allowed_fields=SPEAKER_METADATA_FIELDS,
+            require_file=False,
+        )
+        if "name" not in fields:
+            raise ApiError(
+                400,
+                "invalid_speaker_name",
+                "Speaker name is required",
+                param="name",
+            )
+        try:
+            name = canonicalize_speaker_profile_name(_one(fields, "name"))
+        except ReservedSpeakerProfileNameError as error:
+            raise ApiError(
+                400,
+                "reserved_speaker_name",
+                "Speaker name is reserved",
+                param="name",
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise ApiError(
+                400,
+                "invalid_speaker_name",
+                "Speaker name must contain 1 to 80 characters",
+                param="name",
+            ) from error
+
+        if "description" not in fields:
+            description = KEEP_EXISTING
+        else:
+            raw_description = _one(fields, "description")
+            if len(raw_description) > 500:
+                raise ApiError(
+                    400,
+                    "invalid_speaker_description",
+                    "Speaker description must not exceed 500 characters",
+                    param="description",
+                )
+            description = None if raw_description == "" else raw_description
+
+        try:
+            profile = storage.update_speaker_profile(
+                request.path_params["speaker_id"],
+                SpeakerProfileUpdate(
+                    name=name,
+                    description=description,
+                    embedding=KEEP_EXISTING,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            )
+        except SpeakerProfileNameConflictError as error:
+            raise ApiError(
+                409,
+                "speaker_name_conflict",
+                "Speaker name already exists",
+                param="name",
+            ) from error
         if profile is None:
             raise _speaker_not_found()
         return JSONResponse(_speaker_profile_object(profile))
@@ -532,6 +609,11 @@ def create_app(
                 "/v1/speakers/{speaker_id}",
                 get_speaker,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/speakers/{speaker_id}",
+                update_speaker,
+                methods=["PUT"],
             ),
             Route(
                 "/v1/speakers/{speaker_id}",
@@ -965,9 +1047,11 @@ def _processing_api_error(
 async def _ingest_multipart(
     request: Request,
     storage: Storage,
-    append_file: Callable[[bytes], None],
+    append_file: Callable[[bytes], None] | None,
     *,
     prefer_async: bool,
+    allowed_fields: Collection[str] = ALL_FIELDS,
+    require_file: bool = True,
 ) -> dict[str, list[str]]:
     content_type = request.headers.get("content-type", "")
     media_type, options = parse_options_header(content_type)
@@ -979,10 +1063,13 @@ async def _ingest_multipart(
         storage,
         append_file,
         prefer_async=prefer_async,
+        allowed_fields=allowed_fields,
+        require_file=require_file,
     )
     parser = MultipartParser(boundary, state.callbacks)
     raw_body_limit = (
-        state.file_byte_limit + MAX_MULTIPART_OVERHEAD_BYTES
+        (state.file_byte_limit if state.require_file else 0)
+        + MAX_MULTIPART_OVERHEAD_BYTES
     )
     try:
         async for chunk in request.stream():
@@ -1016,7 +1103,7 @@ async def _ingest_multipart(
     except Exception as exc:
         raise _invalid_multipart("Malformed multipart body") from exc
 
-    if not state.ended or not state.file_seen:
+    if not state.ended or (state.require_file and not state.file_seen):
         raise _invalid_multipart("Exactly one file part is required")
     if state.body_bytes - state.file_bytes > MAX_MULTIPART_OVERHEAD_BYTES:
         raise _invalid_multipart("Multipart overhead exceeds 1 MiB")
@@ -1027,13 +1114,17 @@ class _MultipartState:
     def __init__(
         self,
         storage: Storage,
-        append_file: Callable[[bytes], None],
+        append_file: Callable[[bytes], None] | None,
         *,
         prefer_async: bool,
+        allowed_fields: Collection[str],
+        require_file: bool,
     ) -> None:
         self.storage = storage
         self.append_file = append_file
         self.prefer_async = prefer_async
+        self.allowed_fields = frozenset(allowed_fields)
+        self.require_file = require_file
         self.body_bytes = 0
         self.file_bytes = 0
         self.file_seen = False
@@ -1102,7 +1193,7 @@ class _MultipartState:
             name = name_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _invalid_multipart("Part name must be UTF-8") from exc
-        if name not in ALL_FIELDS:
+        if name not in self.allowed_fields:
             raise _invalid_multipart("Unknown multipart part")
         filename = options.get(b"filename")
         if name == "file":
@@ -1112,7 +1203,7 @@ class _MultipartState:
             self._is_file = True
         elif filename is not None:
             raise _invalid_multipart("Only file may be a file part")
-        elif name in SCALAR_FIELDS and name in self.fields:
+        elif name not in ARRAY_FIELDS and name in self.fields:
             raise _invalid_multipart("Scalar fields must not be repeated")
         self._name = name
 
@@ -1144,6 +1235,7 @@ class _MultipartState:
         self.ended = True
 
     def _append_file(self, payload: bytes) -> None:
+        assert self.append_file is not None
         limits = self.storage.limits
         if self.prefer_async or (
             limits.sync_max_upload_bytes == limits.max_upload_bytes

@@ -1169,12 +1169,8 @@ class Storage:
                 embedding_policy_fingerprint=embedding_policy_fingerprint,
                 sample_count=sample_count,
                 created_at=current.created_at,
-                updated_at=update.updated_at,
+                updated_at=max(current.updated_at, update.updated_at),
             )
-            if changed.updated_at < current.updated_at:
-                raise ValueError(
-                    "speaker profile updated_at must not move backwards"
-                )
             if (
                 self._connection.execute(
                     """

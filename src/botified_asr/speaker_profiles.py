@@ -25,6 +25,10 @@ _UNKNOWN_LABEL_NAME = re.compile(
 _LITTLE_ENDIAN_FLOAT32 = np.dtype("<f4")
 
 
+class ReservedSpeakerProfileNameError(ValueError):
+    pass
+
+
 def validate_speaker_profile_id(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("speaker profile ID must be a string")
@@ -43,7 +47,9 @@ def canonicalize_speaker_profile_name(value: object) -> str:
         _ANONYMOUS_LABEL_NAME.fullmatch(name) is not None
         or _UNKNOWN_LABEL_NAME.fullmatch(name) is not None
     ):
-        raise ValueError("speaker profile name is reserved")
+        raise ReservedSpeakerProfileNameError(
+            "speaker profile name is reserved"
+        )
     return name
 
 
