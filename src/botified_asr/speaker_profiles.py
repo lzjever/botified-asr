@@ -23,6 +23,8 @@ _UNKNOWN_LABEL_NAME = re.compile(
     flags=re.ASCII | re.IGNORECASE,
 )
 _LITTLE_ENDIAN_FLOAT32 = np.dtype("<f4")
+MIN_SPEAKER_SAMPLES = 2
+MAX_SPEAKER_SAMPLES = 5
 
 
 class ReservedSpeakerProfileNameError(ValueError):
@@ -233,7 +235,7 @@ def _validate_profile_embedding_fields(
         raise ValueError("speaker embedding policy fingerprint is invalid")
     if type(sample_count) is not int:
         raise TypeError("speaker profile sample count must be an integer")
-    if not 2 <= sample_count <= 5:
+    if not MIN_SPEAKER_SAMPLES <= sample_count <= MAX_SPEAKER_SAMPLES:
         raise ValueError("speaker profile sample count must be between 2 and 5")
 
 

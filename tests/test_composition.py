@@ -528,6 +528,7 @@ def test_processor_pool_sync_and_async_share_round_robin_and_request_affinity() 
     )
     pool = composition_module.TranscriptionProcessorPool(processors)
 
+    assert pool.speaker_enrollment_processor is None
     assert _call_pooled_processor(pool.sync_processor) == "lane-0"
     assert _call_pooled_processor(pool.async_processor) == "lane-1"
     assert _call_pooled_processor(pool.async_processor) == "lane-0"
@@ -540,6 +541,118 @@ def test_processor_pool_sync_and_async_share_round_robin_and_request_affinity() 
             (processor.name, "asr"),
             (processor.name, "speaker"),
         ] * 2
+
+
+def test_processor_pool_enrollment_shares_lane_selection_and_sync_session() -> None:
+    selected: list[str] = []
+    lanes = (
+        inference_module.SerialInferenceLane(),
+        inference_module.SerialInferenceLane(),
+    )
+    transcription_processors = tuple(
+        PoolRecordingProcessor(f"transcription-{index}", lane, selected)
+        for index, lane in enumerate(lanes)
+    )
+
+    class EnrollmentProcessor:
+        def __init__(
+            self,
+            name: str,
+            lane: inference_module.SerialInferenceLane,
+        ) -> None:
+            self.name = name
+            self.lane = lane
+
+        def process(
+            self,
+            sample_paths: tuple[Path, ...],
+            cancellation: Cancellation,
+            *,
+            effective_max_audio_samples: int,
+        ) -> str:
+            assert sample_paths == (Path("a.ready"), Path("b.ready"))
+            assert type(cancellation) is Cancellation
+            assert effective_max_audio_samples == 32_000
+            session = inference_module._session_local.current
+            assert session.category == "sync"
+            return self.lane.invoke(lambda: self.name)
+
+    enrollment_processors = tuple(
+        EnrollmentProcessor(f"enrollment-{index}", lane)
+        for index, lane in enumerate(lanes)
+    )
+    pool = composition_module.TranscriptionProcessorPool(
+        transcription_processors,
+        enrollment_processors,
+    )
+
+    assert _call_pooled_processor(pool.sync_processor) == "transcription-0"
+    assert pool.speaker_enrollment_processor is not None
+    assert (
+        pool.speaker_enrollment_processor.process(
+            (Path("a.ready"), Path("b.ready")),
+            Cancellation(),
+            effective_max_audio_samples=32_000,
+        )
+        == "enrollment-1"
+    )
+    assert _call_pooled_processor(pool.async_processor) == "transcription-0"
+
+
+def test_processor_pool_enrollment_routes_away_from_active_transcription_lane() -> None:
+    decode_entered = threading.Event()
+    release_decode = threading.Event()
+    lanes = (
+        inference_module.SerialInferenceLane(),
+        inference_module.SerialInferenceLane(),
+    )
+
+    class TranscriptionProcessor:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def process(self, *_args: object, **_kwargs: object) -> int:
+            if self.index == 0:
+                decode_entered.set()
+                assert release_decode.wait(timeout=2)
+            return self.index
+
+    class EnrollmentProcessor:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def process(self, *_args: object, **_kwargs: object) -> int:
+            return lanes[self.index].invoke(lambda: self.index)
+
+    pool = composition_module.TranscriptionProcessorPool(
+        tuple(TranscriptionProcessor(index) for index in range(2)),
+        tuple(EnrollmentProcessor(index) for index in range(2)),
+    )
+    errors: list[BaseException] = []
+    transcription = threading.Thread(
+        target=lambda: _call_pooled_processor(pool.sync_processor),
+        daemon=True,
+    )
+    transcription.start()
+    assert decode_entered.wait(timeout=1)
+    try:
+        assert pool.speaker_enrollment_processor is not None
+        assert (
+            pool.speaker_enrollment_processor.process(
+                (Path("a.ready"), Path("b.ready")),
+                Cancellation(),
+                effective_max_audio_samples=32_000,
+            )
+            == 1
+        )
+    except BaseException as error:
+        errors.append(error)
+    finally:
+        release_decode.set()
+        transcription.join(timeout=1)
+
+    assert not transcription.is_alive()
+    assert errors == []
 
 
 def test_processor_pool_routes_repeated_sync_to_idle_lane_not_busy_round_robin(
@@ -805,6 +918,26 @@ def test_processor_pool_rejects_invalid_lane_processors(
 ) -> None:
     with pytest.raises(error_type):
         composition_module.TranscriptionProcessorPool(processors)
+
+
+@pytest.mark.parametrize(
+    ("enrollment_processors", "error_type"),
+    (
+        ([], TypeError),
+        ((), ValueError),
+        ((object(),), TypeError),
+        ((object(), object()), ValueError),
+    ),
+)
+def test_processor_pool_rejects_invalid_enrollment_processors(
+    enrollment_processors: object,
+    error_type: type[Exception],
+) -> None:
+    with pytest.raises(error_type):
+        composition_module.TranscriptionProcessorPool(
+            (EmittingProcessor(),),
+            enrollment_processors,  # type: ignore[arg-type]
+        )
 
 
 class RuntimeModel:

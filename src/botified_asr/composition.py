@@ -38,6 +38,7 @@ from botified_asr.result_artifact import (
     finalize_result_envelope,
 )
 from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_profiles import SpeakerEmbeddingReplacement
 from botified_asr.speaker_snapshot import (
     SelectedSpeakerSnapshot,
     parse_selected_speaker_snapshot,
@@ -70,26 +71,34 @@ class TranscriptionProcessor(Protocol):
     ) -> ProcessorResult: ...
 
 
-class _LeastActiveProcessorSelector:
-    def __init__(
+class SpeakerEnrollmentProcessor(Protocol):
+    def process(
         self,
-        processors: tuple[TranscriptionProcessor, ...],
-    ) -> None:
-        self._processors = processors
+        sample_paths: tuple[Path, ...],
+        cancellation: Cancellation,
+        *,
+        effective_max_audio_samples: int,
+    ) -> SpeakerEmbeddingReplacement: ...
+
+
+class _LeastActiveProcessorSelector:
+    def __init__(self, lane_count: int) -> None:
+        if type(lane_count) is not int or lane_count <= 0:
+            raise ValueError("processor lane count must be positive")
         self._lock = threading.Lock()
-        self._active_sessions = [0] * len(processors)
+        self._active_sessions = [0] * lane_count
         self._cursor = 0
 
-    def acquire(self) -> tuple[int, TranscriptionProcessor]:
+    def acquire(self) -> int:
         with self._lock:
             minimum = min(self._active_sessions)
-            for offset in range(len(self._processors)):
-                index = (self._cursor + offset) % len(self._processors)
+            for offset in range(len(self._active_sessions)):
+                index = (self._cursor + offset) % len(self._active_sessions)
                 if self._active_sessions[index] == minimum:
                     break
             self._active_sessions[index] += 1
-            self._cursor = (index + 1) % len(self._processors)
-            return index, self._processors[index]
+            self._cursor = (index + 1) % len(self._active_sessions)
+            return index
 
     def release(self, index: int) -> None:
         with self._lock:
@@ -102,9 +111,11 @@ class _SessionTranscriptionProcessor:
     def __init__(
         self,
         selector: _LeastActiveProcessorSelector,
+        processors: tuple[TranscriptionProcessor, ...],
         category: Literal["sync", "async"],
     ) -> None:
         self._selector = selector
+        self._processors = processors
         self._category = category
 
     def process(
@@ -120,7 +131,8 @@ class _SessionTranscriptionProcessor:
         effective_direct_max_audio_samples: int,
         media_probe: MediaProbe | None = None,
     ) -> ProcessorResult:
-        index, processor = self._selector.acquire()
+        index = self._selector.acquire()
+        processor = self._processors[index]
         try:
             with inference_session(self._category, cancellation):
                 return processor.process(
@@ -140,10 +152,42 @@ class _SessionTranscriptionProcessor:
             self._selector.release(index)
 
 
+class _SessionSpeakerEnrollmentProcessor:
+    def __init__(
+        self,
+        selector: _LeastActiveProcessorSelector,
+        processors: tuple[SpeakerEnrollmentProcessor, ...],
+    ) -> None:
+        self._selector = selector
+        self._processors = processors
+
+    def process(
+        self,
+        sample_paths: tuple[Path, ...],
+        cancellation: Cancellation,
+        *,
+        effective_max_audio_samples: int,
+    ) -> SpeakerEmbeddingReplacement:
+        index = self._selector.acquire()
+        processor = self._processors[index]
+        try:
+            with inference_session("sync", cancellation):
+                return processor.process(
+                    sample_paths,
+                    cancellation,
+                    effective_max_audio_samples=effective_max_audio_samples,
+                )
+        finally:
+            self._selector.release(index)
+
+
 class TranscriptionProcessorPool:
     def __init__(
         self,
         lane_processors: tuple[TranscriptionProcessor, ...],
+        speaker_enrollment_processors: (
+            tuple[SpeakerEnrollmentProcessor, ...] | None
+        ) = None,
     ) -> None:
         if type(lane_processors) is not tuple:
             raise TypeError("lane processors must be a tuple")
@@ -154,12 +198,34 @@ class TranscriptionProcessorPool:
             for processor in lane_processors
         ):
             raise TypeError("each lane processor must have a callable process")
-        selector = _LeastActiveProcessorSelector(lane_processors)
-        self.sync_processor: TranscriptionProcessor = (
-            _SessionTranscriptionProcessor(selector, "sync")
+        if speaker_enrollment_processors is not None:
+            if type(speaker_enrollment_processors) is not tuple:
+                raise TypeError("speaker enrollment processors must be a tuple")
+            if len(speaker_enrollment_processors) != len(lane_processors):
+                raise ValueError(
+                    "speaker enrollment processors must match processor lanes"
+                )
+            if any(
+                not callable(getattr(processor, "process", None))
+                for processor in speaker_enrollment_processors
+            ):
+                raise TypeError(
+                    "each speaker enrollment processor must have a callable process"
+                )
+        selector = _LeastActiveProcessorSelector(len(lane_processors))
+        self.sync_processor: TranscriptionProcessor = _SessionTranscriptionProcessor(
+            selector, lane_processors, "sync"
         )
-        self.async_processor: TranscriptionProcessor = (
-            _SessionTranscriptionProcessor(selector, "async")
+        self.async_processor: TranscriptionProcessor = _SessionTranscriptionProcessor(
+            selector, lane_processors, "async"
+        )
+        self.speaker_enrollment_processor: SpeakerEnrollmentProcessor | None = (
+            None
+            if speaker_enrollment_processors is None
+            else _SessionSpeakerEnrollmentProcessor(
+                selector,
+                speaker_enrollment_processors,
+            )
         )
 
 
