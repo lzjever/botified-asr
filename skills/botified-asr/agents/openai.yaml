@@ -1,0 +1,4 @@
+interface:
+  display_name: "Botified ASR"
+  short_description: "Check configured Botified ASR service readiness"
+  default_prompt: "Use $botified-asr to check whether my configured Botified ASR service is ready."
