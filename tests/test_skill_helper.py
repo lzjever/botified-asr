@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import signal
 import subprocess
+import tarfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 import yaml
@@ -14,6 +16,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = PROJECT_ROOT / "skills" / "botified-asr"
 HELPER = SKILL_ROOT / "scripts" / "botified-asr"
+SKILL_BUILDER = PROJECT_ROOT / "scripts" / "build-skill-tarball"
 TOKEN = "test-token+/=="
 
 
@@ -228,6 +231,125 @@ def _without_http_capture_suffix(arguments: list[bytes]) -> list[bytes]:
     assert arguments[-3:] == [b"--write-out", b"%{http_code}", b""]
     assert not response_path.exists()
     return [*arguments[:-5], b""]
+
+
+def test_skill_tarball_has_exact_safe_ustar_shape_and_contents(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "botified-asr-skill.tar.gz"
+
+    subprocess.run([SKILL_BUILDER, output], check=True)
+
+    expected = [
+        ("botified-asr", tarfile.DIRTYPE, 0o755, None),
+        (
+            "botified-asr/SKILL.md",
+            tarfile.REGTYPE,
+            0o644,
+            SKILL_ROOT / "SKILL.md",
+        ),
+        ("botified-asr/agents", tarfile.DIRTYPE, 0o755, None),
+        (
+            "botified-asr/agents/openai.yaml",
+            tarfile.REGTYPE,
+            0o644,
+            SKILL_ROOT / "agents" / "openai.yaml",
+        ),
+        ("botified-asr/references", tarfile.DIRTYPE, 0o755, None),
+        (
+            "botified-asr/references/api.md",
+            tarfile.REGTYPE,
+            0o644,
+            SKILL_ROOT / "references" / "api.md",
+        ),
+        ("botified-asr/scripts", tarfile.DIRTYPE, 0o755, None),
+        (
+            "botified-asr/scripts/botified-asr",
+            tarfile.REGTYPE,
+            0o755,
+            HELPER,
+        ),
+    ]
+    with tarfile.open(output, "r:gz") as archive:
+        members = archive.getmembers()
+        assert [member.name for member in members] == [
+            item[0] for item in expected
+        ]
+        for member, (name, kind, mode, source) in zip(
+            members,
+            expected,
+            strict=True,
+        ):
+            path = PurePosixPath(name)
+            assert not path.is_absolute()
+            assert path.parts[0] == "botified-asr"
+            assert ".." not in path.parts
+            assert member.type == kind
+            assert member.mode == mode
+            assert member.uid == member.gid == 0
+            assert member.uname == member.gname == ""
+            assert member.mtime == 0
+            if source is not None:
+                extracted = archive.extractfile(member)
+                assert extracted is not None
+                assert extracted.read() == source.read_bytes()
+
+    payload = output.read_bytes()
+    assert payload[3] & 0x08 == 0
+    assert payload[4:8] == b"\0\0\0\0"
+    with gzip.open(output, "rb") as compressed:
+        tar_bytes = compressed.read()
+    for member in members:
+        assert tar_bytes[member.offset + 257 : member.offset + 263] == (
+            b"ustar\0"
+        )
+    assert output.stat().st_mode & 0o777 == 0o644
+    assert SKILL_BUILDER.stat().st_mode & 0o111
+
+    preserved = tmp_path / "preserved"
+    preserved.write_bytes(b"keep")
+    symlink_output = tmp_path / "linked-output.tar.gz"
+    symlink_output.symlink_to(preserved)
+    rejected = subprocess.run(
+        [SKILL_BUILDER, symlink_output],
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert symlink_output.is_symlink()
+    assert preserved.read_bytes() == b"keep"
+
+
+def test_skill_tarball_is_byte_identical_across_umasks(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.tar.gz"
+    second = tmp_path / "second.tar.gz"
+
+    subprocess.run(
+        [
+            "sh",
+            "-c",
+            'umask 077; exec "$1" "$2"',
+            "sh",
+            str(SKILL_BUILDER),
+            str(first),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "sh",
+            "-c",
+            'umask 022; exec "$1" "$2"',
+            "sh",
+            str(SKILL_BUILDER),
+            str(second),
+        ],
+        check=True,
+    )
+
+    assert first.read_bytes() == second.read_bytes()
 
 
 def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:

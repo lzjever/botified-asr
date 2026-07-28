@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import gzip
+import io
+import os
+import stat
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+MEMBERS = (
+    ("botified-asr", ".", tarfile.DIRTYPE, 0o755),
+    ("botified-asr/SKILL.md", "SKILL.md", tarfile.REGTYPE, 0o644),
+    ("botified-asr/agents", "agents", tarfile.DIRTYPE, 0o755),
+    (
+        "botified-asr/agents/openai.yaml",
+        "agents/openai.yaml",
+        tarfile.REGTYPE,
+        0o644,
+    ),
+    ("botified-asr/references", "references", tarfile.DIRTYPE, 0o755),
+    (
+        "botified-asr/references/api.md",
+        "references/api.md",
+        tarfile.REGTYPE,
+        0o644,
+    ),
+    ("botified-asr/scripts", "scripts", tarfile.DIRTYPE, 0o755),
+    (
+        "botified-asr/scripts/botified-asr",
+        "scripts/botified-asr",
+        tarfile.REGTYPE,
+        0o755,
+    ),
+)
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: build-skill-tarball OUTPUT")
+
+    project_root = Path(__file__).resolve(strict=True).parent.parent
+    source_root = project_root / "skills" / "botified-asr"
+    output = Path(sys.argv[1])
+    if output.is_symlink():
+        raise RuntimeError("Output must not be a symbolic link")
+    if output.resolve(strict=False).is_relative_to(
+        source_root.resolve(strict=True)
+    ):
+        raise RuntimeError("Output must be outside the Skill source")
+
+    loaded_members = []
+    for archive_name, relative_path, member_type, mode in MEMBERS:
+        source = source_root / relative_path
+        source_status = source.lstat()
+        if member_type == tarfile.DIRTYPE:
+            if not stat.S_ISDIR(source_status.st_mode):
+                raise RuntimeError(f"Skill directory is invalid: {relative_path}")
+            content = None
+        else:
+            if not stat.S_ISREG(source_status.st_mode):
+                raise RuntimeError(f"Skill file is invalid: {relative_path}")
+            content = source.read_bytes()
+        loaded_members.append((archive_name, member_type, mode, content))
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as raw_output:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                compresslevel=9,
+                fileobj=raw_output,
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(
+                    fileobj=compressed,
+                    mode="w",
+                    format=tarfile.USTAR_FORMAT,
+                ) as archive:
+                    for archive_name, member_type, mode, content in loaded_members:
+                        info = tarfile.TarInfo(archive_name)
+                        info.type = member_type
+                        info.mode = mode
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mtime = 0
+                        info.size = len(content) if content is not None else 0
+                        archive.addfile(
+                            info,
+                            None if content is None else io.BytesIO(content),
+                        )
+            os.fchmod(raw_output.fileno(), 0o644)
+            raw_output.flush()
+            os.fsync(raw_output.fileno())
+        os.replace(temporary_name, output)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    main()
