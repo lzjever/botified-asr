@@ -10,10 +10,13 @@ first run `scripts/botified-asr health`. Only after it returns ready, run
 `scripts/botified-asr transcribe AUDIO_FILE` for a basic transcription, or
 `scripts/botified-asr transcribe-long AUDIO_FILE` to submit a long transcription
 job. Use the returned job ID with `scripts/botified-asr job-get JOB_ID` to query
-the job's current state or result.
+the job's current state or result, or with
+`scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS` to wait for its terminal
+response. The wait command outputs only that final response, never intermediate
+active responses.
 
 Return the helper's JSON unchanged. Treat a nonzero exit as a failed readiness
-check, transcription, submission, or query and report its stable error code without exposing
-credentials, local paths, or raw configuration.
+check, transcription, submission, query, or wait and report its stable error
+code without exposing credentials, local paths, or raw configuration.
 
 Read `references/api.md` only when the request or response contract is needed.

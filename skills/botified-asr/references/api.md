@@ -55,3 +55,13 @@ with progress information, `succeeded` with its result, or `failed` or
 
 HTTP error bodies are also returned unchanged. Transport and helper-local
 failures return JSON with a stable `error.code`.
+
+# Wait for a transcription job
+
+`scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS` immediately queries the
+same job endpoint, then waits while the service returns HTTP 202. Timeout
+seconds must be a decimal integer from 1 through 999999999.
+
+The command emits no intermediate active responses. It returns the terminal
+HTTP 200 JSON unchanged, or one final service or helper error JSON. A local
+deadline expiry returns `job_wait_timeout`.

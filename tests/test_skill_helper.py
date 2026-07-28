@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -68,6 +70,87 @@ exit "$FAKE_CURL_EXIT"
     environment.pop("BOTIFIED_ASR_BASE_URL", None)
     environment.pop("BOTIFIED_ASR_API_KEY", None)
     return environment, args_path, stdin_path
+
+
+def _install_fake_job_wait_tools(
+    tmp_path: Path,
+    responses: list[tuple[bytes, str, int, str]],
+) -> tuple[dict[str, str], Path, Path]:
+    environment, _, _ = _install_fake_curl(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    response_root = tmp_path / "job-wait-responses"
+    response_root.mkdir()
+    for index, (body, http_code, exit_code, delay) in enumerate(
+        responses,
+        start=1,
+    ):
+        prefix = response_root / str(index)
+        prefix.with_suffix(".body").write_bytes(body)
+        prefix.with_suffix(".http").write_text(http_code, encoding="ascii")
+        prefix.with_suffix(".exit").write_text(
+            str(exit_code),
+            encoding="ascii",
+        )
+        prefix.with_suffix(".delay").write_text(delay, encoding="ascii")
+
+    traces = tmp_path / "job-wait-traces"
+    traces.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        """#!/bin/sh
+if [ -f "$FAKE_JOB_WAIT_TRACES/count" ]; then
+    IFS= read -r call <"$FAKE_JOB_WAIT_TRACES/count"
+else
+    call=0
+fi
+call=$((call + 1))
+printf '%s\\n' "$call" >"$FAKE_JOB_WAIT_TRACES/count"
+: >"$FAKE_JOB_WAIT_TRACES/args.$call"
+output_path=
+capture_output=0
+for argument do
+    printf '%s\\0' "$argument" >>"$FAKE_JOB_WAIT_TRACES/args.$call"
+    if [ "$capture_output" -eq 1 ]; then
+        output_path=$argument
+        capture_output=0
+    elif [ "$argument" = "--output" ]; then
+        capture_output=1
+    fi
+done
+/bin/cat >"$FAKE_JOB_WAIT_TRACES/stdin.$call"
+/bin/cat <&3 >"$FAKE_JOB_WAIT_TRACES/upload.$call"
+/usr/bin/env >"$FAKE_JOB_WAIT_TRACES/env.$call"
+prefix=$FAKE_JOB_WAIT_RESPONSES/$call
+/bin/cat "$prefix.body" >"$output_path"
+IFS= read -r delay <"$prefix.delay"
+if [ "$delay" != "0" ]; then
+    /usr/bin/sleep "$delay"
+fi
+/bin/cat "$prefix.http"
+IFS= read -r exit_code <"$prefix.exit"
+exit "$exit_code"
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    sleep_log = traces / "sleep"
+    sleep = fake_bin / "sleep"
+    sleep.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$1" >>"$FAKE_JOB_WAIT_SLEEP"
+exit 0
+""",
+        encoding="utf-8",
+    )
+    sleep.chmod(0o755)
+    environment.update(
+        {
+            "FAKE_JOB_WAIT_RESPONSES": str(response_root),
+            "FAKE_JOB_WAIT_TRACES": str(traces),
+            "FAKE_JOB_WAIT_SLEEP": str(sleep_log),
+        }
+    )
+    return environment, traces, sleep_log
 
 
 def _write_client_config(
@@ -137,6 +220,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr transcribe AUDIO_FILE" in body
     assert "scripts/botified-asr transcribe-long AUDIO_FILE" in body
     assert "scripts/botified-asr job-get JOB_ID" in body
+    assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in body
     assert (
         body.index("first run `scripts/botified-asr health`")
         < body.index("Only after it returns ready")
@@ -151,6 +235,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "`model=sensevoice`" in reference
     assert "`chunking_strategy=auto`" in reference
     assert "GET `/v1/audio/transcriptions/{job_id}`" in reference
+    assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in reference
 
     assert yaml.safe_load(
         (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -180,6 +265,9 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("transcribe-long", "audio.wav", "extra"),
         ("job-get",),
         ("job-get", "7K3M9Q2W", "extra"),
+        ("job-wait",),
+        ("job-wait", "7K3M9Q2W"),
+        ("job-wait", "7K3M9Q2W", "1", "extra"),
     ],
 )
 def test_invalid_command_precedes_the_curl_dependency_check(
@@ -520,16 +608,18 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
         ("transcribe", "missing.wav"),
         ("transcribe-long", "missing.wav"),
         ("job-get", "malformed/id"),
+        ("job-wait", "malformed/id", "invalid-timeout"),
     ],
 )
 def test_client_configuration_errors_precede_local_input_validation(
     tmp_path: Path,
-    arguments: tuple[str, str],
+    arguments: tuple[str, ...],
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
     local_input = str(tmp_path / arguments[1])
+    local_arguments = (arguments[0], local_input, *arguments[2:])
 
-    result = _run(environment, arguments[0], local_input)
+    result = _run(environment, *local_arguments)
 
     assert result.returncode == 78
     assert _error_code(result) == "client_not_configured"
@@ -836,6 +926,431 @@ def test_job_get_preserves_responses_and_shared_errors(
     curl_environment = (tmp_path / "curl-env").read_bytes()
     assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
     assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
+
+
+def _duration_centiseconds(value: bytes) -> int:
+    whole, fraction = value.split(b".", 1)
+    assert whole.isdigit()
+    assert len(fraction) == 2
+    assert fraction.isdigit()
+    return int(whole) * 100 + int(fraction)
+
+
+def test_job_wait_discards_active_responses_and_caps_backoff(
+    tmp_path: Path,
+) -> None:
+    active_bodies = [
+        (
+            f'{{"id":"7K3M9Q2W","status":"running",'
+            f'"private_poll":{index}}}'
+        ).encode()
+        for index in range(1, 6)
+    ]
+    terminal = (
+        b'{"id":"7K3M9Q2W","status":"succeeded",'
+        b'"result":{"text":"final"}}'
+    )
+    environment, traces, sleep_log = _install_fake_job_wait_tools(
+        tmp_path,
+        [
+            *((body, "202", 0, "0") for body in active_bodies),
+            (terminal, "200", 0, "0"),
+        ],
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(
+        environment,
+        "job-wait",
+        "7K3M9Q2W",
+        "000999999999",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == terminal
+    assert result.stderr == b""
+    assert sleep_log.read_bytes() == b"1.00\n2.00\n4.00\n8.00\n8.00\n"
+    assert (traces / "count").read_text(encoding="ascii").strip() == "6"
+    response_paths: set[bytes] = set()
+    max_times: list[int] = []
+    for call in range(1, 7):
+        arguments = (traces / f"args.{call}").read_bytes().split(b"\0")
+        assert arguments[:10] == [
+            b"--disable",
+            b"--globoff",
+            b"--config",
+            b"-",
+            b"--proto",
+            b"=http,https",
+            b"--silent",
+            b"--fail-with-body",
+            b"--connect-timeout",
+            b"5",
+        ]
+        assert arguments[10:14] == [
+            b"--request",
+            b"GET",
+            b"--url",
+            (
+                b"https://asr.example:17770/v1/audio/"
+                b"transcriptions/7K3M9Q2W"
+            ),
+        ]
+        assert arguments[14] == b"--max-time"
+        max_times.append(_duration_centiseconds(arguments[15]))
+        assert arguments[16] == b"--output"
+        response_paths.add(arguments[17])
+        assert arguments[18:] == [b"--write-out", b"%{http_code}", b""]
+        assert b"--location" not in arguments
+        assert b"-L" not in arguments
+        assert TOKEN.encode() not in (traces / f"args.{call}").read_bytes()
+        assert (traces / f"stdin.{call}").read_bytes() == (
+            f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+        )
+        assert (traces / f"upload.{call}").read_bytes() == b""
+        curl_environment = (traces / f"env.{call}").read_bytes()
+        assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+        assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
+    assert max_times[0] == 999_999_999 * 100
+    assert all(
+        0 < later <= earlier
+        for earlier, later in zip(max_times, max_times[1:])
+    )
+    assert len(response_paths) == 1
+    assert not Path(os.fsdecode(response_paths.pop())).exists()
+    for body in active_bodies:
+        assert body not in result.stdout + result.stderr
+    assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [
+        "",
+        "0",
+        "000",
+        "1000000000",
+        "0001000000000",
+        "1.0",
+        "+1",
+        "-1",
+        "1x",
+        "1\n",
+    ],
+)
+def test_job_wait_rejects_invalid_timeout_after_configuration(
+    tmp_path: Path,
+    timeout_seconds: str,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+
+    result = _run(
+        environment,
+        "job-wait",
+        "7K3M9Q2W",
+        timeout_seconds,
+    )
+
+    assert result.returncode == 65
+    assert _error_code(result) == "invalid_timeout_seconds"
+    assert json.loads(result.stdout)["error"]["param"] == "timeout_seconds"
+    assert result.stderr == b""
+    if timeout_seconds:
+        assert timeout_seconds.encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+def test_job_wait_reuses_strict_job_id_validation(tmp_path: Path) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-wait", "../health", "1")
+
+    assert result.returncode == 65
+    assert _error_code(result) == "invalid_job_id"
+    assert json.loads(result.stdout)["error"]["param"] == "job_id"
+    assert b"../health" not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "body",
+        "http_code",
+        "curl_exit",
+        "expected_exit",
+        "expected_stdout",
+    ),
+    [
+        (
+            b'{"redirect":"private"}',
+            "302",
+            0,
+            76,
+            (
+                b'{"error":{"message":"Botified ASR job wait received an '
+                b'unexpected response","type":"client_error","param":null,'
+                b'"code":"unexpected_job_response"}}\n'
+            ),
+        ),
+        (
+            b"",
+            "204",
+            0,
+            76,
+            (
+                b'{"error":{"message":"Botified ASR job wait received an '
+                b'unexpected response","type":"client_error","param":null,'
+                b'"code":"unexpected_job_response"}}\n'
+            ),
+        ),
+        (
+            b"private malformed status body",
+            "2000",
+            0,
+            76,
+            (
+                b'{"error":{"message":"Botified ASR job wait received an '
+                b'unexpected response","type":"client_error","param":null,'
+                b'"code":"unexpected_job_response"}}\n'
+            ),
+        ),
+        (
+            b'{"error":{"code":"job_not_found"}}',
+            "404",
+            22,
+            22,
+            b'{"error":{"code":"job_not_found"}}',
+        ),
+        (
+            b"private transport body",
+            "000",
+            7,
+            7,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+        (
+            b"private early timeout body",
+            "000",
+            28,
+            28,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+    ],
+)
+def test_job_wait_http_and_transport_precedence(
+    tmp_path: Path,
+    body: bytes,
+    http_code: str,
+    curl_exit: int,
+    expected_exit: int,
+    expected_stdout: bytes,
+) -> None:
+    environment, traces, sleep_log = _install_fake_job_wait_tools(
+        tmp_path,
+        [(body, http_code, curl_exit, "0")],
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-wait", "7K3M9Q2W", "10")
+
+    assert result.returncode == expected_exit
+    assert result.stdout == expected_stdout
+    assert result.stderr == b""
+    assert not sleep_log.exists()
+    assert (traces / "count").read_text(encoding="ascii").strip() == "1"
+    if body and result.returncode != 22:
+        assert body not in result.stdout + result.stderr
+    assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+def test_job_wait_maps_curl_28_to_timeout_only_after_deadline(
+    tmp_path: Path,
+) -> None:
+    private_body = b"private timeout body"
+    environment, traces, sleep_log = _install_fake_job_wait_tools(
+        tmp_path,
+        [(private_body, "000", 28, "1.05")],
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-wait", "7K3M9Q2W", "1")
+
+    assert result.returncode == 75
+    assert _error_code(result) == "job_wait_timeout"
+    assert json.loads(result.stdout)["error"]["param"] == "timeout_seconds"
+    assert result.stderr == b""
+    assert private_body not in result.stdout
+    assert not sleep_log.exists()
+    assert (traces / "count").read_text(encoding="ascii").strip() == "1"
+    assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+def test_job_wait_term_exits_and_cleans_without_another_request(
+    tmp_path: Path,
+) -> None:
+    active_body = b'{"id":"7K3M9Q2W","status":"running"}'
+    environment, traces, sleep_log = _install_fake_job_wait_tools(
+        tmp_path,
+        [
+            (active_body, "202", 0, "0"),
+            (
+                b'{"id":"7K3M9Q2W","status":"succeeded",'
+                b'"result":{"text":"must not be requested"}}',
+                "200",
+                0,
+                "0",
+            ),
+        ],
+    )
+    _write_client_config(environment, _valid_config())
+    sleep_ready = traces / "sleep-ready"
+    sleep_pid_path = traces / "sleep-pid"
+    temporary_root = tmp_path / "private-tmp"
+    temporary_root.mkdir()
+    environment["TMPDIR"] = str(temporary_root)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    sleep = fake_bin / "sleep"
+    sleep.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$1" >>"$FAKE_JOB_WAIT_SLEEP"
+printf '%s\\n' "$$" >"$FAKE_JOB_WAIT_SLEEP_PID"
+: >"$FAKE_JOB_WAIT_SLEEP_READY"
+exec /usr/bin/sleep 30
+""",
+        encoding="utf-8",
+    )
+    sleep.chmod(0o755)
+    environment.update(
+        {
+            "FAKE_JOB_WAIT_SLEEP_PID": str(sleep_pid_path),
+            "FAKE_JOB_WAIT_SLEEP_READY": str(sleep_ready),
+        }
+    )
+
+    process = subprocess.Popen(
+        [HELPER, "job-wait", "7K3M9Q2W", "60"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    sleep_pid: int | None = None
+    child_survived_handler: bool | None = None
+    try:
+        ready_deadline = time.monotonic() + 2
+        while not sleep_ready.exists() and time.monotonic() < ready_deadline:
+            time.sleep(0.01)
+        assert sleep_ready.exists()
+        sleep_pid = int(sleep_pid_path.read_text(encoding="ascii"))
+        first_arguments = (traces / "args.1").read_bytes().split(b"\0")
+        response_body = Path(os.fsdecode(first_arguments[17]))
+
+        termination_started = time.monotonic()
+        os.kill(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=1)
+        assert time.monotonic() - termination_started < 1
+    finally:
+        if sleep_pid is not None:
+            child_survived_handler = Path(f"/proc/{sleep_pid}").exists()
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        if sleep_pid is not None and Path(f"/proc/{sleep_pid}").exists():
+            os.kill(sleep_pid, signal.SIGKILL)
+
+    assert process.returncode == 143
+    assert stdout == b""
+    assert stderr == b""
+    assert sleep_log.read_bytes()
+    assert (traces / "count").read_text(encoding="ascii").strip() == "1"
+    assert not (traces / "args.2").exists()
+    assert not response_body.exists()
+    assert sleep_pid is not None
+    assert child_survived_handler is False
+    assert list(temporary_root.iterdir()) == []
+
+
+def test_job_wait_term_reaps_blocked_curl_and_cleans(
+    tmp_path: Path,
+) -> None:
+    environment, traces, _ = _install_fake_job_wait_tools(
+        tmp_path,
+        [(b"", "000", 0, "0")],
+    )
+    _write_client_config(environment, _valid_config())
+    curl_ready = traces / "curl-ready"
+    curl_pid_path = traces / "curl-pid"
+    temporary_root = tmp_path / "private-tmp"
+    temporary_root.mkdir()
+    environment["TMPDIR"] = str(temporary_root)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    curl = fake_bin / "curl"
+    curl.write_text(
+        """#!/bin/sh
+: >"$FAKE_JOB_WAIT_TRACES/args.1"
+for argument do
+    printf '%s\\0' "$argument" >>"$FAKE_JOB_WAIT_TRACES/args.1"
+done
+/bin/cat >"$FAKE_JOB_WAIT_TRACES/stdin.1"
+/bin/cat <&3 >"$FAKE_JOB_WAIT_TRACES/upload.1"
+printf '%s\\n' 1 >"$FAKE_JOB_WAIT_TRACES/count"
+printf '%s\\n' "$$" >"$FAKE_JOB_WAIT_CURL_PID"
+: >"$FAKE_JOB_WAIT_CURL_READY"
+exec /usr/bin/sleep 30
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    environment.update(
+        {
+            "FAKE_JOB_WAIT_CURL_PID": str(curl_pid_path),
+            "FAKE_JOB_WAIT_CURL_READY": str(curl_ready),
+        }
+    )
+
+    process = subprocess.Popen(
+        [HELPER, "job-wait", "7K3M9Q2W", "60"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    curl_pid: int | None = None
+    child_survived_handler: bool | None = None
+    try:
+        ready_deadline = time.monotonic() + 2
+        while not curl_ready.exists() and time.monotonic() < ready_deadline:
+            time.sleep(0.01)
+        assert curl_ready.exists()
+        curl_pid = int(curl_pid_path.read_text(encoding="ascii"))
+
+        termination_started = time.monotonic()
+        os.kill(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=1)
+        assert time.monotonic() - termination_started < 1
+    finally:
+        if curl_pid is not None:
+            child_survived_handler = Path(f"/proc/{curl_pid}").exists()
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        if curl_pid is not None and Path(f"/proc/{curl_pid}").exists():
+            os.kill(curl_pid, signal.SIGKILL)
+
+    assert process.returncode == 143
+    assert stdout == b""
+    assert stderr == b""
+    assert (traces / "count").read_text(encoding="ascii").strip() == "1"
+    assert not (traces / "args.2").exists()
+    assert curl_pid is not None
+    assert child_survived_handler is False
+    assert list(temporary_root.iterdir()) == []
 
 
 @pytest.mark.parametrize(

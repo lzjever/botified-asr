@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, or job-get JOB_ID","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, or job-wait JOB_ID TIMEOUT_SECONDS","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -22,6 +22,30 @@ invalid_job_id() {
     printf '%s\n' \
         '{"error":{"message":"Job ID must be 8 uppercase Crockford Base32 characters","type":"client_error","param":"job_id","code":"invalid_job_id"}}'
     exit 65
+}
+
+invalid_timeout_seconds() {
+    printf '%s\n' \
+        '{"error":{"message":"Timeout seconds must be an integer from 1 through 999999999","type":"client_error","param":"timeout_seconds","code":"invalid_timeout_seconds"}}'
+    exit 65
+}
+
+job_wait_unavailable() {
+    printf '%s\n' \
+        '{"error":{"message":"Botified ASR job waiting is unavailable","type":"client_error","param":null,"code":"job_wait_unavailable"}}'
+    exit 69
+}
+
+job_wait_timeout() {
+    printf '%s\n' \
+        '{"error":{"message":"Botified ASR job wait timed out","type":"client_error","param":"timeout_seconds","code":"job_wait_timeout"}}'
+    exit 75
+}
+
+unexpected_job_response() {
+    printf '%s\n' \
+        '{"error":{"message":"Botified ASR job wait received an unexpected response","type":"client_error","param":null,"code":"unexpected_job_response"}}'
+    exit 76
 }
 
 curl_not_found() {
@@ -51,26 +75,130 @@ local_io_error() {
     exit 70
 }
 
+curl_failed() {
+    printf '%s\n' \
+        '{"error":{"message":"Botified ASR request failed","type":"client_error","param":null,"code":"curl_failed"}}'
+    exit "$1"
+}
+
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+read_monotonic_centiseconds() {
+    uptime_contents=$(cat /proc/uptime 2>/dev/null) ||
+        job_wait_unavailable
+    uptime_value=${uptime_contents%%[[:space:]]*}
+    case "$uptime_value" in
+        *.*)
+            uptime_whole=${uptime_value%%.*}
+            uptime_fraction=${uptime_value#*.}
+            ;;
+        *)
+            job_wait_unavailable
+            ;;
+    esac
+    case "$uptime_whole" in
+        "" | *[!0-9]*)
+            job_wait_unavailable
+            ;;
+    esac
+    case "$uptime_fraction" in
+        [0-9][0-9])
+            ;;
+        *)
+            job_wait_unavailable
+            ;;
+    esac
+    while [ "${uptime_whole#0}" != "$uptime_whole" ]; do
+        uptime_whole=${uptime_whole#0}
+    done
+    if [ -z "$uptime_whole" ]; then
+        uptime_whole=0
+    fi
+    if [ "${#uptime_whole}" -gt 15 ]; then
+        job_wait_unavailable
+    fi
+    uptime_tenths=${uptime_fraction%?}
+    uptime_hundredths=${uptime_fraction#?}
+    now_centiseconds=$((uptime_whole * 100 + uptime_tenths * 10 + uptime_hundredths))
+    if [ "$now_centiseconds" -lt 0 ]; then
+        job_wait_unavailable
+    fi
+}
+
+format_centiseconds() {
+    duration_whole=$(( $1 / 100 ))
+    duration_fraction=$(( $1 % 100 ))
+    if [ "$duration_fraction" -lt 10 ]; then
+        formatted_duration=$duration_whole.0$duration_fraction
+    else
+        formatted_duration=$duration_whole.$duration_fraction
+    fi
+}
+
+read_wait_clock_before_deadline() {
+    read_monotonic_centiseconds
+    if [ "$now_centiseconds" -ge "$deadline_centiseconds" ]; then
+        job_wait_timeout
+    fi
+}
+
+wait_for_active_child() {
+    wait "$active_child_pid"
+    active_child_status=$?
+    active_child_pid=
+    return "$active_child_status"
+}
+
+terminate_active_child_and_exit() {
+    signal_exit_status=$1
+    if [ -n "$active_child_pid" ]; then
+        kill -TERM "$active_child_pid" 2>/dev/null || :
+        wait "$active_child_pid" 2>/dev/null || :
+        active_child_pid=
+    fi
+    exit "$signal_exit_status"
+}
+
+execute_curl() {
+    printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
+        curl "$@" 2>/dev/null &
+    active_child_pid=$!
+    wait_for_active_child
+}
+
+execute_sleep() {
+    sleep "$1" 2>/dev/null &
+    active_child_pid=$!
+    wait_for_active_child
 }
 
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
     command_name=health
     audio_file=
     job_id=
+    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe" ]; then
     command_name=transcribe
     audio_file=$2
     job_id=
+    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe-long" ]; then
     command_name=transcribe-long
     audio_file=$2
     job_id=
+    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "job-get" ]; then
     command_name=job-get
     audio_file=
     job_id=$2
+    wait_timeout=
+elif [ "$#" -eq 3 ] && [ "$1" = "job-wait" ]; then
+    command_name=job-wait
+    audio_file=
+    job_id=$2
+    wait_timeout=$3
 else
     invalid_command
 fi
@@ -234,7 +362,7 @@ while [ -n "$key_padding" ]; do
 done
 
 case "$command_name" in
-    health | job-get)
+    health | job-get | job-wait)
         request_input=/dev/null
         ;;
     transcribe | transcribe-long)
@@ -245,30 +373,68 @@ case "$command_name" in
         ;;
 esac
 
-if [ "$command_name" = "job-get" ]; then
-    case "$job_id" in
-        ????????)
-            case "$job_id" in
-                *[!0-9A-HJKMNP-TV-Z]*)
-                    invalid_job_id
-                    ;;
-            esac
-            ;;
-        *)
-            invalid_job_id
+case "$command_name" in
+    job-get | job-wait)
+        case "$job_id" in
+            ????????)
+                case "$job_id" in
+                    *[!0-9A-HJKMNP-TV-Z]*)
+                        invalid_job_id
+                        ;;
+                esac
+                ;;
+            *)
+                invalid_job_id
+                ;;
+        esac
+        ;;
+esac
+
+if [ "$command_name" = "job-wait" ]; then
+    case "$wait_timeout" in
+        "" | *[!0-9]*)
+            invalid_timeout_seconds
             ;;
     esac
+    while [ "${wait_timeout#0}" != "$wait_timeout" ]; do
+        wait_timeout=${wait_timeout#0}
+    done
+    if [ -z "$wait_timeout" ] || [ "${#wait_timeout}" -gt 9 ]; then
+        invalid_timeout_seconds
+    fi
+    if [ "$wait_timeout" -gt 999999999 ]; then
+        invalid_timeout_seconds
+    fi
+    read_monotonic_centiseconds
+    deadline_centiseconds=$((now_centiseconds + wait_timeout * 100))
 fi
 
 temporary_root=${TMPDIR:-/tmp}
+response_body=
+http_status_body=
+active_child_pid=
+
+cleanup() {
+    if [ -n "$response_body" ]; then
+        rm -f -- "$response_body"
+    fi
+    if [ -n "$http_status_body" ]; then
+        rm -f -- "$http_status_body"
+    fi
+}
+trap cleanup EXIT
+trap 'terminate_active_child_and_exit 129' HUP
+trap 'terminate_active_child_and_exit 130' INT
+trap 'terminate_active_child_and_exit 143' TERM
+
 response_body=$(
     mktemp "$temporary_root/botified-asr-body.XXXXXX" 2>/dev/null
 ) || local_io_error
-
-cleanup() {
-    rm -f -- "$response_body"
-}
-trap cleanup EXIT HUP INT TERM
+if [ "$command_name" = "job-wait" ]; then
+    http_status_body=$(
+        mktemp "$temporary_root/botified-asr-http.XXXXXX" 2>/dev/null
+    ) || local_io_error
+fi
 
 set -- \
     --disable \
@@ -311,7 +477,7 @@ case "$command_name" in
             'file=@/dev/fd/3;filename=audio;type=application/octet-stream' \
             --url "$origin/v1/audio/transcriptions"
         ;;
-    job-get)
+    job-get | job-wait)
         set -- \
             "$@" \
             --request GET \
@@ -323,10 +489,64 @@ if ! { command exec 3<"$request_input"; } 2>/dev/null; then
     invalid_audio_file
 fi
 
-printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
-    curl \
-        "$@" \
-        >"$response_body" 2>/dev/null
+if [ "$command_name" = "job-wait" ]; then
+    backoff_centiseconds=100
+    while :; do
+        remaining_centiseconds=$((deadline_centiseconds - now_centiseconds))
+        if [ "$remaining_centiseconds" -le 0 ]; then
+            job_wait_timeout
+        fi
+        format_centiseconds "$remaining_centiseconds"
+        execute_curl \
+            "$@" \
+            --max-time "$formatted_duration" \
+            --output "$response_body" \
+            --write-out '%{http_code}' \
+            >"$http_status_body"
+        curl_status=$?
+        http_code=
+        IFS= read -r http_code <"$http_status_body" || :
+
+        if [ "$curl_status" -eq 22 ]; then
+            cat "$response_body"
+            exit 22
+        fi
+        if [ "$curl_status" -ne 0 ]; then
+            if [ "$curl_status" -eq 28 ]; then
+                read_wait_clock_before_deadline
+            fi
+            curl_failed "$curl_status"
+        fi
+
+        case "$http_code" in
+            200)
+                cat "$response_body"
+                exit 0
+                ;;
+            202)
+                read_wait_clock_before_deadline
+                remaining_centiseconds=$((deadline_centiseconds - now_centiseconds))
+                sleep_centiseconds=$backoff_centiseconds
+                if [ "$remaining_centiseconds" -lt "$sleep_centiseconds" ]; then
+                    sleep_centiseconds=$remaining_centiseconds
+                fi
+                format_centiseconds "$sleep_centiseconds"
+                if ! execute_sleep "$formatted_duration"; then
+                    job_wait_unavailable
+                fi
+                read_wait_clock_before_deadline
+                if [ "$backoff_centiseconds" -lt 800 ]; then
+                    backoff_centiseconds=$((backoff_centiseconds * 2))
+                fi
+                ;;
+            *)
+                unexpected_job_response
+                ;;
+        esac
+    done
+fi
+
+execute_curl "$@" >"$response_body"
 curl_status=$?
 
 if [ "$curl_status" -eq 0 ] || [ "$curl_status" -eq 22 ]; then
@@ -334,6 +554,4 @@ if [ "$curl_status" -eq 0 ] || [ "$curl_status" -eq 22 ]; then
     exit "$curl_status"
 fi
 
-printf '%s\n' \
-    '{"error":{"message":"Botified ASR request failed","type":"client_error","param":null,"code":"curl_failed"}}'
-exit "$curl_status"
+curl_failed "$curl_status"
