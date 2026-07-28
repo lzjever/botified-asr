@@ -47,7 +47,8 @@ COPY --from=builder /opt/botified-asr /opt/botified-asr
 
 ARG BOTIFIED_ASR_VERSION
 
-LABEL org.opencontainers.image.version=$BOTIFIED_ASR_VERSION
+LABEL org.opencontainers.image.source=https://github.com/lzjever/botified-asr \
+      org.opencontainers.image.version=$BOTIFIED_ASR_VERSION
 
 RUN groupadd --gid 10001 botified-asr \
     && useradd \

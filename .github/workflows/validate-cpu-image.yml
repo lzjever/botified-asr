@@ -2,15 +2,74 @@ name: Validate CPU image
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the validated CPU image
+        required: true
+        type: boolean
+        default: false
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ${{ inputs.publish && 'botified-asr-cpu-publish' || format('botified-asr-cpu-validate-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare image version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      project_version: ${{ steps.version.outputs.project_version }}
+      release_version: ${{ steps.version.outputs.release_version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Validate project version
+        id: version
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH" = "true" ]; then
+            test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
+
+          version="$(
+            python3 - <<'PY'
+          import re
+          import tomllib
+
+          with open("pyproject.toml", "rb") as source:
+              version = tomllib.load(source)["project"]["version"]
+
+          if not isinstance(version, str) or re.fullmatch(
+              r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
+              version,
+          ) is None:
+              raise SystemExit(f"project.version must be canonical X.Y.Z, got {version!r}")
+          print(version)
+          PY
+          )"
+          printf 'project_version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'release_version=v%s\n' "$version" >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate ${{ matrix.image_arch }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +84,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Verify runner architecture
         shell: bash
@@ -32,20 +93,81 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
 
-      - name: Read project version
+      - name: Export image versions
         shell: bash
         run: |
           set -euo pipefail
-          version="$(
-            python3 - <<'PY'
-          import tomllib
+          printf 'BOTIFIED_ASR_VERSION=%s\n' \
+            '${{ needs.prepare.outputs.project_version }}' \
+            >> "$GITHUB_ENV"
+          printf 'BOTIFIED_ASR_RELEASE_VERSION=%s\n' \
+            '${{ needs.prepare.outputs.release_version }}' \
+            >> "$GITHUB_ENV"
 
-          with open("pyproject.toml", "rb") as source:
-              print(tomllib.load(source)["project"]["version"])
-          PY
+      - name: Prepare registry publication
+        if: ${{ inputs.publish }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+          image="ghcr.io/lzjever/botified-asr"
+          printf '%s' "$GITHUB_TOKEN" \
+            | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+          registry_token="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --get \
+              --user "$GITHUB_ACTOR:$GITHUB_TOKEN" \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode \
+                scope=repository:lzjever/botified-asr:pull,push \
+              https://ghcr.io/token \
+              | python3 -c \
+                'import json, sys; token = json.load(sys.stdin).get("token"); print(token) if token else sys.exit("GHCR response omitted bearer token")'
           )"
-          test -n "$version"
-          printf 'BOTIFIED_ASR_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+          headers="$(mktemp)"
+          status="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /dev/null \
+              --dump-header "$headers" \
+              --write-out '%{http_code}' \
+              --head \
+              --header "Authorization: Bearer $registry_token" \
+              --header \
+                'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/lzjever/botified-asr/manifests/$BOTIFIED_ASR_RELEASE_VERSION"
+          )"
+          case "$status" in
+            404)
+              ;;
+            200)
+              digest="$(
+                awk \
+                  'BEGIN { IGNORECASE = 1 } /^Docker-Content-Digest:/ { gsub("\r", "", $2); print $2 }' \
+                  "$headers" \
+                  | tail -n 1
+              )"
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              printf 'Stable image %s:%s already exists at %s\n' \
+                "$image" "$BOTIFIED_ASR_RELEASE_VERSION" "$digest" \
+                >&2
+              exit 1
+              ;;
+            *)
+              printf 'Unexpected GHCR manifest status: %s\n' "$status" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Build CPU image
         shell: bash
@@ -54,6 +176,7 @@ jobs:
           docker build \
             --pull \
             --no-cache \
+            --provenance=false \
             --build-arg BOTIFIED_ASR_VERSION="$BOTIFIED_ASR_VERSION" \
             -t botified-asr:test \
             .
@@ -72,6 +195,11 @@ jobs:
               --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
               botified-asr:test
           )" = "$BOTIFIED_ASR_VERSION"
+          test "$(
+            docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.source"}}' \
+              botified-asr:test
+          )" = "https://github.com/lzjever/botified-asr"
           test "$(
             docker image inspect \
               --format '{{.Config.User}}' \
@@ -212,6 +340,49 @@ jobs:
 
           trap - EXIT
 
+      - name: Push validated architecture image
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+          image="ghcr.io/lzjever/botified-asr"
+          staging_ref="$image:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.image_arch }}"
+          docker tag botified-asr:test "$staging_ref"
+          docker push "$staging_ref"
+
+          inspect_output="$(docker buildx imagetools inspect "$staging_ref")"
+          digest="$(
+            awk '$1 == "Digest:" { print $2; exit }' \
+              <<< "$inspect_output"
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          raw_manifest="$(mktemp)"
+          docker buildx imagetools inspect "$staging_ref" --raw \
+            > "$raw_manifest"
+          python3 - "$raw_manifest" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              manifest = json.load(source)
+
+          allowed_media_types = {
+              "application/vnd.docker.distribution.manifest.v2+json",
+              "application/vnd.oci.image.manifest.v1+json",
+          }
+          if manifest.get("mediaType") not in allowed_media_types:
+              raise SystemExit("staging reference is not a single image manifest")
+          if "manifests" in manifest:
+              raise SystemExit("staging reference unexpectedly contains an image index")
+          PY
+
+          docker logout ghcr.io
+          docker buildx imagetools inspect "$image@$digest" >/dev/null
+
       - name: Stop validation container
         if: ${{ always() }}
         shell: bash
@@ -224,3 +395,211 @@ jobs:
               || docker rm --force "$container_name" \
               || true
           fi
+
+      - name: Remove registry credentials
+        if: ${{ always() && inputs.publish }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
+
+  publish:
+    name: Publish CPU image
+    needs:
+      - prepare
+      - validate
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+
+    steps:
+      - name: Publish stable multi-architecture image
+        if: ${{ inputs.publish }}
+        env:
+          BOTIFIED_ASR_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+          image="ghcr.io/lzjever/botified-asr"
+          stable_ref="$image:$BOTIFIED_ASR_RELEASE_VERSION"
+          printf '%s' "$GITHUB_TOKEN" \
+            | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+          registry_token="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --get \
+              --user "$GITHUB_ACTOR:$GITHUB_TOKEN" \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode \
+                scope=repository:lzjever/botified-asr:pull,push \
+              https://ghcr.io/token \
+              | python3 -c \
+                'import json, sys; token = json.load(sys.stdin).get("token"); print(token) if token else sys.exit("GHCR response omitted bearer token")'
+          )"
+
+          assert_stable_absent() {
+            local headers
+            local status
+            local digest
+
+            headers="$(mktemp)"
+            status="$(
+              curl \
+                --silent \
+                --show-error \
+                --output /dev/null \
+                --dump-header "$headers" \
+                --write-out '%{http_code}' \
+                --head \
+                --header "Authorization: Bearer $registry_token" \
+                --header \
+                  'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/lzjever/botified-asr/manifests/$BOTIFIED_ASR_RELEASE_VERSION"
+            )"
+            case "$status" in
+              404)
+                ;;
+              200)
+                digest="$(
+                  awk \
+                    'BEGIN { IGNORECASE = 1 } /^Docker-Content-Digest:/ { gsub("\r", "", $2); print $2 }' \
+                    "$headers" \
+                    | tail -n 1
+                )"
+                [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+                printf 'Stable image %s already exists at %s\n' \
+                  "$stable_ref" "$digest" >&2
+                return 1
+                ;;
+              *)
+                printf 'Unexpected GHCR manifest status: %s\n' "$status" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          assert_stable_absent
+
+          inspect_single_manifest() {
+            local reference="$1"
+            local inspect_output
+            local digest
+            local raw_manifest
+
+            inspect_output="$(docker buildx imagetools inspect "$reference")" \
+              || return 1
+            digest="$(
+              awk '$1 == "Digest:" { print $2; exit }' \
+                <<< "$inspect_output"
+            )" || return 1
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+
+            raw_manifest="$(mktemp)" || return 1
+            docker buildx imagetools inspect "$reference" --raw \
+              > "$raw_manifest" \
+              || return 1
+            python3 - "$raw_manifest" <<'PY' || return 1
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              manifest = json.load(source)
+
+          allowed_media_types = {
+              "application/vnd.docker.distribution.manifest.v2+json",
+              "application/vnd.oci.image.manifest.v1+json",
+          }
+          if manifest.get("mediaType") not in allowed_media_types:
+              raise SystemExit("staging reference is not a single image manifest")
+          if "manifests" in manifest:
+              raise SystemExit("staging reference unexpectedly contains an image index")
+          PY
+            printf '%s\n' "$digest"
+          }
+
+          amd64_ref="$image:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64"
+          arm64_ref="$image:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64"
+          amd64_digest="$(inspect_single_manifest "$amd64_ref")"
+          arm64_digest="$(inspect_single_manifest "$arm64_ref")"
+          test "$amd64_digest" != "$arm64_digest"
+
+          metadata_file="$(mktemp)"
+          assert_stable_absent
+          docker buildx imagetools create \
+            --tag "$stable_ref" \
+            --metadata-file "$metadata_file" \
+            "$image@$amd64_digest" \
+            "$image@$arm64_digest"
+
+          final_digest="$(
+            python3 - "$metadata_file" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              descriptor = json.load(source).get("containerimage.descriptor")
+          digest = descriptor.get("digest") if isinstance(descriptor, dict) else None
+          if not isinstance(digest, str) or re.fullmatch(
+              r"sha256:[0-9a-f]{64}", digest
+          ) is None:
+              raise SystemExit("imagetools metadata omitted a valid image digest")
+          print(digest)
+          PY
+          )"
+
+          inspect_output="$(docker buildx imagetools inspect "$stable_ref")"
+          inspected_digest="$(
+            awk '$1 == "Digest:" { print $2; exit }' \
+              <<< "$inspect_output"
+          )"
+          test "$inspected_digest" = "$final_digest"
+
+          final_index="$(mktemp)"
+          docker buildx imagetools inspect "$image@$final_digest" --raw \
+            > "$final_index"
+          python3 \
+            - "$final_index" "$amd64_digest" "$arm64_digest" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              index = json.load(source)
+
+          allowed_media_types = {
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+              "application/vnd.oci.image.index.v1+json",
+          }
+          if index.get("mediaType") not in allowed_media_types:
+              raise SystemExit("stable reference is not an image index")
+
+          manifests = index.get("manifests")
+          if not isinstance(manifests, list) or len(manifests) != 2:
+              raise SystemExit("stable image index must contain exactly two manifests")
+
+          platforms = sorted(
+              (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture"))
+              for item in manifests
+          )
+          if platforms != [("linux", "amd64"), ("linux", "arm64")]:
+              raise SystemExit(f"unexpected stable image platforms: {platforms!r}")
+
+          digests = sorted(item.get("digest") for item in manifests)
+          if digests != sorted(sys.argv[2:]):
+              raise SystemExit("stable image index does not reference the staged manifests")
+          PY
+
+          docker logout ghcr.io
+          docker buildx imagetools inspect "$image@$final_digest" >/dev/null
+
+      - name: Remove registry credentials
+        if: ${{ always() && inputs.publish }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
