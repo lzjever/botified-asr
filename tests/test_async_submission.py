@@ -106,8 +106,15 @@ class RejectingProcessor:
 def app_client(
     storage: Storage,
     prober: RecordingProber,
+    *,
+    job_executor: object | None = None,
 ) -> tuple[TestClient, RejectingProcessor]:
     processor = RejectingProcessor()
+    executor_options = (
+        {}
+        if job_executor is None
+        else {"job_executor": job_executor}
+    )
     app = create_app(
         api_key="test-secret",
         readiness=Readiness(True, True, True),
@@ -117,6 +124,7 @@ def app_client(
         processor_fingerprint=PROCESSOR_FINGERPRINT,
         speaker_embedding_policy=embedding_policy(),
         close_storage_on_shutdown=False,
+        **executor_options,
     )
     return TestClient(app, raise_server_exceptions=False), processor
 
@@ -188,7 +196,27 @@ def test_async_post_returns_exact_202_and_retains_queued_input(
         lambda: "7K3M9Q2W",
     )
     prober = RecordingProber()
-    client, processor = app_client(storage, prober)
+    wake_calls = 0
+
+    class FakeJobExecutor:
+        ready = True
+        failure = None
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def wake(self) -> None:
+            nonlocal wake_calls
+            wake_calls += 1
+
+    client, processor = app_client(
+        storage,
+        prober,
+        job_executor=FakeJobExecutor(),
+    )
     with client:
         response = post_async(client)
 
@@ -210,6 +238,7 @@ def test_async_post_returns_exact_202_and_retains_queued_input(
     assert (storage.staging_dir / "7K3M9Q2W.ready").read_bytes() == b"audio"
     assert storage.total_reserved_bytes() == len(b"audio")
     assert_probe_only(prober, processor)
+    assert wake_calls == 1
 
 
 @pytest.mark.parametrize(

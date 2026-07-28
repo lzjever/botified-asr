@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -13,6 +15,7 @@ from botified_asr.huggingface_fetcher import HuggingFaceSnapshotFetcher
 from botified_asr.model_artifacts import ModelArtifactResolver
 from botified_asr.model_loader import load_funasr_model_bundle
 from botified_asr.pipeline import Processor
+from botified_asr.runtime import JobExecutor
 from botified_asr.storage import Storage
 
 
@@ -47,6 +50,14 @@ def main() -> None:
             vad_adapter=bundle.vad,
             known_speaker_policy=None,
         )
+        generation = secrets.token_urlsafe()
+        job_executor = JobExecutor(
+            storage,
+            processor,
+            bundle.speaker_embedding_policy,
+            generation,
+            lambda: datetime.now(timezone.utc),
+        )
         readiness = Readiness(
             database=True,
             models=True,
@@ -60,6 +71,7 @@ def main() -> None:
             audio_prober=frontend.probe,
             processor_fingerprint=bundle.processor_fingerprint,
             speaker_embedding_policy=bundle.speaker_embedding_policy,
+            job_executor=job_executor,
             close_storage_on_shutdown=False,
         )
         uvicorn.run(app, host=host, port=port, workers=1)

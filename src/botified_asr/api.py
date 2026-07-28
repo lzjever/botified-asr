@@ -36,6 +36,7 @@ from botified_asr.contracts import DIRECT_MAX_SAMPLES, CanonicalOptions
 from botified_asr.jobs import JobStatus, QueuedJobSpec
 from botified_asr.pipeline import PipelineError, PipelineNotReady
 from botified_asr.result_artifact import CanonicalArtifactError
+from botified_asr.runtime import JobExecutor
 from botified_asr.speaker_profiles import SpeakerProfile
 from botified_asr.speaker_snapshot import (
     SelectedSpeakerIncompatibleError,
@@ -137,6 +138,7 @@ def create_app(
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
     audio_prober: Callable[[Path, Cancellation], MediaProbe],
     processor_fingerprint: str,
+    job_executor: JobExecutor | None = None,
     close_storage_on_shutdown: bool = True,
 ) -> Starlette:
     if not api_key:
@@ -179,6 +181,8 @@ def create_app(
             )
 
     def require_ready() -> None:
+        if job_executor is not None and not job_executor.ready:
+            readiness.executor = False
         if not readiness.ready:
             raise ApiError(
                 503,
@@ -251,6 +255,7 @@ def create_app(
                     audio_prober,
                     processor_fingerprint,
                     speaker_embedding_policy,
+                    job_executor,
                 )
             except StorageAdmissionError as exc:
                 raise _storage_admission_error(exc) from exc
@@ -408,11 +413,21 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: Starlette):
+        executor_started = False
         try:
+            if job_executor is not None:
+                job_executor.start()
+                executor_started = True
+                readiness.executor = job_executor.ready
             yield
         finally:
-            if close_storage_on_shutdown:
-                storage.close()
+            readiness.executor = False
+            try:
+                if executor_started:
+                    await run_in_threadpool(job_executor.stop)
+            finally:
+                if close_storage_on_shutdown:
+                    storage.close()
 
     app = Starlette(
         debug=False,
@@ -565,6 +580,7 @@ async def _submit_async_transcription(
     audio_prober: Callable[[Path, Cancellation], MediaProbe],
     processor_fingerprint: str,
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
+    job_executor: JobExecutor | None,
 ) -> Response:
     lease = storage.begin_job_upload(datetime.now(timezone.utc))
     cleanup_handle: JobUploadLease | JobInputRef = lease
@@ -622,6 +638,8 @@ async def _submit_async_transcription(
                 param="known_speaker_ids[]",
             ) from exc
         ownership_transferred = True
+        if job_executor is not None:
+            job_executor.wake()
         return JSONResponse(
             {
                 "id": published.id,

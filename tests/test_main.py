@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,8 @@ DATA_DIR = Path("/data/botified-asr")
 MODEL_CACHE_DIR = Path("/cache/botified-asr/models")
 API_KEY = "startup-test-token"
 PROCESSOR_FINGERPRINT = "3" * 64
+PROCESS_GENERATION = "process-generation"
+PROCESS_NOW = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 
 
 def install_fakes(
@@ -23,6 +26,7 @@ def install_fakes(
     *,
     listen: str = "127.0.0.1:19001",
     failure_site: str | None = None,
+    track_executor: bool = False,
 ) -> SimpleNamespace:
     events: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
     failure = RuntimeError("startup failed")
@@ -42,6 +46,8 @@ def install_fakes(
         processor_fingerprint=PROCESSOR_FINGERPRINT,
     )
     processor = object()
+    executor = SimpleNamespace(ready=False)
+    executor_clocks: list[object] = []
     readiness = SimpleNamespace(
         database=True,
         models=True,
@@ -67,6 +73,12 @@ def install_fakes(
             events.append(("storage.close", (), {}))
 
     storage = FakeStorage()
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return PROCESS_NOW
 
     def fake(
         name: str,
@@ -124,6 +136,59 @@ def install_fakes(
         "Processor",
         fake("Processor", processor),
     )
+
+    def generate_process_generation(*args: Any, **kwargs: Any) -> str:
+        if track_executor:
+            events.append(("secrets.token_urlsafe", args, kwargs))
+        return PROCESS_GENERATION
+
+    def build_job_executor(
+        actual_storage: object,
+        actual_processor: object,
+        actual_policy: object,
+        generation: str,
+        now: object,
+    ) -> object:
+        if track_executor:
+            events.append(
+                (
+                    "JobExecutor",
+                    (
+                        actual_storage,
+                        actual_processor,
+                        actual_policy,
+                        generation,
+                    ),
+                    {},
+                )
+            )
+        executor_clocks.append(now)
+        return executor
+
+    monkeypatch.setattr(
+        main_module,
+        "secrets",
+        SimpleNamespace(token_urlsafe=generate_process_generation),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "datetime",
+        FixedDateTime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "timezone",
+        timezone,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "JobExecutor",
+        build_job_executor,
+        raising=False,
+    )
     monkeypatch.setattr(
         main_module,
         "Readiness",
@@ -153,6 +218,8 @@ def install_fakes(
         speaker=speaker,
         speaker_embedding_policy=speaker_embedding_policy,
         processor=processor,
+        executor=executor,
+        executor_clocks=executor_clocks,
         readiness=readiness,
         app=app,
     )
@@ -189,6 +256,17 @@ def expected_success_events(
                 "known_speaker_policy": None,
             },
         ),
+        ("secrets.token_urlsafe", (), {}),
+        (
+            "JobExecutor",
+            (
+                scenario.storage,
+                scenario.processor,
+                scenario.speaker_embedding_policy,
+                PROCESS_GENERATION,
+            ),
+            {},
+        ),
         (
             "Readiness",
             (),
@@ -205,6 +283,7 @@ def expected_success_events(
                 "audio_prober": scenario.frontend.probe,
                 "processor_fingerprint": PROCESSOR_FINGERPRINT,
                 "speaker_embedding_policy": (scenario.speaker_embedding_policy),
+                "job_executor": scenario.executor,
                 "close_storage_on_shutdown": False,
             },
         ),
@@ -220,11 +299,14 @@ def expected_success_events(
 def test_main_composes_loaded_models_before_serving_and_closes_storage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = install_fakes(monkeypatch)
+    scenario = install_fakes(monkeypatch, track_executor=True)
 
     main_module.main()
 
     assert scenario.events == expected_success_events(scenario)
+    assert len(scenario.executor_clocks) == 1
+    assert callable(scenario.executor_clocks[0])
+    assert scenario.executor_clocks[0]() == PROCESS_NOW
     assert scenario.readiness.ready is False
     assert scenario.storage.close_calls == 1
 

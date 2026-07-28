@@ -194,6 +194,59 @@ def test_ready_is_503_until_database_models_and_executor_are_ready(
     assert response.json()["error"]["code"] == "service_not_ready"
 
 
+def test_job_executor_lifespan_drives_dynamic_readiness_and_closes_in_order(
+) -> None:
+    events: list[str] = []
+
+    class FakeStorage:
+        def close(self) -> None:
+            events.append("storage.close")
+
+    class FakeJobExecutor:
+        ready = False
+        failure = None
+
+        def start(self) -> None:
+            events.append("executor.start")
+            self.ready = True
+
+        def stop(self) -> None:
+            events.append("executor.stop")
+            self.ready = False
+
+        def wake(self) -> None:
+            raise AssertionError("health checks must not wake the executor")
+
+    executor = FakeJobExecutor()
+    readiness = Readiness(True, True, False)
+    app = create_app(
+        api_key="test-secret",
+        readiness=readiness,
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        processor=FakeProcessor(),
+        audio_prober=lambda _path, _cancellation: None,
+        processor_fingerprint=PROCESSOR_FINGERPRINT,
+        speaker_embedding_policy=_speaker_embedding_policy(),
+        job_executor=executor,  # type: ignore[arg-type]
+        close_storage_on_shutdown=True,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/health/ready", headers=AUTH).status_code == 200
+        readiness.executor = False
+        executor.ready = True
+        assert client.get("/health/ready", headers=AUTH).status_code == 503
+        readiness.executor = True
+        executor.ready = False
+        assert client.get("/health/ready", headers=AUTH).status_code == 503
+
+    assert events == [
+        "executor.start",
+        "executor.stop",
+        "storage.close",
+    ]
+
+
 @pytest.mark.parametrize(
     ("authorization", "readiness", "expected_status"),
     [
