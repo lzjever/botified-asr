@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+from asyncio import Event, Task, create_task, wait_for
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -72,6 +73,8 @@ ARRAY_FIELDS = {"include[]", "known_speaker_ids[]"}
 ALL_FIELDS = SCALAR_FIELDS | ARRAY_FIELDS | {"file"}
 SPEAKER_EMBEDDING_MODEL_ALIAS = "cam++"
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+_RETENTION_SWEEP_BATCH_SIZE = 32
+_RETENTION_SWEEP_INTERVAL_SECONDS = 60.0
 
 
 class ApiError(Exception):
@@ -377,6 +380,8 @@ def create_app(
                 )
             except CanonicalArtifactError as error:
                 raise _processing_api_error(error) from error
+            if stored_result is None:
+                raise _job_not_found()
             return _StoredJobStreamingResponse(job.id, stored_result)
         if job.status is JobStatus.FAILED:
             assert job.finished_at is not None
@@ -451,23 +456,69 @@ def create_app(
             raise _job_not_found()
         raise RuntimeError("storage returned an unsupported deletion outcome")
 
+    async def sweep_expired_jobs() -> None:
+        sweep_at = datetime.now(timezone.utc)
+        for _ in range(_RETENTION_SWEEP_BATCH_SIZE):
+            deleted = await run_in_threadpool(
+                storage.delete_next_expired_terminal_job,
+                sweep_at,
+            )
+            if not deleted:
+                return
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         executor_started = False
+        maintenance_stop = Event()
+        maintenance_task: Task[None] | None = None
+
+        async def maintain_retention() -> None:
+            last_error: Exception | None = None
+            while True:
+                try:
+                    await wait_for(
+                        maintenance_stop.wait(),
+                        _RETENTION_SWEEP_INTERVAL_SECONDS,
+                    )
+                except TimeoutError:
+                    try:
+                        await sweep_expired_jobs()
+                    except Exception as error:
+                        readiness.database = False
+                        last_error = error
+                    else:
+                        readiness.database = True
+                        last_error = None
+                else:
+                    if last_error is not None:
+                        raise last_error
+                    return
+
         try:
             if job_executor is not None:
+                try:
+                    await sweep_expired_jobs()
+                except Exception:
+                    readiness.database = False
+                    raise
                 job_executor.start()
                 executor_started = True
                 readiness.executor = job_executor.ready
+                maintenance_task = create_task(maintain_retention())
             yield
         finally:
             readiness.executor = False
+            maintenance_stop.set()
             try:
-                if executor_started:
-                    await run_in_threadpool(job_executor.stop)
+                if maintenance_task is not None:
+                    await maintenance_task
             finally:
-                if close_storage_on_shutdown:
-                    storage.close()
+                try:
+                    if executor_started:
+                        await run_in_threadpool(job_executor.stop)
+                finally:
+                    if close_storage_on_shutdown:
+                        storage.close()
 
     app = Starlette(
         debug=False,

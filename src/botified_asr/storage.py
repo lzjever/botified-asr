@@ -9,7 +9,7 @@ import stat
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
 
@@ -1831,6 +1831,79 @@ class Storage:
                 self._delete_terminal_job(job_id)
                 return JobDeletionOutcome.TERMINAL_DELETED
 
+    def delete_next_expired_terminal_job(
+        self,
+        sweep_at: datetime,
+    ) -> bool:
+        _encode_job_timestamp(sweep_at)
+        cutoff = sweep_at - timedelta(
+            hours=self.limits.result_retention_hours
+        )
+        encoded_cutoff = _encode_job_timestamp(cutoff)
+        normalized_cutoff = (
+            encoded_cutoff
+            if "." in encoded_cutoff
+            else f"{encoded_cutoff[:-1]}.000000Z"
+        )
+        normalized_finished_at = """
+            CASE
+                WHEN instr(finished_at, '.') = 0
+                THEN substr(finished_at, 1, length(finished_at) - 1)
+                     || '.000000Z'
+                ELSE finished_at
+            END
+        """
+
+        with self._transaction():
+            row = self._connection.execute(
+                f"""
+                SELECT {_TRANSCRIPTION_JOB_COLUMNS}
+                FROM transcription_jobs
+                WHERE status IN ('succeeded', 'failed', 'cancelled')
+                  AND (
+                      phase = 'deleting'
+                      OR (
+                          phase = 'visible'
+                          AND {normalized_finished_at} <= ?
+                      )
+                  )
+                ORDER BY
+                    CASE phase WHEN 'deleting' THEN 0 ELSE 1 END,
+                    {normalized_finished_at},
+                    id
+                LIMIT 1
+                """,
+                (normalized_cutoff,),
+            ).fetchone()
+            if row is None:
+                return False
+            job = _decode_transcription_job(row)
+            if job.phase is JobPhase.VISIBLE:
+                assert job.status is not None
+                changed = self._connection.execute(
+                    """
+                    UPDATE transcription_jobs SET phase = 'deleting'
+                    WHERE id = ? AND phase = 'visible'
+                      AND status = ? AND finished_at = ?
+                    """,
+                    (
+                        job.id,
+                        job.status.value,
+                        row["finished_at"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError(
+                        "expired terminal job changed during deletion"
+                    )
+            elif job.phase is not JobPhase.DELETING:
+                raise StorageSchemaError(
+                    "retention selected a non-terminal job"
+                )
+
+        self._delete_terminal_job(job.id)
+        return True
+
     def cleanup_cancelled_job_input(self, job_id: str) -> None:
         validate_job_id(job_id)
         self._cleanup_terminal_job_input(job_id, JobStatus.CANCELLED)
@@ -2985,7 +3058,7 @@ class Storage:
     def open_succeeded_job_result(
         self,
         job_id: str,
-    ) -> StoredJobResult:
+    ) -> StoredJobResult | None:
         validate_job_id(job_id)
         handle: BinaryIO | None = None
         try:
@@ -3000,9 +3073,7 @@ class Storage:
                     (job_id,),
                 ).fetchone()
                 if job_row is None:
-                    raise CanonicalArtifactError(
-                        "stored job result is unavailable"
-                    )
+                    return None
                 job = _decode_transcription_job(job_row)
                 lease_row = self._connection.execute(
                     "SELECT * FROM storage_leases WHERE id = ?",

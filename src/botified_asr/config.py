@@ -108,6 +108,11 @@ class LimitsConfig:
             if not _is_int(value) or value <= 0:
                 raise ConfigError(f"limits.{field.name} must be a positive integer")
 
+        if self.result_retention_hours > 24:
+            raise ConfigError(
+                "limits.result_retention_hours must be an integer from 1 to 24"
+            )
+
         if not (
             self.direct_max_audio_duration_secs <= 30
             and self.sync_max_audio_duration_secs <= 3600

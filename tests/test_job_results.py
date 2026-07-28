@@ -746,6 +746,345 @@ def test_terminal_delete_fault_recovers_on_startup(
         assert recovered.total_reserved_bytes() == 0
 
 
+def test_retention_deletes_one_job_at_a_time_in_exact_finished_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_ids = iter(
+        (
+            "7K3M9Q2W",
+            "8K3M9Q2W",
+            "9K3M9Q2W",
+            "AK3M9Q2W",
+        )
+    )
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(job_ids))
+    monkeypatch.setattr(
+        storage_module,
+        "generate_attempt_token",
+        lambda: "attempt-1",
+    )
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    cutoff = FINISHED_AT
+    finished_by_id = {
+        "7K3M9Q2W": cutoff,
+        "8K3M9Q2W": cutoff + timedelta(microseconds=1),
+        "9K3M9Q2W": cutoff - timedelta(microseconds=1),
+        "AK3M9Q2W": cutoff - timedelta(microseconds=1),
+    }
+    with closing(storage):
+        for expected_id, finished_at in finished_by_id.items():
+            running = queue_and_claim(storage)
+            assert running.id == expected_id
+            assert (
+                commit_terminal(
+                    storage,
+                    running,
+                    "failure",
+                    finished_at=finished_at,
+                )
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+
+        sweep_at = cutoff + timedelta(
+            hours=storage.limits.result_retention_hours
+        )
+        for deleted_id in (
+            "9K3M9Q2W",
+            "AK3M9Q2W",
+            "7K3M9Q2W",
+        ):
+            assert storage.delete_next_expired_terminal_job(sweep_at)
+            assert storage.get_visible_job(deleted_id) is None
+        assert not storage.delete_next_expired_terminal_job(sweep_at)
+        retained = storage.get_visible_job("8K3M9Q2W")
+        assert retained is not None
+        assert retained.finished_at == cutoff + timedelta(microseconds=1)
+
+
+def test_retention_never_changes_queued_or_running_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_ids = iter(("7K3M9Q2W", "8K3M9Q2W"))
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(job_ids))
+    monkeypatch.setattr(
+        storage_module,
+        "generate_attempt_token",
+        lambda: "attempt-1",
+    )
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        running = queue_and_claim(storage)
+        queued = queue_job(storage)
+        before = recovery_snapshot(tmp_path)
+
+        assert not storage.delete_next_expired_terminal_job(
+            FINISHED_AT + timedelta(days=365)
+        )
+        assert recovery_snapshot(tmp_path) == before
+        assert storage.get_visible_job(running.id) == running
+        assert storage.get_visible_job(queued.id) == queued
+
+
+def test_retention_uses_configured_hours(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    configured_limits = LimitsConfig(
+        max_upload_bytes=RESERVATION_QUANTUM,
+        sync_max_upload_bytes=RESERVATION_QUANTUM,
+        max_active_uploads=4,
+        max_queued_jobs=4,
+        max_job_storage_bytes=4 * RESERVATION_QUANTUM,
+        min_filesystem_free_bytes=1,
+        result_retention_hours=1,
+    )
+    storage = Storage(
+        tmp_path,
+        configured_limits,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        running = queue_and_claim(storage)
+        assert (
+            commit_terminal(storage, running, "failure")
+            is jobs.JobTerminalOutcome.COMMITTED
+        )
+
+        assert not storage.delete_next_expired_terminal_job(
+            FINISHED_AT + timedelta(hours=1, microseconds=-1)
+        )
+        assert storage.delete_next_expired_terminal_job(
+            FINISHED_AT + timedelta(hours=1)
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        jobs.JobStatus.SUCCEEDED,
+        jobs.JobStatus.FAILED,
+        jobs.JobStatus.CANCELLED,
+    ),
+)
+def test_retention_deletes_each_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: jobs.JobStatus,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        if terminal_status is jobs.JobStatus.SUCCEEDED:
+            finish_progress(storage, running)
+            result_ref = seal_result(storage, running)
+            assert running.attempt_token is not None
+            assert (
+                storage.commit_job_success(
+                    running.id,
+                    running.attempt_token,
+                    result_ref,
+                )
+                is jobs.JobSuccessOutcome.COMMITTED
+            )
+        elif terminal_status is jobs.JobStatus.FAILED:
+            assert (
+                commit_terminal(storage, running, "failure")
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+        else:
+            assert (
+                storage.delete_or_cancel_job(running.id, FINISHED_AT)
+                is jobs.JobDeletionOutcome.RUNNING_CANCEL_REQUESTED
+            )
+            assert (
+                commit_terminal(storage, running, "cancellation")
+                is jobs.JobTerminalOutcome.COMMITTED
+            )
+
+        assert storage.delete_next_expired_terminal_job(
+            FINISHED_AT
+            + timedelta(hours=storage.limits.result_retention_hours)
+        )
+        assert storage.get_visible_job(running.id) is None
+        assert storage.total_reserved_bytes() == 0
+
+
+@pytest.mark.parametrize("fault_stage", ("unlink", "fsync", "database"))
+def test_retention_retries_deleting_job_without_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        sweep_at = FINISHED_AT + timedelta(
+            hours=storage.limits.result_retention_hours
+        )
+
+        if fault_stage == "database":
+            storage._connection.execute(
+                f"""
+                CREATE TRIGGER reject_retention_delete
+                BEFORE DELETE ON transcription_jobs
+                WHEN OLD.id = '{running.id}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected retention failure');
+                END
+                """
+            )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="injected retention failure",
+            ):
+                storage.delete_next_expired_terminal_job(sweep_at)
+            storage._connection.execute(
+                "DROP TRIGGER reject_retention_delete"
+            )
+        else:
+            original_unlink = Path.unlink
+            original_fsync = storage_module._fsync_directory
+
+            def fail_unlink(path: Path) -> None:
+                if path == result_ref.path:
+                    raise OSError("injected retention failure")
+                original_unlink(path)
+
+            def fail_fsync(directory: Path) -> None:
+                if directory == storage.artifact_dir:
+                    raise OSError("injected retention failure")
+                original_fsync(directory)
+
+            with monkeypatch.context() as fault:
+                if fault_stage == "unlink":
+                    fault.setattr(Path, "unlink", fail_unlink)
+                else:
+                    fault.setattr(
+                        storage_module,
+                        "_fsync_directory",
+                        fail_fsync,
+                    )
+                with pytest.raises(
+                    OSError,
+                    match="injected retention failure",
+                ):
+                    storage.delete_next_expired_terminal_job(sweep_at)
+
+        deleting = storage._connection.execute(
+            "SELECT phase FROM transcription_jobs WHERE id = ?",
+            (running.id,),
+        ).fetchone()
+        assert deleting["phase"] == "deleting"
+        assert storage.open_succeeded_job_result(running.id) is None
+
+        assert storage.delete_next_expired_terminal_job(CREATED_AT)
+        assert storage.get_visible_job(running.id) is None
+        assert storage.total_reserved_bytes() == 0
+
+
+@pytest.mark.parametrize("retention_first", (False, True))
+def test_retention_and_explicit_delete_orders_are_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retention_first: bool,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        assert (
+            commit_terminal(storage, running, "failure")
+            is jobs.JobTerminalOutcome.COMMITTED
+        )
+        sweep_at = FINISHED_AT + timedelta(
+            hours=storage.limits.result_retention_hours
+        )
+
+        if retention_first:
+            assert storage.delete_next_expired_terminal_job(sweep_at)
+            assert (
+                storage.delete_or_cancel_job(running.id, sweep_at)
+                is jobs.JobDeletionOutcome.NOT_FOUND
+            )
+        else:
+            assert (
+                storage.delete_or_cancel_job(running.id, sweep_at)
+                is jobs.JobDeletionOutcome.TERMINAL_DELETED
+            )
+            assert not storage.delete_next_expired_terminal_job(sweep_at)
+
+
+def test_open_succeeded_job_result_returns_none_when_not_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ids(monkeypatch)
+    storage = Storage(
+        tmp_path,
+        limits(),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+    with closing(storage):
+        assert storage.open_succeeded_job_result("7K3M9Q2W") is None
+        running = queue_and_claim(storage)
+        assert (
+            commit_terminal(storage, running, "failure")
+            is jobs.JobTerminalOutcome.COMMITTED
+        )
+        assert storage.open_succeeded_job_result(running.id) is None
+
+
+def test_open_result_fd_survives_terminal_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, running = new_running_job(tmp_path, monkeypatch)
+    with closing(storage):
+        finish_progress(storage, running)
+        result_ref = seal_result(storage, running)
+        expected_body = result_ref.path.read_bytes().split(b"\n", 1)[1]
+        assert running.attempt_token is not None
+        assert (
+            storage.commit_job_success(
+                running.id,
+                running.attempt_token,
+                result_ref,
+            )
+            is jobs.JobSuccessOutcome.COMMITTED
+        )
+        stored = storage.open_succeeded_job_result(running.id)
+        assert stored is not None
+
+        assert (
+            storage.delete_or_cancel_job(running.id, FINISHED_AT)
+            is jobs.JobDeletionOutcome.TERMINAL_DELETED
+        )
+        with closing(stored):
+            assert b"".join(stored.iter_body()) == expected_body
+
+
 @pytest.mark.parametrize(
     ("failure_code", "expected_status"),
     (

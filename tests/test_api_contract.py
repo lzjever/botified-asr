@@ -199,6 +199,10 @@ def test_job_executor_lifespan_drives_dynamic_readiness_and_closes_in_order(
     events: list[str] = []
 
     class FakeStorage:
+        def delete_next_expired_terminal_job(self, _sweep_at) -> bool:
+            events.append("storage.sweep")
+            return False
+
         def close(self) -> None:
             events.append("storage.close")
 
@@ -241,6 +245,7 @@ def test_job_executor_lifespan_drives_dynamic_readiness_and_closes_in_order(
         assert client.get("/health/ready", headers=AUTH).status_code == 503
 
     assert events == [
+        "storage.sweep",
         "executor.start",
         "executor.stop",
         "storage.close",

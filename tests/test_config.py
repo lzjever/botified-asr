@@ -291,6 +291,34 @@ def test_duration_release_boundaries_are_accepted(tmp_path: Path) -> None:
     assert limits.max_audio_duration_secs == 43_200
 
 
+@pytest.mark.parametrize("hours", (1, 24))
+def test_result_retention_accepts_release_boundaries(
+    tmp_path: Path,
+    hours: int,
+) -> None:
+    path = write_config(
+        tmp_path,
+        f"limits:\n  result_retention_hours: {hours}\n",
+    )
+
+    assert load_config(path).limits.result_retention_hours == hours
+
+
+def test_result_retention_rejects_above_release_limit(
+    tmp_path: Path,
+) -> None:
+    path = write_config(
+        tmp_path,
+        "limits:\n  result_retention_hours: 25\n",
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"limits\.result_retention_hours.*1 to 24",
+    ):
+        load_config(path)
+
+
 def test_storage_limit_rounds_max_upload_to_reservation_quantum(
     tmp_path: Path,
 ) -> None:
