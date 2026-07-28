@@ -5,6 +5,7 @@ import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
+from types import FrameType
 
 import uvicorn
 
@@ -20,6 +21,23 @@ from botified_asr.runtime import JobExecutor
 from botified_asr.storage import Storage
 
 
+class _ShutdownAwareServer(uvicorn.Server):
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        job_executor: JobExecutor,
+    ) -> None:
+        super().__init__(config)
+        self._job_executor = job_executor
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        super().handle_exit(sig, frame)
+        try:
+            self._job_executor.begin_shutdown()
+        except BaseException:
+            pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=_default_config_path())
@@ -29,6 +47,7 @@ def main() -> None:
     port = int(port_text)
     api_key = load_api_key()
     storage: Storage | None = None
+    job_executor: JobExecutor | None = None
     try:
         fetcher = HuggingFaceSnapshotFetcher()
         resolver = ModelArtifactResolver(
@@ -81,10 +100,21 @@ def main() -> None:
             job_executor=job_executor,
             close_storage_on_shutdown=False,
         )
-        uvicorn.run(app, host=host, port=port, workers=1)
+        uvicorn_config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            workers=1,
+            timeout_graceful_shutdown=30,
+        )
+        _ShutdownAwareServer(uvicorn_config, job_executor).run()
     finally:
-        if storage is not None:
-            storage.close()
+        try:
+            if job_executor is not None:
+                job_executor.stop()
+        finally:
+            if storage is not None:
+                storage.close()
 
 
 def _default_config_path() -> Path:

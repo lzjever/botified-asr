@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,7 +59,20 @@ def install_fakes(
         sync_processor=sync_processor,
         async_processor=async_processor,
     )
-    executor = SimpleNamespace(ready=False)
+    class FakeExecutor:
+        ready = False
+        stop_calls = 0
+
+        def begin_shutdown(self) -> None:
+            events.append(("executor.begin_shutdown", (), {}))
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            events.append(("executor.stop", (), {}))
+            if failure_site == "executor.stop":
+                raise failure
+
+    executor = FakeExecutor()
     executor_clocks: list[object] = []
     readiness = SimpleNamespace(
         database=True,
@@ -223,10 +237,19 @@ def install_fakes(
         "create_app",
         fake("create_app", app),
     )
+    uvicorn_config = object()
+    server = SimpleNamespace()
+    server.run = fake("server.run", None)
     monkeypatch.setattr(
         main_module.uvicorn,
-        "run",
-        fake("uvicorn.run", None),
+        "Config",
+        fake("uvicorn.Config", uvicorn_config),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_ShutdownAwareServer",
+        fake("_ShutdownAwareServer", server),
+        raising=False,
     )
     return SimpleNamespace(
         events=events,
@@ -251,6 +274,8 @@ def install_fakes(
         executor_clocks=executor_clocks,
         readiness=readiness,
         app=app,
+        uvicorn_config=uvicorn_config,
+        server=server,
     )
 
 
@@ -330,10 +355,22 @@ def expected_success_events(
             },
         ),
         (
-            "uvicorn.run",
+            "uvicorn.Config",
             (scenario.app,),
-            {"host": "127.0.0.1", "port": 19001, "workers": 1},
+            {
+                "host": "127.0.0.1",
+                "port": 19001,
+                "workers": 1,
+                "timeout_graceful_shutdown": 30,
+            },
         ),
+        (
+            "_ShutdownAwareServer",
+            (scenario.uvicorn_config, scenario.executor),
+            {},
+        ),
+        ("server.run", (), {}),
+        ("executor.stop", (), {}),
         ("storage.close", (), {}),
     ]
 
@@ -350,6 +387,7 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
     assert callable(scenario.executor_clocks[0])
     assert scenario.executor_clocks[0]() == PROCESS_NOW
     assert scenario.readiness.ready is False
+    assert scenario.executor.stop_calls == 1
     assert scenario.storage.close_calls == 1
 
 
@@ -392,11 +430,12 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
                 "TranscriptionProcessorPool",
                 "Readiness",
                 "create_app",
+                "executor.stop",
                 "storage.close",
             ],
         ),
         (
-            "uvicorn.run",
+            "server.run",
             [
                 "load_config",
                 "load_api_key",
@@ -410,13 +449,38 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
                 "TranscriptionProcessorPool",
                 "Readiness",
                 "create_app",
-                "uvicorn.run",
+                "uvicorn.Config",
+                "_ShutdownAwareServer",
+                "server.run",
+                "executor.stop",
+                "storage.close",
+            ],
+        ),
+        (
+            "executor.stop",
+            [
+                "load_config",
+                "load_api_key",
+                "HuggingFaceSnapshotFetcher",
+                "ModelArtifactResolver",
+                "load_funasr_model_pool",
+                "Storage",
+                "FfmpegAudioFrontend",
+                "Processor",
+                "Processor",
+                "TranscriptionProcessorPool",
+                "Readiness",
+                "create_app",
+                "uvicorn.Config",
+                "_ShutdownAwareServer",
+                "server.run",
+                "executor.stop",
                 "storage.close",
             ],
         ),
     ],
 )
-def test_main_propagates_startup_failures_and_closes_storage_once(
+def test_main_propagates_failures_and_closes_storage_once(
     monkeypatch: pytest.MonkeyPatch,
     failure_site: str,
     expected_names: list[str],
@@ -431,6 +495,32 @@ def test_main_propagates_startup_failures_and_closes_storage_once(
     assert scenario.storage.close_calls == (
         0 if failure_site in {"load_funasr_model_pool", "Storage"} else 1
     )
+
+
+def test_shutdown_server_updates_uvicorn_before_begin_and_swallows_base_error() -> None:
+    observations: list[tuple[bool, bool]] = []
+    server = None
+
+    class FailingExecutor:
+        def begin_shutdown(self) -> None:
+            assert server is not None
+            observations.append((server.should_exit, server.force_exit))
+            raise KeyboardInterrupt("signal callback must not escape")
+
+    async def app(_scope: object, _receive: object, _send: object) -> None:
+        pass
+
+    server = main_module._ShutdownAwareServer(
+        main_module.uvicorn.Config(app),
+        FailingExecutor(),
+    )
+
+    server.handle_exit(signal.SIGTERM, None)
+    server.handle_exit(signal.SIGINT, None)
+
+    assert observations == [(True, False), (True, True)]
+    assert server.should_exit
+    assert server.force_exit
 
 
 def test_main_parses_port_before_api_key_or_resource_acquisition(

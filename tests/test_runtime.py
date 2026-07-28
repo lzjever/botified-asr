@@ -175,6 +175,121 @@ def test_job_executor_claims_fifo_only_when_slot_is_free(
     assert cancellation_seen.is_set()
 
 
+def test_shutdown_during_claim_does_not_block_or_run_claimed_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _runtime()
+    ids = iter(("01234567", "ABCDEFGH"))
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(ids))
+    storage = _storage(tmp_path)
+    first = _queue_job(storage)
+    second = _queue_job(storage)
+    claim_entered = threading.Event()
+    allow_claim = threading.Event()
+    marker_entered = threading.Event()
+    marker_has_storage = threading.Event()
+    allow_marker = threading.Event()
+    executions: list[str] = []
+    requeue_calls: list[str] = []
+    original_claim = storage.claim_next_job
+    original_marker = storage.write_shutdown_marker
+    original_requeue = storage.requeue_job_at_shutdown
+
+    def claim(generation: str, claimed_at: datetime):
+        with storage._lock:
+            claim_entered.set()
+            if not allow_claim.wait(timeout=2):
+                raise RuntimeError("timed out waiting to release claim")
+            return original_claim(generation, claimed_at)
+
+    def write_marker(generation: str, created_at: datetime) -> None:
+        marker_entered.set()
+        with storage._lock:
+            marker_has_storage.set()
+            if not allow_marker.wait(timeout=2):
+                raise RuntimeError("timed out waiting to write marker")
+            original_marker(generation, created_at)
+
+    def requeue(
+        job_id: str,
+        attempt_token: str,
+        generation: str,
+    ) -> bool:
+        requeue_calls.append(job_id)
+        return original_requeue(job_id, attempt_token, generation)
+
+    def execute(
+        _storage: Storage,
+        _processor: object,
+        running: jobs.DurableJob,
+        _cancellation: Cancellation,
+        **_kwargs: Any,
+    ) -> None:
+        executions.append(running.id)
+
+    monkeypatch.setattr(storage, "claim_next_job", claim)
+    monkeypatch.setattr(storage, "write_shutdown_marker", write_marker)
+    monkeypatch.setattr(storage, "requeue_job_at_shutdown", requeue)
+    monkeypatch.setattr(runtime, "execute_claimed_job_attempt", execute)
+    executor = runtime.JobExecutor(
+        storage,
+        object(),
+        _speaker_embedding_policy(),
+        GENERATION,
+        _now,
+    )
+    stop_errors: list[BaseException] = []
+    stopper = threading.Thread(
+        target=lambda: _call_and_capture(executor.stop, stop_errors),
+        daemon=True,
+    )
+    try:
+        executor.start()
+        executor.wake()
+        assert claim_entered.wait(timeout=2)
+
+        begin_started = time.monotonic()
+        executor.begin_shutdown()
+        assert time.monotonic() - begin_started < 0.5
+        assert marker_entered.wait(timeout=2)
+        assert not executor.ready
+        assert executor._wake_event.is_set()
+        assert executions == []
+
+        stopper.start()
+        allow_claim.set()
+        assert marker_has_storage.wait(timeout=2)
+        _wait_until(lambda: executor._active_cancellation is not None)
+        with executor._lock:
+            cancellation = executor._active_cancellation
+        assert cancellation is not None
+        assert cancellation.cancelled
+        assert executions == []
+
+        allow_marker.set()
+        stopper.join(timeout=2)
+        assert not stopper.is_alive()
+        assert stop_errors == []
+        assert executions == []
+        assert requeue_calls == [first.id]
+        requeued = storage.get_visible_job(first.id)
+        assert requeued is not None
+        assert requeued.status is jobs.JobStatus.QUEUED
+        assert requeued.attempt_no == 1
+        waiting = storage.get_visible_job(second.id)
+        assert waiting is not None
+        assert waiting.status is jobs.JobStatus.QUEUED
+        assert waiting.attempt_no == 0
+    finally:
+        allow_claim.set()
+        allow_marker.set()
+        if stopper.is_alive():
+            stopper.join(timeout=2)
+        executor.stop()
+        storage.close()
+
+
 def test_job_executor_starts_idle_then_claims_a_later_job(
     tmp_path: Path,
     monkeypatch,
@@ -453,10 +568,14 @@ def test_job_executor_shutdown_fences_claims_cancels_and_requeues_from_zero(
     policy = _speaker_embedding_policy()
     entered = threading.Event()
     cancellation_seen = threading.Event()
+    marker_entered = threading.Event()
+    allow_marker = threading.Event()
     allow_runner_return = threading.Event()
     runner_returned = threading.Event()
     executions: list[tuple[str, str]] = []
+    marker_calls: list[str] = []
     requeue_calls: list[tuple[str, str, str, bool]] = []
+    original_marker = storage.write_shutdown_marker
     original_requeue = storage.requeue_job_at_shutdown
 
     def execute(
@@ -498,7 +617,15 @@ def test_job_executor_shutdown_fences_claims_cancels_and_requeues_from_zero(
         )
         return original_requeue(job_id, attempt_token, generation)
 
+    def write_marker(generation: str, created_at: datetime) -> None:
+        marker_calls.append(generation)
+        marker_entered.set()
+        if not allow_marker.wait(timeout=2):
+            raise RuntimeError("timed out waiting to write shutdown marker")
+        original_marker(generation, created_at)
+
     monkeypatch.setattr(runtime, "execute_claimed_job_attempt", execute)
+    monkeypatch.setattr(storage, "write_shutdown_marker", write_marker)
     monkeypatch.setattr(storage, "requeue_job_at_shutdown", requeue)
     executor = runtime.JobExecutor(
         storage,
@@ -520,10 +647,25 @@ def test_job_executor_shutdown_fences_claims_cancels_and_requeues_from_zero(
         assert running is not None
         assert running.attempt_token is not None
 
-        stopper.start()
+        begin_started = time.monotonic()
+        executor.begin_shutdown()
+        assert time.monotonic() - begin_started < 0.5
+        executor.begin_shutdown()
+        assert marker_entered.wait(timeout=2)
         assert cancellation_seen.wait(timeout=2)
-
         assert not executor.ready
+        assert executor._wake_event.is_set()
+        assert marker_calls == [GENERATION]
+        assert storage.get_visible_job(waiting.id).status is jobs.JobStatus.QUEUED
+        assert executions == [(active.id, running.attempt_token)]
+
+        stopper.start()
+        time.sleep(0.05)
+        assert stopper.is_alive()
+
+        allow_marker.set()
+        time.sleep(0.05)
+        assert stopper.is_alive()
         with storage._lock:
             marker = storage._connection.execute(
                 "SELECT generation FROM shutdown_marker"
@@ -569,6 +711,7 @@ def test_job_executor_shutdown_fences_claims_cancels_and_requeues_from_zero(
             ).fetchone()[0]
         assert artifact_count == 0
     finally:
+        allow_marker.set()
         allow_runner_return.set()
         if stopper.is_alive():
             stopper.join(timeout=2)
@@ -659,6 +802,8 @@ def test_job_executor_marker_failure_cancels_active_and_is_idempotent(
     sentinel = OSError("shutdown marker failed")
     entered = threading.Event()
     cancellation_seen = threading.Event()
+    marker_entered = threading.Event()
+    allow_marker_failure = threading.Event()
     marker_calls: list[str] = []
     requeue_calls: list[str] = []
 
@@ -678,6 +823,9 @@ def test_job_executor_marker_failure_cancels_active_and_is_idempotent(
 
     def fail_marker(generation: str, _created_at: datetime) -> None:
         marker_calls.append(generation)
+        marker_entered.set()
+        if not allow_marker_failure.wait(timeout=2):
+            raise RuntimeError("timed out waiting to fail shutdown marker")
         raise sentinel
 
     def observe_requeue(*_args: Any, **_kwargs: Any) -> bool:
@@ -698,19 +846,31 @@ def test_job_executor_marker_failure_cancels_active_and_is_idempotent(
         GENERATION,
         _now,
     )
+    stop_errors: list[BaseException] = []
+    stoppers = tuple(
+        threading.Thread(
+            target=lambda: _call_and_capture(executor.stop, stop_errors),
+            daemon=True,
+        )
+        for _ in range(2)
+    )
     try:
         executor.start()
         executor.wake()
         assert entered.wait(timeout=2)
 
-        with pytest.raises(OSError) as first:
-            executor.stop()
-        with pytest.raises(OSError) as repeated:
-            executor.stop()
+        for stopper in stoppers:
+            stopper.start()
+        assert marker_entered.wait(timeout=2)
+        assert cancellation_seen.wait(timeout=2)
+        assert all(stopper.is_alive() for stopper in stoppers)
 
-        assert first.value is sentinel
-        assert repeated.value is sentinel
-        assert cancellation_seen.is_set()
+        allow_marker_failure.set()
+        for stopper in stoppers:
+            stopper.join(timeout=2)
+        assert all(not stopper.is_alive() for stopper in stoppers)
+
+        assert stop_errors == [sentinel, sentinel]
         assert marker_calls == [GENERATION]
         assert requeue_calls == []
         current = storage.get_visible_job(queued.id)
@@ -721,6 +881,50 @@ def test_job_executor_marker_failure_cancels_active_and_is_idempotent(
                 "SELECT COUNT(*) FROM shutdown_marker"
             ).fetchone()[0]
         assert marker_count == 0
+    finally:
+        allow_marker_failure.set()
+        for stopper in stoppers:
+            if stopper.is_alive():
+                stopper.join(timeout=2)
+        storage.close()
+
+
+def test_job_executor_marker_thread_start_failure_unblocks_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _runtime()
+    storage = _storage(tmp_path)
+    sentinel = RuntimeError("marker thread did not start")
+    executor = runtime.JobExecutor(
+        storage,
+        object(),
+        _speaker_embedding_policy(),
+        GENERATION,
+        _now,
+    )
+
+    class FailingMarkerThread:
+        def __init__(self, *, target: object, name: str) -> None:
+            assert callable(target)
+            assert name == "botified-asr-shutdown-marker"
+
+        def start(self) -> None:
+            raise sentinel
+
+    try:
+        executor.start()
+        monkeypatch.setattr(runtime.threading, "Thread", FailingMarkerThread)
+
+        executor.begin_shutdown()
+
+        assert not executor.ready
+        with pytest.raises(RuntimeError) as first:
+            executor.stop()
+        with pytest.raises(RuntimeError) as repeated:
+            executor.stop()
+        assert first.value is sentinel
+        assert repeated.value is sentinel
     finally:
         storage.close()
 

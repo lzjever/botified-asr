@@ -1920,9 +1920,7 @@ class Storage:
                 "SELECT 1 FROM shutdown_marker"
             ).fetchone()
             if marker is not None:
-                raise RuntimeError(
-                    "cannot claim jobs after shutdown has started"
-                )
+                return None
             row = self._connection.execute(
                 f"""
                 SELECT {_TRANSCRIPTION_JOB_COLUMNS}

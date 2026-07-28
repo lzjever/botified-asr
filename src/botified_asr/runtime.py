@@ -35,8 +35,10 @@ class JobExecutor:
         self._marker_done = threading.Event()
         self._stop_complete = threading.Event()
         self._thread: threading.Thread | None = None
+        self._marker_thread: threading.Thread | None = None
         self._started = False
         self._stopping = False
+        self._stop_started = False
         self._ready = False
         self._failure: BaseException | None = None
         self._stop_error: BaseException | None = None
@@ -88,52 +90,105 @@ class JobExecutor:
         if cancellation is not None:
             cancellation.cancel()
 
+    def begin_shutdown(self) -> None:
+        active_cancellation: Cancellation | None = None
+        marker_required = False
+        try:
+            with self._lock:
+                if self._stopping:
+                    return
+                self._stopping = True
+                self._ready = False
+                active_cancellation = self._active_cancellation
+                marker_required = self._started and self._failure is None
+
+            if active_cancellation is not None:
+                active_cancellation.cancel()
+            self._wake_event.set()
+
+            if not marker_required:
+                self._marker_done.set()
+                return
+            try:
+                marker_thread = threading.Thread(
+                    target=self._write_shutdown_marker,
+                    name="botified-asr-shutdown-marker",
+                )
+                with self._lock:
+                    self._marker_thread = marker_thread
+                marker_thread.start()
+            except BaseException as error:
+                with self._lock:
+                    self._marker_thread = None
+                self._record_stop_error(error)
+                self._marker_done.set()
+        except BaseException as error:
+            self._record_stop_error(error)
+            try:
+                self._wake_event.set()
+            except BaseException:
+                pass
+            self._marker_done.set()
+
     def stop(self) -> None:
+        self.begin_shutdown()
         with self._lock:
-            if self._stopping:
+            if self._stop_started:
                 owns_stop = False
             else:
                 owns_stop = True
-                self._stopping = True
-                self._ready = False
-                started = self._started
-                fatal = self._failure is not None
+                self._stop_started = True
 
         if not owns_stop:
             self._stop_complete.wait()
             self._raise_stop_error()
             return
 
-        if not started:
-            self._marker_done.set()
-            self._stop_complete.set()
-            return
-
-        if not fatal:
-            try:
-                self._storage.write_shutdown_marker(
-                    self._generation,
-                    self._now(),
+        current_thread = threading.current_thread()
+        try:
+            self._marker_done.wait()
+            with self._lock:
+                marker_thread = self._marker_thread
+                thread = self._thread
+            if marker_thread is not None and marker_thread is not current_thread:
+                try:
+                    marker_thread.join()
+                except BaseException as error:
+                    self._record_stop_error(error)
+            if thread is not None and thread is not current_thread:
+                try:
+                    thread.join()
+                except BaseException as error:
+                    self._record_stop_error(error)
+            elif thread is current_thread:
+                self._record_stop_error(
+                    RuntimeError("job executor cannot join its worker thread")
                 )
-            except BaseException as error:
-                with self._lock:
-                    if self._stop_error is None:
-                        self._stop_error = error
-            else:
-                with self._lock:
-                    self._marker_written = True
-
-        self._marker_done.set()
-        with self._lock:
-            active_cancellation = self._active_cancellation
-            thread = self._thread
-        if active_cancellation is not None:
-            active_cancellation.cancel()
-        self._wake_event.set()
-        assert thread is not None
-        thread.join()
-        self._stop_complete.set()
+        finally:
+            self._stop_complete.set()
         self._raise_stop_error()
+
+    def _write_shutdown_marker(self) -> None:
+        try:
+            self._storage.write_shutdown_marker(
+                self._generation,
+                self._now(),
+            )
+        except BaseException as error:
+            self._record_stop_error(error)
+        else:
+            with self._lock:
+                self._marker_written = True
+        finally:
+            self._marker_done.set()
+
+    def _record_stop_error(self, error: BaseException) -> None:
+        try:
+            with self._lock:
+                if self._stop_error is None:
+                    self._stop_error = error
+        except BaseException:
+            pass
 
     def _run(self) -> None:
         while True:
@@ -141,38 +196,52 @@ class JobExecutor:
             with self._lock:
                 if self._stopping or self._failure is not None:
                     return
-                try:
-                    running_job = self._storage.claim_next_job(
-                        self._generation,
-                        self._now(),
-                    )
-                except BaseException as error:
-                    self._failure = error
-                    self._ready = False
-                    return
-                if running_job is not None:
-                    cancellation = Cancellation()
-                    self._active_job_id = running_job.id
-                    self._active_cancellation = cancellation
+
+            try:
+                running_job = self._storage.claim_next_job(
+                    self._generation,
+                    self._now(),
+                )
+            except BaseException as error:
+                with self._lock:
+                    if self._stopping:
+                        if self._stop_error is None:
+                            self._stop_error = error
+                    else:
+                        self._failure = error
+                        self._ready = False
+                return
 
             if running_job is None:
+                with self._lock:
+                    if self._stopping or self._failure is not None:
+                        return
                 self._wake_event.wait(_IDLE_WAIT_SECONDS)
                 continue
 
+            cancellation = Cancellation()
+            with self._lock:
+                stopping = self._stopping
+                if stopping:
+                    cancellation.cancel()
+                self._active_job_id = running_job.id
+                self._active_cancellation = cancellation
+
             runner_error: BaseException | None = None
-            try:
-                execute_claimed_job_attempt(
-                    self._storage,
-                    self._processor,
-                    running_job,
-                    cancellation,
-                    speaker_embedding_policy=(
-                        self._speaker_embedding_policy
-                    ),
-                    now=self._now,
-                )
-            except BaseException as error:
-                runner_error = error
+            if not stopping:
+                try:
+                    execute_claimed_job_attempt(
+                        self._storage,
+                        self._processor,
+                        running_job,
+                        cancellation,
+                        speaker_embedding_policy=(
+                            self._speaker_embedding_policy
+                        ),
+                        now=self._now,
+                    )
+                except BaseException as error:
+                    runner_error = error
 
             with self._lock:
                 stopping = self._stopping

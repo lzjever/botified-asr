@@ -550,8 +550,7 @@ def test_shutdown_marker_is_idempotent_and_fences_requeue(
                 "generation-2",
                 CLAIMED_AT + timedelta(seconds=2),
             )
-        with pytest.raises(RuntimeError):
-            storage.claim_next_job("generation-1", CLAIMED_AT)
+        assert storage.claim_next_job("generation-1", CLAIMED_AT) is None
 
         assert not storage.requeue_job_at_shutdown(
             second.id,
