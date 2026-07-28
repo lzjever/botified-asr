@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import io
-import wave
+import hashlib
+from pathlib import Path
 
 import httpx
 from openai import OpenAI
@@ -18,6 +18,18 @@ from botified_asr.storage import Storage
 
 
 PROCESSOR_FINGERPRINT = "3" * 64
+SMOKE_AUDIO_PATH = (
+    Path(__file__).resolve().parents[1] / "assets" / "botified-asr-smoke.flac"
+)
+SMOKE_AUDIO_SIZE = 39_958
+SMOKE_AUDIO_SHA256 = "c536776258dcd74f84d98a075cf7bff0168c41646da9553ab696f336732c2005"
+
+
+def test_smoke_audio_asset_is_stable() -> None:
+    assert SMOKE_AUDIO_PATH.is_file()
+    audio = SMOKE_AUDIO_PATH.read_bytes()
+    assert len(audio) == SMOKE_AUDIO_SIZE
+    assert hashlib.sha256(audio).hexdigest() == SMOKE_AUDIO_SHA256
 
 
 class SdkProcessor:
@@ -58,23 +70,25 @@ class SdkProcessor:
             SpeakerLabelMapping(()),
         )
 
+
 def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
     storage = Storage(
         tmp_path,
         LimitsConfig(
-            max_upload_bytes=1024,
-            sync_max_upload_bytes=1024,
+            max_upload_bytes=SMOKE_AUDIO_SIZE,
+            sync_max_upload_bytes=SMOKE_AUDIO_SIZE,
             max_job_storage_bytes=2 * RESERVATION_QUANTUM,
             min_filesystem_free_bytes=1,
         ),
-        current_processor_fingerprint=PROCESSOR_FINGERPRINT, free_bytes=lambda _: 1 << 40,
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
     )
     app = create_app(
         api_key="sdk-secret",
         readiness=Readiness(True, True, True),
         storage=storage,
         processor=SdkProcessor(),
-        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "wav"),
+        audio_prober=lambda _path, _cancellation: MediaProbe(1.0, "flac"),
         processor_fingerprint="3" * 64,
         speaker_embedding_policy=speakers.SpeakerEmbeddingPolicy(
             model_id="funasr/campplus",
@@ -110,16 +124,14 @@ def test_openai_sdk_basic_sync_text_smoke(tmp_path) -> None:
         base_url="http://testserver/v1",
         http_client=httpx.Client(transport=httpx.MockTransport(forward)),
     )
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, "wb") as output:
-        output.setnchannels(1)
-        output.setsampwidth(2)
-        output.setframerate(16_000)
-        output.writeframes(b"\x00\x00" * 16)
     try:
         result = sdk.audio.transcriptions.create(
             model="sensevoice",
-            file=("audio.wav", wav_buffer.getvalue(), "audio/wav"),
+            file=(
+                "botified-asr-smoke.flac",
+                SMOKE_AUDIO_PATH.read_bytes(),
+                "audio/flac",
+            ),
         )
         assert result.text == "SDK works"
     finally:
