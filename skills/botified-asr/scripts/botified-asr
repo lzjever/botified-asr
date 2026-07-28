@@ -8,8 +8,14 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected exactly one command: health","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health or transcribe AUDIO_FILE","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
+}
+
+invalid_audio_file() {
+    printf '%s\n' \
+        '{"error":{"message":"Audio file must be a readable regular file","type":"client_error","param":"file","code":"invalid_audio_file"}}'
+    exit 66
 }
 
 curl_not_found() {
@@ -43,7 +49,13 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-if [ "$#" -ne 1 ] || [ "$1" != "health" ]; then
+if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
+    command_name=health
+    audio_file=
+elif [ "$#" -eq 2 ] && [ "$1" = "transcribe" ]; then
+    command_name=transcribe
+    audio_file=$2
+else
     invalid_command
 fi
 
@@ -205,6 +217,18 @@ while [ -n "$key_padding" ]; do
     esac
 done
 
+case "$command_name" in
+    health)
+        request_input=/dev/null
+        ;;
+    transcribe)
+        if [ ! -f "$audio_file" ] || [ ! -r "$audio_file" ]; then
+            invalid_audio_file
+        fi
+        request_input=$audio_file
+        ;;
+esac
+
 temporary_root=${TMPDIR:-/tmp}
 response_body=$(
     mktemp "$temporary_root/botified-asr-body.XXXXXX" 2>/dev/null
@@ -215,18 +239,42 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+set -- \
+    --disable \
+    --globoff \
+    --config - \
+    --proto '=http,https' \
+    --silent \
+    --fail-with-body \
+    --connect-timeout 5
+
+case "$command_name" in
+    health)
+        set -- \
+            "$@" \
+            --max-time 10 \
+            --request GET \
+            --url "$origin/health/ready"
+        ;;
+    transcribe)
+        set -- \
+            "$@" \
+            --request POST \
+            --form-string model=sensevoice \
+            --form-string response_format=json \
+            --form \
+            'file=@/dev/fd/3;filename=audio;type=application/octet-stream' \
+            --url "$origin/v1/audio/transcriptions"
+        ;;
+esac
+
+if ! { command exec 3<"$request_input"; } 2>/dev/null; then
+    invalid_audio_file
+fi
+
 printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
     curl \
-        --disable \
-        --globoff \
-        --config - \
-        --proto '=http,https' \
-        --silent \
-        --fail-with-body \
-        --connect-timeout 5 \
-        --max-time 10 \
-        --request GET \
-        --url "$origin/health/ready" \
+        "$@" \
         >"$response_body" 2>/dev/null
 curl_status=$?
 

@@ -32,6 +32,7 @@ for argument do
     printf '%s\\0' "$argument" >>"$FAKE_CURL_ARGS"
 done
 /bin/cat >"$FAKE_CURL_STDIN"
+/bin/cat <&3 >"$FAKE_CURL_UPLOAD"
 /usr/bin/env >"$FAKE_CURL_ENV"
 /bin/cat "$FAKE_CURL_BODY"
 /bin/cat "$FAKE_CURL_STDERR" >&2
@@ -61,6 +62,7 @@ exit "$FAKE_CURL_EXIT"
             "FAKE_CURL_STDERR": str(stderr_path),
             "FAKE_CURL_EXIT": str(exit_code),
             "FAKE_CURL_ENV": str(tmp_path / "curl-env"),
+            "FAKE_CURL_UPLOAD": str(tmp_path / "curl-upload"),
         }
     )
     environment.pop("BOTIFIED_ASR_BASE_URL", None)
@@ -130,10 +132,21 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     _, frontmatter, body = skill_text.split("---", 2)
     assert yaml.safe_load(frontmatter).keys() == {"name", "description"}
-    assert "TODO" not in skill_text
     assert "relative to this `SKILL.md` (the skill root)" in body
     assert "scripts/botified-asr health" in body
+    assert "scripts/botified-asr transcribe AUDIO_FILE" in body
+    assert (
+        body.index("first run `scripts/botified-asr health`")
+        < body.index("Only after it returns ready")
+        < body.index("`scripts/botified-asr transcribe AUDIO_FILE`")
+    )
     assert "references/api.md" in body
+    assert "transcrib" in yaml.safe_load(frontmatter)["description"].lower()
+    reference = (SKILL_ROOT / "references" / "api.md").read_text(
+        encoding="utf-8"
+    )
+    assert "POST `/v1/audio/transcriptions`" in reference
+    assert "`model=sensevoice`" in reference
 
     assert yaml.safe_load(
         (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -141,17 +154,26 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         "interface": {
             "display_name": "Botified ASR",
             "short_description": (
-                "Check configured Botified ASR service readiness"
+                "Check readiness and transcribe basic audio"
             ),
             "default_prompt": (
-                "Use $botified-asr to check whether my configured "
-                "Botified ASR service is ready."
+                "Use $botified-asr to check readiness or transcribe a "
+                "local audio file with my configured Botified ASR service."
             ),
         }
     }
 
 
-@pytest.mark.parametrize("arguments", [(), ("unknown",), ("health", "extra")])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (),
+        ("unknown",),
+        ("health", "extra"),
+        ("transcribe",),
+        ("transcribe", "audio.wav", "extra"),
+    ],
+)
 def test_invalid_command_precedes_the_curl_dependency_check(
     tmp_path: Path,
     arguments: tuple[str, ...],
@@ -482,6 +504,166 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
     if api_key:
         assert api_key.encode() not in result.stdout + result.stderr
     assert not args_path.exists()
+
+
+def test_client_configuration_errors_precede_audio_file_validation(
+    tmp_path: Path,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    missing_audio = tmp_path / "missing.wav"
+
+    result = _run(environment, "transcribe", str(missing_audio))
+
+    assert result.returncode == 78
+    assert _error_code(result) == "client_not_configured"
+    assert result.stderr == b""
+    assert str(missing_audio).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ["missing", "directory", "fifo", "unreadable"],
+)
+def test_transcribe_requires_a_readable_regular_audio_file(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    audio_path = tmp_path / f"invalid-{invalid_kind}.wav"
+    if invalid_kind == "directory":
+        audio_path.mkdir()
+    elif invalid_kind == "fifo":
+        os.mkfifo(audio_path)
+    elif invalid_kind == "unreadable":
+        audio_path.write_bytes(b"audio")
+        audio_path.chmod(0)
+
+    result = _run(environment, "transcribe", str(audio_path))
+
+    assert result.returncode == 66
+    assert _error_code(result) == "invalid_audio_file"
+    assert json.loads(result.stdout)["error"]["param"] == "file"
+    assert result.stderr == b""
+    assert str(audio_path).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+def test_audio_fd_open_failure_is_stable_and_does_not_call_curl(
+    tmp_path: Path,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    audio_path = tmp_path / "removed-after-validation.wav"
+    audio_path.write_bytes(b"audio")
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        """#!/bin/sh
+/bin/rm -f -- "$DELETE_BEFORE_AUDIO_OPEN"
+/usr/bin/mktemp "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    environment["DELETE_BEFORE_AUDIO_OPEN"] = str(audio_path)
+
+    result = _run(environment, "transcribe", str(audio_path))
+
+    assert result.returncode == 66
+    assert _error_code(result) == "invalid_audio_file"
+    assert result.stderr == b""
+    assert str(audio_path).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    [
+        (b'{"text":"hello"}', b"", 0, b'{"text":"hello"}'),
+        (
+            b'{"error":{"code":"invalid_audio"}}',
+            b"curl http 400 detail",
+            22,
+            b'{"error":{"code":"invalid_audio"}}',
+        ),
+        (
+            b"partial sensitive transport body",
+            f"timed out using {TOKEN}".encode(),
+            28,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+    ],
+)
+def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
+    tmp_path: Path,
+    body: bytes,
+    curl_stderr: bytes,
+    curl_exit: int,
+    expected_stdout: bytes,
+) -> None:
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        stderr=curl_stderr,
+        exit_code=curl_exit,
+    )
+    _write_client_config(environment, _valid_config())
+    target = tmp_path / "real-audio.wav"
+    audio_bytes = b"dangerous local audio bytes"
+    target.write_bytes(audio_bytes)
+    audio_path = tmp_path / 'audio ,;"{}[] $().wav'
+    audio_path.symlink_to(target)
+
+    result = _run(environment, "transcribe", str(audio_path))
+
+    assert result.returncode == curl_exit
+    assert result.stdout == expected_stdout
+    assert result.stderr == b""
+    arguments = args_path.read_bytes().split(b"\0")
+    assert arguments == [
+        b"--disable",
+        b"--globoff",
+        b"--config",
+        b"-",
+        b"--proto",
+        b"=http,https",
+        b"--silent",
+        b"--fail-with-body",
+        b"--connect-timeout",
+        b"5",
+        b"--request",
+        b"POST",
+        b"--form-string",
+        b"model=sensevoice",
+        b"--form-string",
+        b"response_format=json",
+        b"--form",
+        (
+            b"file=@/dev/fd/3;filename=audio;"
+            b"type=application/octet-stream"
+        ),
+        b"--url",
+        b"https://asr.example:17770/v1/audio/transcriptions",
+        b"",
+    ]
+    assert b"--max-time" not in arguments
+    assert b"--location" not in arguments
+    assert b"-L" not in arguments
+    assert str(audio_path).encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in result.stdout + result.stderr
+    assert stdin_path.read_bytes() == (
+        f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+    )
+    assert (tmp_path / "curl-upload").read_bytes() == audio_bytes
+    curl_environment = (tmp_path / "curl-env").read_bytes()
+    assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+    assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
 
 
 @pytest.mark.parametrize(

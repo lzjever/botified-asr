@@ -1,4 +1,4 @@
 interface:
   display_name: "Botified ASR"
-  short_description: "Check configured Botified ASR service readiness"
-  default_prompt: "Use $botified-asr to check whether my configured Botified ASR service is ready."
+  short_description: "Check readiness and transcribe basic audio"
+  default_prompt: "Use $botified-asr to check readiness or transcribe a local audio file with my configured Botified ASR service."
