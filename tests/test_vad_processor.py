@@ -22,6 +22,10 @@ from botified_asr.speaker_snapshot import SelectedSpeaker, SelectedSpeakerSnapsh
 EMPTY_SELECTED_SNAPSHOT = SelectedSpeakerSnapshot(())
 
 
+class ProgressFenceStop(RuntimeError):
+    pass
+
+
 class FakeDecoder:
     def __init__(
         self,
@@ -66,12 +70,15 @@ class FakeAsrAdapter:
     def __init__(
         self,
         result_factory: Callable[[tuple[np.ndarray, ...]], object] | None = None,
+        *,
+        events: list[str] | None = None,
     ) -> None:
         self._result_factory = result_factory or (
             lambda pcms: tuple(
                 _result(f"text-{index}") for index, _pcm in enumerate(pcms)
             )
         )
+        self.events = events
         self.calls: list[tuple[tuple[np.ndarray, ...], str]] = []
 
     def transcribe(self, _pcm: np.ndarray) -> pipeline.AsrResult:
@@ -84,18 +91,28 @@ class FakeAsrAdapter:
         language: str,
     ) -> object:
         self.calls.append((pcms, language))
+        if self.events is not None:
+            self.events.append("asr")
         return self._result_factory(pcms)
 
 
 class RecordingProgress:
-    def __init__(self, *, events: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on_call: int | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.updates: list[tuple[int, int | None]] = []
+        self.fail_on_call = fail_on_call
         self.events = events
 
     def update(self, *, processed_samples: int, total_samples: int | None) -> None:
         self.updates.append((processed_samples, total_samples))
         if self.events is not None:
             self.events.append(f"progress:{processed_samples}:{total_samples}")
+        if len(self.updates) == self.fail_on_call:
+            raise ProgressFenceStop("stopped at durable progress fence")
 
 
 class RecordingSink:
@@ -125,10 +142,13 @@ class ScriptedSegmenter:
     def __init__(
         self,
         adapter: object,
-        outputs: tuple[tuple[pipeline.BufferedSpeechSegment, ...], ...],
+        outputs: tuple[object, ...],
+        *,
+        events: list[str] | None = None,
     ) -> None:
         self.adapter = adapter
         self.outputs = outputs
+        self.events = events
         self.calls: list[tuple[DecodedBlock, bool]] = []
 
     def process(
@@ -136,9 +156,11 @@ class ScriptedSegmenter:
         block: DecodedBlock,
         *,
         is_final: bool,
-    ) -> tuple[pipeline.BufferedSpeechSegment, ...]:
+    ) -> object:
         output = self.outputs[len(self.calls)]
         self.calls.append((block, is_final))
+        if self.events is not None:
+            self.events.append("fsmn")
         return output
 
 
@@ -173,12 +195,18 @@ class FakeSpeakerAdapter:
 
 def _install_segmenter(
     monkeypatch: pytest.MonkeyPatch,
-    outputs: tuple[tuple[pipeline.BufferedSpeechSegment, ...], ...],
+    outputs: tuple[object, ...],
+    *,
+    events: list[str] | None = None,
 ) -> list[ScriptedSegmenter]:
     instances: list[ScriptedSegmenter] = []
 
     def factory(adapter: object) -> ScriptedSegmenter:
-        instance = ScriptedSegmenter(adapter, outputs)
+        instance = ScriptedSegmenter(
+            adapter,
+            outputs,
+            events=events,
+        )
         instances.append(instance)
         return instance
 
@@ -368,9 +396,13 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     segment = _segment(5_920, 24_000, pcm_start_sample=2_720)
-    instances = _install_segmenter(monkeypatch, ((), (), (segment,)))
-    blocks = _blocks(3)
     events: list[str] = []
+    instances = _install_segmenter(
+        monkeypatch,
+        ((), (), (segment,)),
+        events=events,
+    )
+    blocks = _blocks(3)
     decoder = FakeDecoder(blocks, events=events)
     asr = FakeAsrAdapter(lambda _pcms: (_result("mapped"),))
     progress = RecordingProgress(events=events)
@@ -410,10 +442,22 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
         )
     ]
     assert progress.updates == [
+        (0, None),
+        (BLOCK_SAMPLES, None),
         (BLOCK_SAMPLES, None),
         (2 * BLOCK_SAMPLES, None),
+        (2 * BLOCK_SAMPLES, None),
+        (3 * BLOCK_SAMPLES, None),
         (3 * BLOCK_SAMPLES, None),
         (3 * BLOCK_SAMPLES, 3 * BLOCK_SAMPLES),
+    ]
+    fsmn_positions = [
+        index for index, event in enumerate(events) if event == "fsmn"
+    ]
+    assert [events[index + 1] for index in fsmn_positions] == [
+        "progress:0:None",
+        f"progress:{BLOCK_SAMPLES}:None",
+        f"progress:{2 * BLOCK_SAMPLES}:None",
     ]
     assert events[-2:] == [
         "decoder_close",
@@ -421,13 +465,52 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
     ]
 
 
+def test_auto_post_fsmn_progress_fence_precedes_result_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances = _install_segmenter(monkeypatch, (object(),))
+    asr = FakeAsrAdapter()
+    progress = RecordingProgress(fail_on_call=1)
+    sink = RecordingSink()
+
+    with pytest.raises(
+        ProgressFenceStop,
+        match="stopped at durable progress fence",
+    ):
+        _process(
+            pipeline.Processor(
+                FakeFrontend(FakeDecoder(_blocks(1))),
+                asr,
+                vad_adapter=object(),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=progress,
+        )
+
+    assert len(instances) == 1
+    assert len(instances[0].calls) == 1
+    assert progress.updates == [(0, None)]
+    assert asr.calls == []
+    assert sink.records == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
 @pytest.mark.parametrize(
-    ("overall_cap", "blocks", "expected_processed"),
+    (
+        "overall_cap",
+        "blocks",
+        "expected_processed",
+        "expected_fsmn_calls",
+    ),
     (
         (
             BLOCK_SAMPLES - 1,
             _blocks(1),
             (),
+            0,
         ),
         (
             BLOCK_SAMPLES,
@@ -435,7 +518,11 @@ def test_auto_uses_lookahead_language_and_canonical_span_mapping(
                 *_blocks(1),
                 DecodedBlock(BLOCK_SAMPLES, np.ones(1, dtype=np.int16)),
             ),
-            ((BLOCK_SAMPLES, None),),
+            (
+                (0, None),
+                (BLOCK_SAMPLES, None),
+            ),
+            1,
         ),
     ),
     ids=("first_block_exceeds", "first_sample_after_cap"),
@@ -445,6 +532,7 @@ def test_auto_stops_before_processing_audio_beyond_the_effective_overall_cap(
     overall_cap: int,
     blocks: tuple[DecodedBlock, ...],
     expected_processed: tuple[tuple[int, int | None], ...],
+    expected_fsmn_calls: int,
 ) -> None:
     instances = _install_segmenter(monkeypatch, ((), ()))
     decoder = FakeDecoder(blocks)
@@ -472,7 +560,7 @@ def test_auto_stops_before_processing_audio_beyond_the_effective_overall_cap(
 
     assert caught.value.code == "audio_too_long"
     assert len(instances) == 1
-    assert len(instances[0].calls) == len(expected_processed)
+    assert len(instances[0].calls) == expected_fsmn_calls
     assert progress.updates == list(expected_processed)
     assert asr.calls == []
     assert decoder.closed == 1
@@ -512,8 +600,10 @@ def test_auto_preflushes_before_a_candidate_exceeds_each_inclusive_batch_cap(
     expected_batch_sizes: list[int],
 ) -> None:
     _install_segmenter(monkeypatch, (segments,))
-    asr = FakeAsrAdapter()
-    sink = RecordingSink()
+    events: list[str] = []
+    asr = FakeAsrAdapter(events=events)
+    progress = RecordingProgress(events=events)
+    sink = RecordingSink(events)
 
     _process(
         pipeline.Processor(
@@ -524,10 +614,19 @@ def test_auto_preflushes_before_a_candidate_exceeds_each_inclusive_batch_cap(
         ),
         sink,
         selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        progress=progress,
     )
 
     assert [len(pcms) for pcms, _language in asr.calls] == expected_batch_sizes
     assert all(language == "auto" for _pcms, language in asr.calls)
+    asr_positions = [
+        index for index, event in enumerate(events) if event == "asr"
+    ]
+    assert len(asr_positions) == len(expected_batch_sizes)
+    assert all(
+        events[index + 1].startswith("progress:")
+        for index in asr_positions
+    )
     assert len(sink.records) == len(segments)
     assert sink.finalized == 1
     assert sink.aborted == 0
@@ -569,6 +668,79 @@ def test_auto_rejects_invalid_batch_atomically_and_aborts(
     assert sink.finalized == 0
     assert sink.aborted == 1
     assert decoder.closed == 1
+
+
+@pytest.mark.parametrize("unit", ("asr", "cam"))
+def test_auto_post_inference_progress_fence_precedes_result_use(
+    monkeypatch: pytest.MonkeyPatch,
+    unit: str,
+) -> None:
+    segment = _segment(100, 200, pcm_start_sample=90)
+    _install_segmenter(monkeypatch, ((segment,),))
+    progress = RecordingProgress(fail_on_call=3 if unit == "asr" else 4)
+    sink = RecordingSink()
+    assign_calls = 0
+
+    def reject_assign(
+        _state: speakers.AnonymousSpeakerState,
+        _windows: tuple[speakers.SpeakerEmbeddingWindow, ...],
+    ) -> str:
+        nonlocal assign_calls
+        assign_calls += 1
+        raise AssertionError("speaker result was assigned before its fence")
+
+    speaker_adapter = None
+    canonical_options = _options()
+    asr_result: object = object()
+    if unit == "cam":
+        asr_result = (_result("spoken"),)
+        speaker_adapter = FakeSpeakerAdapter(
+            (_window(_unit(1.0, 0.0)),)
+        )
+        canonical_options = _options(model="sensevoice-diarize")
+        monkeypatch.setattr(
+            speakers.AnonymousSpeakerState,
+            "assign_segment",
+            reject_assign,
+        )
+    asr = FakeAsrAdapter(lambda _pcms: asr_result)
+
+    with pytest.raises(
+        ProgressFenceStop,
+        match="stopped at durable progress fence",
+    ):
+        _process(
+            pipeline.Processor(
+                FakeFrontend(FakeDecoder(_blocks(1))),
+                asr,
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_policy=(
+                    _policy() if speaker_adapter is not None else None
+                ),
+                known_speaker_policy=None,
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=progress,
+            canonical_options=canonical_options,
+        )
+
+    expected_calls = 3 if unit == "asr" else 4
+    assert progress.updates == [
+        (0, None),
+        *[(BLOCK_SAMPLES, None)] * (expected_calls - 1),
+    ]
+    assert len(asr.calls) == 1
+    if speaker_adapter is None:
+        assert unit == "asr"
+    else:
+        assert len(speaker_adapter.calls) == 1
+    assert assign_calls == 0
+    assert all(total is None for _processed, total in progress.updates)
+    assert sink.records == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
 
 
 def test_auto_skips_empty_results_positionally_with_dense_record_indices(
@@ -997,7 +1169,7 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
     result = _process(
         pipeline.Processor(
             FakeFrontend(FakeDecoder(_blocks(1))),
-            FakeAsrAdapter(lambda _pcms: results),
+            FakeAsrAdapter(lambda _pcms: results, events=events),
             vad_adapter=object(),
             speaker_adapter=cam,
             speaker_policy=_policy(),
@@ -1009,6 +1181,7 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
             model="sensevoice-diarize",
             known_speaker_ids=("00000001",),
         ),
+        progress=RecordingProgress(events=events),
     )
 
     assert type(result) is pipeline.ProcessorResult
@@ -1026,13 +1199,21 @@ def test_diarize_uses_canonical_crops_updates_empty_text_and_appends_after_cam_b
             segment.pcm[canonical_start:canonical_end],
         )
     assert events == [
+        "progress:0:None",
+        f"progress:{BLOCK_SAMPLES}:None",
+        "asr",
+        f"progress:{BLOCK_SAMPLES}:None",
         "cam",
+        f"progress:{BLOCK_SAMPLES}:None",
         "cam",
+        f"progress:{BLOCK_SAMPLES}:None",
         "cam",
+        f"progress:{BLOCK_SAMPLES}:None",
         "append",
         "append",
         "finalize_clusters",
         "matcher",
+        f"progress:{BLOCK_SAMPLES}:{BLOCK_SAMPLES}",
         "sink_finalize",
     ]
     assert sink.records == [

@@ -38,6 +38,10 @@ from botified_asr.speaker_snapshot import SelectedSpeakerSnapshot
 EMPTY_SELECTED_SNAPSHOT = SelectedSpeakerSnapshot(())
 
 
+class ProgressFenceStop(RuntimeError):
+    pass
+
+
 class FakeDecoder:
     def __init__(
         self,
@@ -190,16 +194,20 @@ class RecordingProgress:
         self,
         *,
         fail_eof: bool = False,
+        fail_on_call: int | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.updates: list[tuple[int, int | None]] = []
         self.fail_eof = fail_eof
+        self.fail_on_call = fail_on_call
         self.events = events
 
     def update(self, *, processed_samples: int, total_samples: int | None) -> None:
         self.updates.append((processed_samples, total_samples))
         if self.events is not None:
             self.events.append(f"progress:{processed_samples}:{total_samples}")
+        if len(self.updates) == self.fail_on_call:
+            raise ProgressFenceStop("stopped at durable progress fence")
         if self.fail_eof and total_samples is not None:
             raise OSError("EOF progress failed")
 
@@ -504,6 +512,41 @@ def test_direct_processor_rejects_invalid_typed_batch_results_atomically(
     assert caught.value.code == "invalid_model_output"
     assert len(adapter.calls) == 1
     assert decoder.closed == 1
+    assert sink.records == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_direct_post_asr_progress_fence_precedes_result_validation_and_append() -> None:
+    sample_count = 4
+    adapter = FakeAdapter(object())
+    sink = RecordingSink()
+    progress = RecordingProgress(fail_on_call=2)
+
+    with pytest.raises(
+        ProgressFenceStop,
+        match="stopped at durable progress fence",
+    ):
+        run_processor(
+            FakeDecoder(
+                [
+                    DecodedBlock(
+                        0,
+                        np.ones(sample_count, dtype=np.int16),
+                    )
+                ]
+            ),
+            adapter,
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            progress=progress,
+        )
+
+    assert len(adapter.calls) == 1
+    assert progress.updates == [
+        (sample_count, None),
+        (sample_count, None),
+    ]
     assert sink.records == []
     assert sink.finalized == 0
     assert sink.aborted == 1

@@ -903,10 +903,6 @@ class Processor:
                     ),
                 )
             close_decoder()
-            progress_sink.update(
-                processed_samples=actual_samples,
-                total_samples=actual_samples,
-            )
             speaker_mapping = SpeakerLabelMapping(())
             if is_diarize:
                 if speaker_state is None:
@@ -923,6 +919,10 @@ class Processor:
                     )
             if cancellation.cancelled:
                 raise PipelineError("cancelled", "Audio processing was cancelled")
+            progress_sink.update(
+                processed_samples=actual_samples,
+                total_samples=actual_samples,
+            )
             artifact_ref = segment_sink.finalize()
             failed = False
             return ProcessorResult(
@@ -953,10 +953,19 @@ class Processor:
         pending: list[BufferedSpeechSegment] = []
         pending_pcm_samples = 0
         next_record_index = 0
+        processed_end_sample = 0
 
         def check_cancellation() -> None:
             if cancellation.cancelled:
                 raise PipelineError("cancelled", "Audio processing was cancelled")
+
+        def durable_fence() -> None:
+            check_cancellation()
+            progress_sink.update(
+                processed_samples=processed_end_sample,
+                total_samples=None,
+            )
+            check_cancellation()
 
         def flush() -> None:
             nonlocal pending
@@ -970,7 +979,7 @@ class Processor:
                 tuple(segment.pcm for segment in segments),
                 language=language,
             )
-            check_cancellation()
+            durable_fence()
             if (
                 type(batch_result) is not tuple
                 or len(batch_result) != len(segments)
@@ -1004,7 +1013,7 @@ class Processor:
                         "Speech segmenter returned an invalid segment",
                     )
                 windows = speaker_adapter.embed_windows(canonical_pcm)
-                check_cancellation()
+                durable_fence()
                 anonymous_speakers.append(speaker_state.assign_segment(windows))
 
             for segment, result, anonymous_speaker in zip(
@@ -1058,7 +1067,6 @@ class Processor:
             )
             return 0
 
-        processed_end_sample = 0
         while True:
             try:
                 following = next(iterator)
@@ -1084,7 +1092,7 @@ class Processor:
                 )
             check_cancellation()
             emitted = segmenter.process(current, is_final=is_final)
-            check_cancellation()
+            durable_fence()
             if type(emitted) is not tuple:
                 raise PipelineError(
                     "invalid_model_output",
@@ -1163,6 +1171,14 @@ class Processor:
             (int16_pcm,),
             language=language,
         )
+        if cancellation.cancelled:
+            raise PipelineError("cancelled", "Audio processing was cancelled")
+        progress_sink.update(
+            processed_samples=sample_count,
+            total_samples=None,
+        )
+        if cancellation.cancelled:
+            raise PipelineError("cancelled", "Audio processing was cancelled")
         if (
             type(batch_result) is not tuple
             or len(batch_result) != 1
