@@ -68,8 +68,7 @@ deadline expiry returns `job_wait_timeout`.
 
 # Delete or cancel a transcription job
 
-Only when the user explicitly asks to cancel or delete a job, run
-`scripts/botified-asr job-delete JOB_ID`. It sends an authenticated
+`scripts/botified-asr job-delete JOB_ID` sends an authenticated
 DELETE `/v1/audio/transcriptions/{job_id}` request with the same strict job ID
 validation as the query commands.
 
@@ -77,3 +76,15 @@ HTTP 202 returns the service JSON unchanged as the immediate cancellation
 request and does not wait. Terminal HTTP 204 succeeds with no output. HTTP error
 bodies are returned unchanged; transport and helper-local failures return JSON
 with a stable `error.code`.
+
+# Existing speaker profiles
+
+`scripts/botified-asr speaker-list` sends an authenticated
+GET `/v1/speakers`. `scripts/botified-asr speaker-get SPEAKER_ID` sends an
+authenticated GET `/v1/speakers/{speaker_id}`. `SPEAKER_ID` must be exactly
+eight uppercase Crockford Base32 characters.
+
+List and get return HTTP 200 service JSON unchanged.
+`scripts/botified-asr speaker-delete SPEAKER_ID` sends authenticated
+DELETE `/v1/speakers/{speaker_id}`, and HTTP 204 succeeds with no output. HTTP
+error bodies are returned unchanged.

@@ -1,6 +1,6 @@
 ---
 name: botified-asr
-description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long transcription jobs, or delete a job when explicitly requested. Use when Codex needs to verify client configuration and authentication, check readiness, obtain a basic transcription, or work with a long transcription job.
+description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long transcription jobs, list or query existing speaker profiles, or delete a job or speaker profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, check readiness, obtain a transcription, inspect an existing speaker profile, or work with a long transcription job.
 ---
 
 # Botified ASR Client
@@ -17,9 +17,15 @@ active responses. Only when the user explicitly asks to cancel or delete a job,
 run `scripts/botified-asr job-delete JOB_ID`. HTTP 202 reports the immediate
 request without waiting; terminal HTTP 204 produces no output.
 
-Return the helper's JSON unchanged, except that terminal `job-delete` HTTP 204
-intentionally has no output. Treat a nonzero exit as a failed readiness check,
-transcription, submission, query, wait, or deletion and report its stable error
-code without exposing credentials, local paths, or raw configuration.
+Use `scripts/botified-asr speaker-list` to list existing speaker profiles and
+`scripts/botified-asr speaker-get SPEAKER_ID` to query one. Only when the user
+explicitly asks to delete a speaker profile, run
+`scripts/botified-asr speaker-delete SPEAKER_ID`.
+
+Return the helper's JSON unchanged. Successful `job-delete` and
+`speaker-delete` HTTP 204 responses intentionally have no output. Treat a
+nonzero exit as a failed readiness check, transcription, submission, query,
+wait, or deletion and report its stable error code without exposing
+credentials, local paths, or raw configuration.
 
 Read `references/api.md` only when the request or response contract is needed.

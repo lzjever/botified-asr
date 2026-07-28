@@ -1,4 +1,4 @@
 interface:
   display_name: "Botified ASR"
-  short_description: "Check readiness and manage transcription jobs"
-  default_prompt: "Use $botified-asr to check readiness, transcribe local audio, query submitted transcription jobs, or delete a job when I explicitly ask."
+  short_description: "Transcribe audio and inspect speaker profiles"
+  default_prompt: "Use $botified-asr to check readiness, transcribe local audio, query submitted transcription jobs, list or query existing speaker profiles, or delete a job or speaker profile when I explicitly ask."

@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, or job-delete JOB_ID","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -21,6 +21,12 @@ invalid_audio_file() {
 invalid_job_id() {
     printf '%s\n' \
         '{"error":{"message":"Job ID must be 8 uppercase Crockford Base32 characters","type":"client_error","param":"job_id","code":"invalid_job_id"}}'
+    exit 65
+}
+
+invalid_speaker_id() {
+    printf '%s\n' \
+        '{"error":{"message":"Speaker ID must be 8 uppercase Crockford Base32 characters","type":"client_error","param":"speaker_id","code":"invalid_speaker_id"}}'
     exit 65
 }
 
@@ -67,6 +73,21 @@ validate_port() {
             ;;
     esac
     [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_crockford_id() {
+    case "$1" in
+        ????????)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    case "$1" in
+        *[!0-9A-HJKMNP-TV-Z]*)
+            return 1
+            ;;
+    esac
 }
 
 local_io_error() {
@@ -188,13 +209,14 @@ perform_request() {
 classify_http_response() {
     case "$command_name:$http_code" in
         health:200 | transcribe:200 | transcribe-long:202 | \
-            job-get:200 | job-get:202 | job-wait:200 | job-delete:202)
+            job-get:200 | job-get:202 | job-wait:200 | job-delete:202 | \
+            speaker-list:200 | speaker-get:200)
             http_response_kind=body
             ;;
         job-wait:202)
             http_response_kind=active
             ;;
-        job-delete:204)
+        job-delete:204 | speaker-delete:204)
             http_response_kind=empty
             ;;
         *)
@@ -203,36 +225,37 @@ classify_http_response() {
     esac
 }
 
+audio_file=
+job_id=
+speaker_id=
+wait_timeout=
+
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
     command_name=health
-    audio_file=
-    job_id=
-    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe" ]; then
     command_name=transcribe
     audio_file=$2
-    job_id=
-    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe-long" ]; then
     command_name=transcribe-long
     audio_file=$2
-    job_id=
-    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "job-get" ]; then
     command_name=job-get
-    audio_file=
     job_id=$2
-    wait_timeout=
 elif [ "$#" -eq 2 ] && [ "$1" = "job-delete" ]; then
     command_name=job-delete
-    audio_file=
     job_id=$2
-    wait_timeout=
 elif [ "$#" -eq 3 ] && [ "$1" = "job-wait" ]; then
     command_name=job-wait
-    audio_file=
     job_id=$2
     wait_timeout=$3
+elif [ "$#" -eq 1 ] && [ "$1" = "speaker-list" ]; then
+    command_name=speaker-list
+elif [ "$#" -eq 2 ] && [ "$1" = "speaker-get" ]; then
+    command_name=speaker-get
+    speaker_id=$2
+elif [ "$#" -eq 2 ] && [ "$1" = "speaker-delete" ]; then
+    command_name=speaker-delete
+    speaker_id=$2
 else
     invalid_command
 fi
@@ -396,7 +419,8 @@ while [ -n "$key_padding" ]; do
 done
 
 case "$command_name" in
-    health | job-get | job-wait | job-delete)
+    health | job-get | job-wait | job-delete | \
+        speaker-list | speaker-get | speaker-delete)
         request_input=/dev/null
         ;;
     transcribe | transcribe-long)
@@ -409,18 +433,14 @@ esac
 
 case "$command_name" in
     job-get | job-wait | job-delete)
-        case "$job_id" in
-            ????????)
-                case "$job_id" in
-                    *[!0-9A-HJKMNP-TV-Z]*)
-                        invalid_job_id
-                        ;;
-                esac
-                ;;
-            *)
-                invalid_job_id
-                ;;
-        esac
+        if ! is_crockford_id "$job_id"; then
+            invalid_job_id
+        fi
+        ;;
+    speaker-get | speaker-delete)
+        if ! is_crockford_id "$speaker_id"; then
+            invalid_speaker_id
+        fi
         ;;
 esac
 
@@ -520,6 +540,24 @@ case "$command_name" in
             "$@" \
             --request DELETE \
             --url "$origin/v1/audio/transcriptions/$job_id"
+        ;;
+    speaker-list)
+        set -- \
+            "$@" \
+            --request GET \
+            --url "$origin/v1/speakers"
+        ;;
+    speaker-get)
+        set -- \
+            "$@" \
+            --request GET \
+            --url "$origin/v1/speakers/$speaker_id"
+        ;;
+    speaker-delete)
+        set -- \
+            "$@" \
+            --request DELETE \
+            --url "$origin/v1/speakers/$speaker_id"
         ;;
 esac
 

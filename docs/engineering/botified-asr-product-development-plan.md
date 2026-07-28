@@ -1295,18 +1295,22 @@ speaker-delete
   `now >= deadline`，此时返回 `job_wait_timeout`。
 - curl exit 0 时按命令 fail-closed：`health` 仅允许 HTTP 200，`transcribe`
   仅允许 200，`transcribe-long` 仅允许 202，`job-get` 和 `job-wait` 仅允许
-  200/202，`job-delete` 仅允许 202/204。包括 3xx、畸形状态和其他状态在内的
-  非白名单响应丢弃 body，返回 `unexpected_http_response`，`param=null`，
-  exit 76。
+  200/202，`job-delete` 仅允许 202/204，`speaker-list` 和 `speaker-get`
+  仅允许 200，`speaker-delete` 仅允许 204。包括 3xx、畸形状态和其他状态在
+  内的非白名单响应丢弃 body，返回 `unexpected_http_response`，
+  `param=null`，exit 76。
 - `job-wait` 的 HTTP 200 是 terminal：原样输出 JSON 并 exit 0；HTTP 202 是
   active：丢弃该次 JSON，重新读取 deadline 后才决定 timeout 或 sleep。
 - `job-delete JOB_ID` 复用严格 job ID 校验，对同一 job URL 发送 DELETE；HTTP
   202 原样输出立即请求的 JSON 且不等待，terminal HTTP 204 成功且无输出。
+- `speaker-get SPEAKER_ID` 和 `speaker-delete SPEAKER_ID` 复用严格的八位大写
+  Crockford Base32 ID 校验；失败返回 `invalid_speaker_id`，
+  `param=speaker_id`，exit 65。
 - deadline 到期返回 `job_wait_timeout`，`param=timeout_seconds`，exit 75。
   `job-wait` 只输出最终一次 JSON，不输出任何中间 active 响应。
 - 所有服务错误保留稳定 error code。
-- 除 `job-delete` terminal HTTP 204 无输出外，输出 JSON 供 Agent 处理，不替
-  Agent 生成总结。
+- `job-delete` 或 `speaker-delete` 的 HTTP 204 成功响应无输出；其余成功响应
+  原样输出 JSON 供 Agent 处理，不替 Agent 生成总结。
 
 ### 15.4 独立安装
 
