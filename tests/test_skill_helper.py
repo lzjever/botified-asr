@@ -53,7 +53,12 @@ for argument do
     fi
 done
 /bin/cat >"$FAKE_CURL_STDIN"
-/bin/cat <&3 >"$FAKE_CURL_UPLOAD"
+: >"$FAKE_CURL_UPLOAD"
+if [ -r /dev/fd/3 ]; then /bin/cat <&3 >"$FAKE_CURL_UPLOAD"; fi
+if [ -r /dev/fd/4 ]; then /bin/cat <&4 >"$FAKE_CURL_UPLOAD.4"; fi
+if [ -r /dev/fd/5 ]; then /bin/cat <&5 >"$FAKE_CURL_UPLOAD.5"; fi
+if [ -r /dev/fd/6 ]; then /bin/cat <&6 >"$FAKE_CURL_UPLOAD.6"; fi
+if [ -r /dev/fd/7 ]; then /bin/cat <&7 >"$FAKE_CURL_UPLOAD.7"; fi
 /usr/bin/env >"$FAKE_CURL_ENV"
 if [ -n "$output_path" ]; then
     /bin/cat "$FAKE_CURL_BODY" >"$output_path"
@@ -379,6 +384,10 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr speaker-list" in body
     assert "scripts/botified-asr speaker-get SPEAKER_ID" in body
     assert (
+        "scripts/botified-asr speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 "
+        "[SAMPLE_FILE_3 ... SAMPLE_FILE_5]"
+    ) in body
+    assert (
         "scripts/botified-asr speaker-put SPEAKER_ID NAME [DESCRIPTION]"
         in body
     )
@@ -400,6 +409,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in reference
     assert "DELETE `/v1/audio/transcriptions/{job_id}`" in reference
     assert "GET `/v1/speakers`" in reference
+    assert "POST `/v1/speakers`" in reference
     assert "GET `/v1/speakers/{speaker_id}`" in reference
     assert "PUT `/v1/speakers/{speaker_id}`" in reference
     assert "DELETE `/v1/speakers/{speaker_id}`" in reference
@@ -410,14 +420,12 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         "interface": {
             "display_name": "Botified ASR",
             "short_description": (
-                "Transcribe audio and inspect speaker profiles"
+                "Transcribe audio and register speaker profiles"
             ),
             "default_prompt": (
-                "Use $botified-asr to check readiness, transcribe local "
-                "audio, query submitted transcription jobs, list or query "
-                "existing speaker profiles, update existing profile metadata "
-                "only when I explicitly ask, or delete a job or speaker "
-                "profile when I explicitly ask."
+                "Use $botified-asr to check readiness, transcribe audio, "
+                "manage transcription jobs, and register or manage speaker "
+                "profiles only when I explicitly ask."
             ),
         }
     }
@@ -443,6 +451,17 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("speaker-list", "extra"),
         ("speaker-get",),
         ("speaker-get", "7K3M9Q2W", "extra"),
+        ("speaker-add", "Ada", "one.wav"),
+        (
+            "speaker-add",
+            "Ada",
+            "1.wav",
+            "2.wav",
+            "3.wav",
+            "4.wav",
+            "5.wav",
+            "6.wav",
+        ),
         ("speaker-put",),
         ("speaker-put", "7K3M9Q2W"),
         ("speaker-put", "7K3M9Q2W", "Ada", "description", "extra"),
@@ -1596,6 +1615,7 @@ exec /usr/bin/sleep 30
         ("job-delete", "302"),
         ("speaker-list", "202"),
         ("speaker-get", "204"),
+        ("speaker-add", "200"),
         ("speaker-put", "204"),
         ("speaker-delete", "200"),
     ],
@@ -1616,6 +1636,13 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
         audio_path = tmp_path / "audio.wav"
         audio_path.write_bytes(b"audio")
         arguments = (command_name, str(audio_path))
+    elif command_name == "speaker-add":
+        samples = []
+        for index in range(2):
+            sample = tmp_path / f"sample-{index}.wav"
+            sample.write_bytes(b"voice")
+            samples.append(str(sample))
+        arguments = (command_name, "Ada", *samples)
     elif command_name == "speaker-put":
         arguments = (command_name, "7K3M9Q2W", "Ada")
     elif command_name in {
@@ -1639,6 +1666,163 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
     assert result.stderr == b""
     assert private_body not in result.stdout + result.stderr
     assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+def test_speaker_add_posts_literal_name_and_five_private_samples(
+    tmp_path: Path,
+) -> None:
+    body = b'{"id":"7K3M9Q2W","name":"Ada Lovelace"}'
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        http_code="201",
+    )
+    _write_client_config(environment, _valid_config())
+    sample_paths = []
+    sample_bytes = []
+    for index in range(1, 6):
+        target = tmp_path / f"voice-target-{index}.wav"
+        content = f"private voice {index}".encode()
+        target.write_bytes(content)
+        sample = tmp_path / f'voice {index} ,;"[] $().wav'
+        sample.symlink_to(target)
+        sample_paths.append(sample)
+        sample_bytes.append(content)
+
+    result = _run(
+        environment,
+        "speaker-add",
+        "@/literal speaker name",
+        *(str(path) for path in sample_paths),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == body
+    assert result.stderr == b""
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
+    assert arguments == [
+        b"--disable",
+        b"--globoff",
+        b"--config",
+        b"-",
+        b"--proto",
+        b"=http,https",
+        b"--silent",
+        b"--fail-with-body",
+        b"--connect-timeout",
+        b"5",
+        b"--request",
+        b"POST",
+        b"--form-string",
+        b"name=@/literal speaker name",
+        b"--form",
+        (
+            b"samples[]=@/dev/fd/3;filename=sample-1;"
+            b"type=application/octet-stream"
+        ),
+        b"--form",
+        (
+            b"samples[]=@/dev/fd/4;filename=sample-2;"
+            b"type=application/octet-stream"
+        ),
+        b"--form",
+        (
+            b"samples[]=@/dev/fd/5;filename=sample-3;"
+            b"type=application/octet-stream"
+        ),
+        b"--form",
+        (
+            b"samples[]=@/dev/fd/6;filename=sample-4;"
+            b"type=application/octet-stream"
+        ),
+        b"--form",
+        (
+            b"samples[]=@/dev/fd/7;filename=sample-5;"
+            b"type=application/octet-stream"
+        ),
+        b"--url",
+        b"https://asr.example:17770/v1/speakers",
+        b"",
+    ]
+    assert stdin_path.read_bytes() == (
+        f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+    )
+    for descriptor, content in zip(range(3, 8), sample_bytes, strict=True):
+        suffix = "" if descriptor == 3 else f".{descriptor}"
+        assert (tmp_path / f"curl-upload{suffix}").read_bytes() == content
+    curl_environment = (tmp_path / "curl-env").read_bytes()
+    for sample_path in sample_paths:
+        encoded_path = str(sample_path).encode()
+        assert encoded_path not in args_path.read_bytes()
+        assert encoded_path not in curl_environment
+        assert encoded_path not in result.stdout + result.stderr
+    assert TOKEN.encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in curl_environment
+    assert TOKEN.encode() not in result.stdout + result.stderr
+
+
+def test_speaker_add_rejects_an_empty_sample_without_echoing_its_path(
+    tmp_path: Path,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    valid_sample = tmp_path / "valid.wav"
+    valid_sample.write_bytes(b"voice")
+    invalid_sample = tmp_path / "private-empty.wav"
+    invalid_sample.touch()
+
+    result = _run(
+        environment,
+        "speaker-add",
+        "Ada",
+        str(valid_sample),
+        str(invalid_sample),
+    )
+
+    assert result.returncode == 66
+    assert _error_code(result) == "invalid_speaker_sample"
+    assert json.loads(result.stdout)["error"]["param"] == "samples[]"
+    assert result.stderr == b""
+    assert str(invalid_sample).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+def test_speaker_add_fd_open_failure_does_not_echo_the_sample_path(
+    tmp_path: Path,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    first_sample = tmp_path / "first.wav"
+    first_sample.write_bytes(b"voice")
+    removed_sample = tmp_path / "removed-after-validation.wav"
+    removed_sample.write_bytes(b"voice")
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        """#!/bin/sh
+/bin/rm -f -- "$DELETE_BEFORE_SAMPLE_OPEN"
+/usr/bin/mktemp "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    environment["DELETE_BEFORE_SAMPLE_OPEN"] = str(removed_sample)
+
+    result = _run(
+        environment,
+        "speaker-add",
+        "Ada",
+        str(first_sample),
+        str(removed_sample),
+    )
+
+    assert result.returncode == 66
+    assert _error_code(result) == "invalid_speaker_sample"
+    assert json.loads(result.stdout)["error"]["param"] == "samples[]"
+    assert str(removed_sample).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
 
 
 @pytest.mark.parametrize(

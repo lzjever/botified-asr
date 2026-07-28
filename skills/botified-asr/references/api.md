@@ -85,6 +85,14 @@ authenticated GET `/v1/speakers/{speaker_id}`. `SPEAKER_ID` must be exactly
 eight uppercase Crockford Base32 characters.
 
 List and get return HTTP 200 service JSON unchanged.
+Only when the user explicitly requests registration,
+`scripts/botified-asr speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 [SAMPLE_FILE_3 ... SAMPLE_FILE_5]`
+sends an authenticated POST `/v1/speakers`. It submits `name` literally and
+two to five readable, non-empty regular files as repeated `samples[]` parts.
+It does not submit a description; use `speaker-put` afterward when one is
+requested. HTTP 201 service JSON is returned unchanged. Local sample paths,
+sample contents, and credentials are not emitted.
+
 `scripts/botified-asr speaker-put SPEAKER_ID NAME [DESCRIPTION]` sends an
 authenticated PUT `/v1/speakers/{speaker_id}`. It passes provided metadata with
 curl `--form-string` and submits no `samples[]` or `file` field. HTTP 200

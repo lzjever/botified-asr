@@ -8,13 +8,19 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, speaker-put SPEAKER_ID NAME [DESCRIPTION], or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 [SAMPLE_FILE_3 ... SAMPLE_FILE_5], speaker-put SPEAKER_ID NAME [DESCRIPTION], or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
 invalid_audio_file() {
     printf '%s\n' \
         '{"error":{"message":"Audio file must be a readable regular file","type":"client_error","param":"file","code":"invalid_audio_file"}}'
+    exit 66
+}
+
+invalid_speaker_sample() {
+    printf '%s\n' \
+        '{"error":{"message":"Speaker sample must be a readable non-empty regular file","type":"client_error","param":"samples[]","code":"invalid_speaker_sample"}}'
     exit 66
 }
 
@@ -210,7 +216,8 @@ classify_http_response() {
     case "$command_name:$http_code" in
         health:200 | transcribe:200 | transcribe-long:202 | \
             job-get:200 | job-get:202 | job-wait:200 | job-delete:202 | \
-            speaker-list:200 | speaker-get:200 | speaker-put:200)
+            speaker-list:200 | speaker-get:200 | speaker-add:201 | \
+            speaker-put:200)
             http_response_kind=body
             ;;
         job-wait:202)
@@ -229,6 +236,12 @@ audio_file=
 job_id=
 speaker_id=
 speaker_name=
+speaker_sample_count=0
+speaker_sample_1=
+speaker_sample_2=
+speaker_sample_3=
+speaker_sample_4=
+speaker_sample_5=
 speaker_description=
 speaker_description_is_set=0
 wait_timeout=
@@ -256,6 +269,16 @@ elif [ "$#" -eq 1 ] && [ "$1" = "speaker-list" ]; then
 elif [ "$#" -eq 2 ] && [ "$1" = "speaker-get" ]; then
     command_name=speaker-get
     speaker_id=$2
+elif [ "$#" -ge 4 ] && [ "$#" -le 7 ] &&
+    [ "$1" = "speaker-add" ]; then
+    command_name=speaker-add
+    speaker_name=$2
+    speaker_sample_count=$(( $# - 2 ))
+    speaker_sample_1=$3
+    speaker_sample_2=$4
+    speaker_sample_3=${5-}
+    speaker_sample_4=${6-}
+    speaker_sample_5=${7-}
 elif { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } &&
     [ "$1" = "speaker-put" ]; then
     command_name=speaker-put
@@ -441,6 +464,23 @@ case "$command_name" in
         fi
         request_input=$audio_file
         ;;
+    speaker-add)
+        for speaker_sample in \
+            "$speaker_sample_1" \
+            "$speaker_sample_2" \
+            "$speaker_sample_3" \
+            "$speaker_sample_4" \
+            "$speaker_sample_5"; do
+            if [ -n "$speaker_sample" ] && {
+                [ ! -f "$speaker_sample" ] ||
+                    [ ! -r "$speaker_sample" ] ||
+                    [ ! -s "$speaker_sample" ]
+            }; then
+                invalid_speaker_sample
+            fi
+        done
+        request_input=/dev/null
+        ;;
 esac
 
 case "$command_name" in
@@ -565,6 +605,37 @@ case "$command_name" in
             --request GET \
             --url "$origin/v1/speakers/$speaker_id"
         ;;
+    speaker-add)
+        set -- \
+            "$@" \
+            --request POST \
+            --form-string "name=$speaker_name" \
+            --form \
+            'samples[]=@/dev/fd/3;filename=sample-1;type=application/octet-stream' \
+            --form \
+            'samples[]=@/dev/fd/4;filename=sample-2;type=application/octet-stream'
+        if [ "$speaker_sample_count" -ge 3 ]; then
+            set -- \
+                "$@" \
+                --form \
+                'samples[]=@/dev/fd/5;filename=sample-3;type=application/octet-stream'
+        fi
+        if [ "$speaker_sample_count" -ge 4 ]; then
+            set -- \
+                "$@" \
+                --form \
+                'samples[]=@/dev/fd/6;filename=sample-4;type=application/octet-stream'
+        fi
+        if [ "$speaker_sample_count" -eq 5 ]; then
+            set -- \
+                "$@" \
+                --form \
+                'samples[]=@/dev/fd/7;filename=sample-5;type=application/octet-stream'
+        fi
+        set -- \
+            "$@" \
+            --url "$origin/v1/speakers"
+        ;;
     speaker-put)
         set -- \
             "$@" \
@@ -587,7 +658,40 @@ case "$command_name" in
         ;;
 esac
 
-if ! { command exec 3<"$request_input"; } 2>/dev/null; then
+if [ "$command_name" = "speaker-add" ]; then
+    case "$speaker_sample_count" in
+        2)
+            { command exec \
+                3<"$speaker_sample_1" \
+                4<"$speaker_sample_2"; } 2>/dev/null ||
+                invalid_speaker_sample
+            ;;
+        3)
+            { command exec \
+                3<"$speaker_sample_1" \
+                4<"$speaker_sample_2" \
+                5<"$speaker_sample_3"; } 2>/dev/null ||
+                invalid_speaker_sample
+            ;;
+        4)
+            { command exec \
+                3<"$speaker_sample_1" \
+                4<"$speaker_sample_2" \
+                5<"$speaker_sample_3" \
+                6<"$speaker_sample_4"; } 2>/dev/null ||
+                invalid_speaker_sample
+            ;;
+        5)
+            { command exec \
+                3<"$speaker_sample_1" \
+                4<"$speaker_sample_2" \
+                5<"$speaker_sample_3" \
+                6<"$speaker_sample_4" \
+                7<"$speaker_sample_5"; } 2>/dev/null ||
+                invalid_speaker_sample
+            ;;
+    esac
+elif ! { command exec 3<"$request_input"; } 2>/dev/null; then
     invalid_audio_file
 fi
 
