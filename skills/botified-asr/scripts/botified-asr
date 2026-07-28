@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health or transcribe AUDIO_FILE","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, or job-get JOB_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -16,6 +16,12 @@ invalid_audio_file() {
     printf '%s\n' \
         '{"error":{"message":"Audio file must be a readable regular file","type":"client_error","param":"file","code":"invalid_audio_file"}}'
     exit 66
+}
+
+invalid_job_id() {
+    printf '%s\n' \
+        '{"error":{"message":"Job ID must be 8 uppercase Crockford Base32 characters","type":"client_error","param":"job_id","code":"invalid_job_id"}}'
+    exit 65
 }
 
 curl_not_found() {
@@ -52,9 +58,19 @@ json_escape() {
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
     command_name=health
     audio_file=
+    job_id=
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe" ]; then
     command_name=transcribe
     audio_file=$2
+    job_id=
+elif [ "$#" -eq 2 ] && [ "$1" = "transcribe-long" ]; then
+    command_name=transcribe-long
+    audio_file=$2
+    job_id=
+elif [ "$#" -eq 2 ] && [ "$1" = "job-get" ]; then
+    command_name=job-get
+    audio_file=
+    job_id=$2
 else
     invalid_command
 fi
@@ -218,16 +234,31 @@ while [ -n "$key_padding" ]; do
 done
 
 case "$command_name" in
-    health)
+    health | job-get)
         request_input=/dev/null
         ;;
-    transcribe)
+    transcribe | transcribe-long)
         if [ ! -f "$audio_file" ] || [ ! -r "$audio_file" ]; then
             invalid_audio_file
         fi
         request_input=$audio_file
         ;;
 esac
+
+if [ "$command_name" = "job-get" ]; then
+    case "$job_id" in
+        ????????)
+            case "$job_id" in
+                *[!0-9A-HJKMNP-TV-Z]*)
+                    invalid_job_id
+                    ;;
+            esac
+            ;;
+        *)
+            invalid_job_id
+            ;;
+    esac
+fi
 
 temporary_root=${TMPDIR:-/tmp}
 response_body=$(
@@ -256,15 +287,35 @@ case "$command_name" in
             --request GET \
             --url "$origin/health/ready"
         ;;
-    transcribe)
+    transcribe | transcribe-long)
         set -- \
             "$@" \
-            --request POST \
+            --request POST
+        if [ "$command_name" = "transcribe-long" ]; then
+            set -- \
+                "$@" \
+                --header 'Prefer: respond-async'
+        fi
+        set -- \
+            "$@" \
             --form-string model=sensevoice \
-            --form-string response_format=json \
+            --form-string response_format=json
+        if [ "$command_name" = "transcribe-long" ]; then
+            set -- \
+                "$@" \
+                --form-string chunking_strategy=auto
+        fi
+        set -- \
+            "$@" \
             --form \
             'file=@/dev/fd/3;filename=audio;type=application/octet-stream' \
             --url "$origin/v1/audio/transcriptions"
+        ;;
+    job-get)
+        set -- \
+            "$@" \
+            --request GET \
+            --url "$origin/v1/audio/transcriptions/$job_id"
         ;;
 esac
 

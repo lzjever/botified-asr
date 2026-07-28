@@ -135,6 +135,8 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "relative to this `SKILL.md` (the skill root)" in body
     assert "scripts/botified-asr health" in body
     assert "scripts/botified-asr transcribe AUDIO_FILE" in body
+    assert "scripts/botified-asr transcribe-long AUDIO_FILE" in body
+    assert "scripts/botified-asr job-get JOB_ID" in body
     assert (
         body.index("first run `scripts/botified-asr health`")
         < body.index("Only after it returns ready")
@@ -147,6 +149,8 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     )
     assert "POST `/v1/audio/transcriptions`" in reference
     assert "`model=sensevoice`" in reference
+    assert "`chunking_strategy=auto`" in reference
+    assert "GET `/v1/audio/transcriptions/{job_id}`" in reference
 
     assert yaml.safe_load(
         (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -154,11 +158,11 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         "interface": {
             "display_name": "Botified ASR",
             "short_description": (
-                "Check readiness and transcribe basic audio"
+                "Check readiness and run transcription jobs"
             ),
             "default_prompt": (
-                "Use $botified-asr to check readiness or transcribe a "
-                "local audio file with my configured Botified ASR service."
+                "Use $botified-asr to check readiness, transcribe local "
+                "audio, or query a submitted transcription job."
             ),
         }
     }
@@ -172,6 +176,10 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("health", "extra"),
         ("transcribe",),
         ("transcribe", "audio.wav", "extra"),
+        ("transcribe-long",),
+        ("transcribe-long", "audio.wav", "extra"),
+        ("job-get",),
+        ("job-get", "7K3M9Q2W", "extra"),
     ],
 )
 def test_invalid_command_precedes_the_curl_dependency_check(
@@ -506,18 +514,27 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
     assert not args_path.exists()
 
 
-def test_client_configuration_errors_precede_audio_file_validation(
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("transcribe", "missing.wav"),
+        ("transcribe-long", "missing.wav"),
+        ("job-get", "malformed/id"),
+    ],
+)
+def test_client_configuration_errors_precede_local_input_validation(
     tmp_path: Path,
+    arguments: tuple[str, str],
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    missing_audio = tmp_path / "missing.wav"
+    local_input = str(tmp_path / arguments[1])
 
-    result = _run(environment, "transcribe", str(missing_audio))
+    result = _run(environment, arguments[0], local_input)
 
     assert result.returncode == 78
     assert _error_code(result) == "client_not_configured"
     assert result.stderr == b""
-    assert str(missing_audio).encode() not in result.stdout + result.stderr
+    assert local_input.encode() not in result.stdout + result.stderr
     assert not args_path.exists()
 
 
@@ -576,6 +593,249 @@ def test_audio_fd_open_failure_is_stable_and_does_not_call_curl(
     assert result.stderr == b""
     assert str(audio_path).encode() not in result.stdout + result.stderr
     assert not args_path.exists()
+
+
+def test_transcribe_long_reuses_audio_file_validation(
+    tmp_path: Path,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    audio_path = tmp_path / "missing-long-audio.wav"
+
+    result = _run(environment, "transcribe-long", str(audio_path))
+
+    assert result.returncode == 66
+    assert _error_code(result) == "invalid_audio_file"
+    assert result.stderr == b""
+    assert str(audio_path).encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    [
+        "",
+        "7K3M9Q2",
+        "7K3M9Q2W0",
+        "7k3m9q2w",
+        "7K3M9Q2I",
+        "7K3M9Q2L",
+        "7K3M9Q2O",
+        "7K3M9Q2U",
+        "../health",
+        "7K3M9Q?W",
+        "7K3M9Q\n",
+    ],
+)
+def test_job_get_rejects_invalid_job_id_without_request_or_echo(
+    tmp_path: Path,
+    job_id: str,
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-get", job_id)
+
+    assert result.returncode == 65
+    assert _error_code(result) == "invalid_job_id"
+    assert json.loads(result.stdout)["error"]["param"] == "job_id"
+    assert result.stderr == b""
+    if job_id:
+        assert job_id.encode() not in result.stdout + result.stderr
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    [
+        (
+            b'{"id":"7K3M9Q2W","status":"queued",'
+            b'"created_at":"2026-07-27T12:00:00Z"}',
+            b"",
+            0,
+            b'{"id":"7K3M9Q2W","status":"queued",'
+            b'"created_at":"2026-07-27T12:00:00Z"}',
+        ),
+        (
+            b'{"error":{"code":"audio_too_long"}}',
+            b"curl http 413 detail",
+            22,
+            b'{"error":{"code":"audio_too_long"}}',
+        ),
+        (
+            b"partial private upload response",
+            f"upload failed using {TOKEN}".encode(),
+            28,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+    ],
+)
+def test_transcribe_long_submits_one_private_async_request(
+    tmp_path: Path,
+    body: bytes,
+    curl_stderr: bytes,
+    curl_exit: int,
+    expected_stdout: bytes,
+) -> None:
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        stderr=curl_stderr,
+        exit_code=curl_exit,
+    )
+    _write_client_config(environment, _valid_config())
+    target = tmp_path / "real-long-audio.wav"
+    audio_bytes = b"long local audio bytes"
+    target.write_bytes(audio_bytes)
+    audio_path = tmp_path / 'long ,;"{}[] $().wav'
+    audio_path.symlink_to(target)
+
+    result = _run(environment, "transcribe-long", str(audio_path))
+
+    assert result.returncode == curl_exit
+    assert result.stdout == expected_stdout
+    assert result.stderr == b""
+    arguments = args_path.read_bytes().split(b"\0")
+    assert arguments == [
+        b"--disable",
+        b"--globoff",
+        b"--config",
+        b"-",
+        b"--proto",
+        b"=http,https",
+        b"--silent",
+        b"--fail-with-body",
+        b"--connect-timeout",
+        b"5",
+        b"--request",
+        b"POST",
+        b"--header",
+        b"Prefer: respond-async",
+        b"--form-string",
+        b"model=sensevoice",
+        b"--form-string",
+        b"response_format=json",
+        b"--form-string",
+        b"chunking_strategy=auto",
+        b"--form",
+        (
+            b"file=@/dev/fd/3;filename=audio;"
+            b"type=application/octet-stream"
+        ),
+        b"--url",
+        b"https://asr.example:17770/v1/audio/transcriptions",
+        b"",
+    ]
+    assert b"--max-time" not in arguments
+    assert b"--location" not in arguments
+    assert b"-L" not in arguments
+    assert str(audio_path).encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in result.stdout + result.stderr
+    assert stdin_path.read_bytes() == (
+        f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+    )
+    assert (tmp_path / "curl-upload").read_bytes() == audio_bytes
+    curl_environment = (tmp_path / "curl-env").read_bytes()
+    assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+    assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
+
+
+@pytest.mark.parametrize(
+    ("body", "curl_stderr", "curl_exit", "expected_stdout"),
+    [
+        (
+            b'{"id":"7K3M9Q2W","status":"queued","progress":'
+            b'{"processed_audio_secs":0.0,"total_audio_secs":null}}',
+            b"",
+            0,
+            b'{"id":"7K3M9Q2W","status":"queued","progress":'
+            b'{"processed_audio_secs":0.0,"total_audio_secs":null}}',
+        ),
+        (
+            b'{"id":"7K3M9Q2W","status":"succeeded",'
+            b'"result":{"text":"hello"}}',
+            b"",
+            0,
+            b'{"id":"7K3M9Q2W","status":"succeeded",'
+            b'"result":{"text":"hello"}}',
+        ),
+        (
+            b'{"error":{"code":"job_not_found"}}',
+            b"curl http 404 detail",
+            22,
+            b'{"error":{"code":"job_not_found"}}',
+        ),
+        (
+            b"partial private job response",
+            f"job lookup failed using {TOKEN}".encode(),
+            28,
+            (
+                b'{"error":{"message":"Botified ASR request failed",'
+                b'"type":"client_error","param":null,"code":"curl_failed"}}\n'
+            ),
+        ),
+    ],
+)
+def test_job_get_preserves_responses_and_shared_errors(
+    tmp_path: Path,
+    body: bytes,
+    curl_stderr: bytes,
+    curl_exit: int,
+    expected_stdout: bytes,
+) -> None:
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        stderr=curl_stderr,
+        exit_code=curl_exit,
+    )
+    _write_client_config(environment, _valid_config())
+
+    result = _run(environment, "job-get", "7K3M9Q2W")
+
+    assert result.returncode == curl_exit
+    assert result.stdout == expected_stdout
+    assert result.stderr == b""
+    arguments = args_path.read_bytes().split(b"\0")
+    assert arguments == [
+        b"--disable",
+        b"--globoff",
+        b"--config",
+        b"-",
+        b"--proto",
+        b"=http,https",
+        b"--silent",
+        b"--fail-with-body",
+        b"--connect-timeout",
+        b"5",
+        b"--request",
+        b"GET",
+        b"--url",
+        (
+            b"https://asr.example:17770/v1/audio/"
+            b"transcriptions/7K3M9Q2W"
+        ),
+        b"",
+    ]
+    assert b"--max-time" not in arguments
+    assert b"--header" not in arguments
+    assert b"--form" not in arguments
+    assert b"--form-string" not in arguments
+    assert b"--location" not in arguments
+    assert b"-L" not in arguments
+    assert TOKEN.encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in result.stdout + result.stderr
+    assert stdin_path.read_bytes() == (
+        f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+    )
+    assert (tmp_path / "curl-upload").read_bytes() == b""
+    curl_environment = (tmp_path / "curl-env").read_bytes()
+    assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+    assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
 
 
 @pytest.mark.parametrize(

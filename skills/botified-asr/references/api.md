@@ -26,3 +26,32 @@ A successful request returns the service JSON unchanged:
 
 HTTP error bodies are also returned unchanged. Transport and helper-local
 failures return JSON with a stable `error.code`.
+
+# Long transcription submission
+
+`scripts/botified-asr transcribe-long AUDIO_FILE` sends an authenticated
+POST `/v1/audio/transcriptions` request with `Prefer: respond-async`, a readable
+local file, `model=sensevoice`, `response_format=json`, and
+`chunking_strategy=auto`.
+
+An accepted request returns the service JSON unchanged:
+
+```json
+{"id":"7K3M9Q2W","status":"queued"}
+```
+
+HTTP error bodies are also returned unchanged. Transport and helper-local
+failures return JSON with a stable `error.code`.
+
+# Get a transcription job
+
+`scripts/botified-asr job-get JOB_ID` sends an authenticated
+GET `/v1/audio/transcriptions/{job_id}` request. `JOB_ID` must be exactly eight
+uppercase Crockford Base32 characters.
+
+The service response is returned unchanged. A job may be `queued` or `running`
+with progress information, `succeeded` with its result, or `failed` or
+`cancelled` with the corresponding service details.
+
+HTTP error bodies are also returned unchanged. Transport and helper-local
+failures return JSON with a stable `error.code`.
