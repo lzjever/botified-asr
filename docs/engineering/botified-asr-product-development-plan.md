@@ -1072,15 +1072,25 @@ GET /health/ready
 
 ### 11.2 结构化日志
 
-每个请求/job 记录：
+Botified ASR 自有结构化事件以一行一个 JSON object 输出到 stderr：
 
-- request/job ID；
-- model alias；
-- 输入字节和 duration；
-- sync/async；
-- VAD、diarization、rich include；
-- queue wait、decode、VAD、ASR、speaker、total duration；
-- 状态和稳定错误码。
+- 所有事件包含 UTC `ts`、`level` 和固定 `event`。
+- `service_started`、`service_stopped` 记录服务进程生命周期。
+- `http_request_completed` 记录内部 `request_id`、HTTP method、route
+  template、实际发送的 status、`elapsed_ms` 和 nullable 稳定
+  `error_code`；不记录 raw URL 或 query。
+- `job_started` 记录 `job_id`、attempt、model alias 和
+  `queue_wait_ms`。
+- `job_finished` 只在重新读取到 canonical terminal job 后记录
+  `job_id`、attempt、model alias、canonical status、nullable 稳定
+  `error_code`、`elapsed_ms` 和 nullable `audio_duration_seconds`。
+- `job_executor_failed` 只记录 `job_id` 和异常类型名，不记录异常文本或
+  traceback。
+
+日志是 best-effort 可观察输出，不参与请求、job 状态或恢复决策；日志写入或
+terminal readback 失败不得改变业务结果。HTTP status 使用已经发送的 wire
+事实，job status 使用 SQLite canonical 事实。逐 decode、VAD、ASR、speaker
+阶段计时仅在真实诊断需要证明价值后引入，不为日志把计时状态穿透 pipeline。
 
 默认不记录：
 

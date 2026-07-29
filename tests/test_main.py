@@ -571,6 +571,76 @@ def test_json_log_formatter_emits_only_whitelisted_utc_fields() -> None:
     assert invalid_payload["event"] == "log_message"
 
 
+@pytest.mark.parametrize(
+    ("event", "fields"),
+    (
+        (
+            "job_started",
+            {
+                "job_id": "7K3M9Q2W",
+                "attempt": 1,
+                "model": "sensevoice",
+                "queue_wait_ms": 60_000.0,
+            },
+        ),
+        (
+            "job_finished",
+            {
+                "job_id": "7K3M9Q2W",
+                "attempt": 1,
+                "model": "sensevoice-diarize",
+                "status": "failed",
+                "error_code": "internal_error",
+                "elapsed_ms": 250.0,
+                "audio_duration_seconds": None,
+            },
+        ),
+        (
+            "job_executor_failed",
+            {
+                "job_id": "7K3M9Q2W",
+                "exception_type": "StorageSchemaError",
+            },
+        ),
+    ),
+)
+def test_json_log_formatter_accepts_only_complete_job_events(
+    event: str,
+    fields: dict[str, object],
+) -> None:
+    record = logging.LogRecord(
+        "botified_asr.job",
+        logging.INFO,
+        __file__,
+        1,
+        "private job detail",
+        (),
+        None,
+    )
+    record.event = event
+    for name, value in fields.items():
+        setattr(record, name, value)
+
+    payload = json.loads(main_module._JsonLogFormatter().format(record))
+
+    assert payload == {
+        "ts": payload["ts"],
+        "level": "INFO",
+        "event": event,
+        **fields,
+    }
+    record.elapsed_ms = float("nan")
+    if event == "job_finished":
+        assert json.loads(main_module._JsonLogFormatter().format(record))[
+            "event"
+        ] == "log_message"
+        record.elapsed_ms = fields["elapsed_ms"]
+        record.status = []
+        assert json.loads(main_module._JsonLogFormatter().format(record))[
+            "event"
+        ] == "log_message"
+
+
 def test_logging_configuration_preserves_root_and_emits_own_json(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

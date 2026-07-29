@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -301,6 +302,11 @@ def test_job_executor_starts_idle_then_claims_a_later_job(
     policy = _speaker_embedding_policy()
     executed = threading.Event()
     executions: list[str] = []
+    log_records: list[dict[str, object]] = []
+
+    class RecordingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            log_records.append(extra)
 
     def execute(
         actual_storage: Storage,
@@ -321,6 +327,7 @@ def test_job_executor_starts_idle_then_claims_a_later_job(
         executed.set()
 
     monkeypatch.setattr(runtime, "execute_claimed_job_attempt", execute)
+    monkeypatch.setattr(runtime, "_JOB_LOGGER", RecordingLogger(), raising=False)
     executor = runtime.JobExecutor(
         storage,
         processor,
@@ -340,12 +347,115 @@ def test_job_executor_starts_idle_then_claims_a_later_job(
 
         assert executions == [queued.id]
         assert storage.get_visible_job(queued.id).status is jobs.JobStatus.FAILED
+        _wait_until(lambda: len(log_records) == 2)
+        assert log_records == [
+            {
+                "event": "job_started",
+                "job_id": queued.id,
+                "attempt": 1,
+                "model": "sensevoice",
+                "queue_wait_ms": 60_000.0,
+            },
+            {
+                "event": "job_finished",
+                "job_id": queued.id,
+                "attempt": 1,
+                "model": "sensevoice",
+                "status": "failed",
+                "error_code": "internal_error",
+                "elapsed_ms": 0.0,
+                "audio_duration_seconds": None,
+            },
+        ]
         assert executor.ready
         assert executor.failure is None
     finally:
         executor.stop()
         storage.close()
     assert not executor.ready
+
+
+def test_job_finished_log_reads_one_canonical_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: "01234567")
+    storage = _storage(tmp_path)
+    queued = _queue_job(storage)
+    running = storage.claim_next_job(GENERATION, NOW)
+    assert running is not None
+    succeeded = replace(
+        running,
+        status=jobs.JobStatus.SUCCEEDED,
+        total_samples=16_000,
+        processed_samples=16_000,
+        attempt_token=None,
+        owner_generation=None,
+        result_lease_id="result-lease",
+        input_cleanup_pending=True,
+        finished_at=NOW,
+    )
+    reads: list[str] = []
+    records: list[dict[str, object]] = []
+
+    class CanonicalReader:
+        def get_visible_job(self, job_id: str) -> jobs.DurableJob:
+            reads.append(job_id)
+            return succeeded
+
+    class RecordingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            records.append(extra)
+
+    monkeypatch.setattr(runtime, "_JOB_LOGGER", RecordingLogger(), raising=False)
+
+    runtime._log_finished_job(CanonicalReader(), running)
+
+    assert reads == [queued.id]
+    assert records == [
+        {
+            "event": "job_finished",
+            "job_id": queued.id,
+            "attempt": 1,
+            "model": "sensevoice",
+            "status": "succeeded",
+            "error_code": None,
+            "elapsed_ms": 0.0,
+            "audio_duration_seconds": 1.0,
+        }
+    ]
+    storage.close()
+
+
+@pytest.mark.parametrize("failure_site", ("logger", "readback"))
+def test_job_logging_failure_is_best_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: "01234567")
+    storage = _storage(tmp_path)
+    _queue_job(storage)
+    running = storage.claim_next_job(GENERATION, NOW)
+    assert running is not None
+
+    class FailingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            raise RuntimeError("private logging failure")
+
+    class FailingReader:
+        def get_visible_job(self, _job_id: str) -> jobs.DurableJob:
+            raise RuntimeError("private readback failure")
+
+    if failure_site == "logger":
+        monkeypatch.setattr(runtime, "_JOB_LOGGER", FailingLogger(), raising=False)
+        runtime._log_started_job(running)
+    else:
+        runtime._log_finished_job(FailingReader(), running)
+
+    storage.close()
 
 
 def test_job_executor_notify_cancellation_only_targets_active_job(
@@ -726,8 +836,14 @@ def test_job_executor_integrity_failure_is_visible_and_stops_claiming(
     runtime = _runtime()
     ids = iter(("01234567", "ABCDEFGH", "7K3M9Q2W", "JKMNPQRT"))
     monkeypatch.setattr(storage_module, "generate_job_id", lambda: next(ids))
+    log_records: list[dict[str, object]] = []
+
+    class RecordingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            log_records.append(extra)
 
     for failure_site in ("claim", "runner"):
+        log_records.clear()
         storage = _storage(tmp_path / failure_site)
         first = _queue_job(storage)
         second = _queue_job(storage)
@@ -751,6 +867,12 @@ def test_job_executor_integrity_failure_is_visible_and_stops_claiming(
 
         monkeypatch.setattr(storage, "claim_next_job", claim)
         monkeypatch.setattr(runtime, "execute_claimed_job_attempt", execute)
+        monkeypatch.setattr(
+            runtime,
+            "_JOB_LOGGER",
+            RecordingLogger(),
+            raising=False,
+        )
         executor = runtime.JobExecutor(
             storage,
             object(),
@@ -769,6 +891,14 @@ def test_job_executor_integrity_failure_is_visible_and_stops_claiming(
             time.sleep(0.05)
             assert claim_calls == [failure_site]
             if failure_site == "runner":
+                _wait_until(lambda: len(log_records) == 2)
+                assert log_records[0]["event"] == "job_started"
+                assert log_records[1] == {
+                    "event": "job_executor_failed",
+                    "job_id": first.id,
+                    "exception_type": "StorageSchemaError",
+                }
+                assert "integrity failure" not in repr(log_records)
                 assert (
                     storage.get_visible_job(first.id).status
                     is jobs.JobStatus.RUNNING

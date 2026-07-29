@@ -1,19 +1,102 @@
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from datetime import datetime
 
-from botified_asr.audio import AudioError, Cancellation
+from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation
+from botified_asr.canonical_options import parse_canonical_options_json
 from botified_asr.composition import (
     TranscriptionProcessor,
     execute_claimed_job_attempt,
 )
 from botified_asr.errors import PipelineError
+from botified_asr.jobs import DurableJob, JobStatus
 from botified_asr.speakers import SpeakerEmbeddingPolicy
 from botified_asr.storage import Storage
 
 _IDLE_WAIT_SECONDS = 1.0
+_JOB_LOGGER = logging.getLogger("botified_asr.job")
+_TERMINAL_JOB_STATUSES = {
+    JobStatus.SUCCEEDED,
+    JobStatus.FAILED,
+    JobStatus.CANCELLED,
+}
+
+
+def _log_job_event(event: str, fields: dict[str, object]) -> None:
+    try:
+        _JOB_LOGGER.info(event, extra={"event": event, **fields})
+    except Exception:
+        pass
+
+
+def _log_started_job(job: DurableJob) -> None:
+    try:
+        if job.started_at is None or job.canonical_options_json is None:
+            return
+        model = parse_canonical_options_json(job.canonical_options_json).model
+        queue_wait_ms = (
+            job.started_at - job.created_at
+        ).total_seconds() * 1_000
+        _log_job_event(
+            "job_started",
+            {
+                "job_id": job.id,
+                "attempt": job.attempt_no,
+                "model": model,
+                "queue_wait_ms": queue_wait_ms,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _log_finished_job(storage: Storage, running_job: DurableJob) -> None:
+    try:
+        job = storage.get_visible_job(running_job.id)
+        if (
+            type(job) is not DurableJob
+            or job.status not in _TERMINAL_JOB_STATUSES
+            or job.started_at is None
+            or job.finished_at is None
+            or job.canonical_options_json is None
+        ):
+            return
+        model = parse_canonical_options_json(job.canonical_options_json).model
+        elapsed_ms = (
+            job.finished_at - job.started_at
+        ).total_seconds() * 1_000
+        audio_duration_seconds = (
+            None
+            if job.total_samples is None
+            else job.total_samples / SAMPLE_RATE
+        )
+        _log_job_event(
+            "job_finished",
+            {
+                "job_id": job.id,
+                "attempt": job.attempt_no,
+                "model": model,
+                "status": job.status.value,
+                "error_code": job.error_code,
+                "elapsed_ms": elapsed_ms,
+                "audio_duration_seconds": audio_duration_seconds,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _log_job_executor_failure(job_id: str, error: BaseException) -> None:
+    _log_job_event(
+        "job_executor_failed",
+        {
+            "job_id": job_id,
+            "exception_type": type(error).__name__,
+        },
+    )
 
 
 class JobExecutor:
@@ -229,6 +312,7 @@ class JobExecutor:
 
             runner_error: BaseException | None = None
             if not stopping:
+                _log_started_job(running_job)
                 try:
                     execute_claimed_job_attempt(
                         self._storage,
@@ -268,7 +352,9 @@ class JobExecutor:
 
             if not stopping:
                 if runner_error is not None:
+                    _log_job_executor_failure(running_job.id, runner_error)
                     return
+                _log_finished_job(self._storage, running_job)
                 continue
 
             self._marker_done.wait()

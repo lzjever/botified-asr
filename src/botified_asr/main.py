@@ -79,6 +79,88 @@ class _JsonLogFormatter(logging.Formatter):
                         "error_code": error_code,
                     }
                 )
+        elif record.name == "botified_asr.job":
+            job_id = getattr(record, "job_id", None)
+            if event == "job_started":
+                attempt = getattr(record, "attempt", None)
+                model = getattr(record, "model", None)
+                queue_wait_ms = getattr(record, "queue_wait_ms", None)
+                if (
+                    type(job_id) is str
+                    and type(attempt) is int
+                    and attempt >= 1
+                    and type(model) is str
+                    and type(queue_wait_ms) is float
+                    and math.isfinite(queue_wait_ms)
+                    and queue_wait_ms >= 0
+                ):
+                    payload.update(
+                        {
+                            "event": event,
+                            "job_id": job_id,
+                            "attempt": attempt,
+                            "model": model,
+                            "queue_wait_ms": queue_wait_ms,
+                        }
+                    )
+            elif event == "job_finished":
+                attempt = getattr(record, "attempt", None)
+                model = getattr(record, "model", None)
+                status = getattr(record, "status", None)
+                error_code = getattr(record, "error_code", None)
+                elapsed_ms = getattr(record, "elapsed_ms", None)
+                audio_duration_seconds = getattr(
+                    record,
+                    "audio_duration_seconds",
+                    None,
+                )
+                if (
+                    type(job_id) is str
+                    and type(attempt) is int
+                    and attempt >= 1
+                    and type(model) is str
+                    and type(status) is str
+                    and status in {"succeeded", "failed", "cancelled"}
+                    and (error_code is None or type(error_code) is str)
+                    and type(elapsed_ms) is float
+                    and math.isfinite(elapsed_ms)
+                    and elapsed_ms >= 0
+                    and (
+                        audio_duration_seconds is None
+                        or (
+                            type(audio_duration_seconds) is float
+                            and math.isfinite(audio_duration_seconds)
+                            and audio_duration_seconds >= 0
+                        )
+                    )
+                ):
+                    payload.update(
+                        {
+                            "event": event,
+                            "job_id": job_id,
+                            "attempt": attempt,
+                            "model": model,
+                            "status": status,
+                            "error_code": error_code,
+                            "elapsed_ms": elapsed_ms,
+                            "audio_duration_seconds": (
+                                audio_duration_seconds
+                            ),
+                        }
+                    )
+            elif event == "job_executor_failed":
+                exception_type = getattr(record, "exception_type", None)
+                if (
+                    type(job_id) is str
+                    and type(exception_type) is str
+                ):
+                    payload.update(
+                        {
+                            "event": event,
+                            "job_id": job_id,
+                            "exception_type": exception_type,
+                        }
+                    )
         return json.dumps(
             payload,
             ensure_ascii=False,
