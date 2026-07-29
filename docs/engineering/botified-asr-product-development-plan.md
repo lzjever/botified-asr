@@ -316,7 +316,7 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 - 客户端必须显式提交 `response_format=diarized_json`；缺省或其他值均返回 `400`，服务不得自动补齐。
 - 固定只接受实际音频不超过 30 分钟的完整文件，不提供流式响应、在线 diarization、实时 speaker label 或处理中间 speaker 结果。
 - FSMN-VAD 先得到全文件绝对时间 speech islands；在 islands 内按现有 CAM++ policy 使用 1.5 秒 window、0.75 秒 shift 的全局时间锚点提取 embedding。
-- 完整文件处理结束后，使用本地 NumPy spectral clustering 和经真实数据校准的低频 normalized-gap 规则发现未知 speaker 数；将 window label 投影回时间轴并合并相邻同标签区间。若同 speaker run 超过 30 秒，再沿已有 VAD 安全切点和 30 秒模型边界切成同标签 final segments，之后才执行 ASR/rich 处理。
+- 完整文件处理结束后，使用本地 NumPy spectral clustering 和经真实数据校准的低频 normalized-gap 规则发现未知 speaker 数；将 window label 投影回时间轴，只在同一 true VAD island 内合并 touching 同标签区间，true island 是 hard cut 且不得跨 island 合并。within-island 同 speaker run 超过 480,000 samples 时，只从 run start 每 480,000 samples 切成同标签 final segments，之后才执行 ASR/rich 处理。
 - 已知人物只在匿名 clustering 完成后命名；最多 32 个 `known_speaker_ids[]` 只是 profile matching 候选边界，不限制实际 speaker 数。
 - 首版重叠语音只输出一个主 speaker，不承诺分离或同时标注多个说话人；这是明确质量限制，不增加 overlap 专用模型。
 
@@ -705,7 +705,7 @@ bounded upload
        -> after decoder EOF: CAM++ embeddings on 1.5s/0.75s global-time windows inside speech islands
        -> local NumPy spectral clustering + calibrated low-frequency normalized-gap K selection
        -> project window labels and merge adjacent equal labels
-       -> split any >30s same-speaker run at existing VAD-safe/30s model boundaries
+       -> keep true VAD islands as hard cuts; split within-island same-speaker runs from run start every 480,000 samples
        -> one-time ASR/rich processing per final segment
        -> optional known-speaker naming
   -> final response projection
@@ -781,14 +781,14 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 - 增量 FSMN-VAD 输出绝对 sample 边界和 speech island；island 只界定连续语音，不声明 speaker 唯一。
 - ring/spool 只保留当前未闭合 speech island 和少量前置 padding。
-- 单个 speech island 达到 30 秒时强制安全切分。
+- 底层 `np.int16` PCM 可按有界存储需要分块，但不得改变或丢失 true VAD island identity；true island 边界由 VAD 结果唯一确定。
 - 普通 ASR 中 island 就是 final segment，完成后即可执行一次 ASR/rich 处理并释放 PCM。
 - diarization 中保留各 island 的 bounded `np.int16` speech PCM 和绝对 sample 映射，直到完整文件 EOF、actual duration 校验和 clustering 完成；此阶段不执行 ASR，也不产生 speaker segment。
 - 空白音频返回空字符串和空 segments，不生成模型幻觉文本。
 
 ### 8.4 Result artifact
 
-- 普通 ASR 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相；diarization 只在全文件 clustering、label projection、相邻标签合并和超长同 speaker run 安全切分完成后，按 final segment 执行 ASR 并追加。canonical line 保存整数 `start_sample`/`end_sample`，公开响应只在 projection 时统一换算为秒。
+- 普通 ASR 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相；diarization 只在全文件 clustering、label projection、true-island hard cuts、同 island 相邻标签合并和 within-island 超长同 speaker run 从 start 每 480,000 samples 切分完成后，按 final segment 执行 ASR 并追加。canonical line 保存整数 `start_sample`/`end_sample`，公开响应只在 projection 时统一换算为秒。
 - 普通 ASR 内存只保留当前 batch；diarization 额外保留固定 30 分钟上限内的 int16 speech PCM、embedding 和 spectral workspace。
 - 最终 `text` 由 canonical segment 顺序拼接。
 - 所有输出格式共用一个 canonical text join helper。每个 segment text 只移除首尾 Unicode whitespace，不执行 NFC/NFKC 或其他正文 normalization；trim 后为空的 segment 跳过。连接相邻非空文本时，若左侧末字符 Unicode category 为 `Ps`/`Pi`、右侧首字符 category 为 `Pe`/`Pf`/`Po`，或任一边界字符属于 Han、Hiragana、Katakana，则不插入字符；其他情况恰好插入一个 U+0020。Hangul 按普通 letter 处理，因此默认插入 U+0020，segment 内已有空格不改写。
@@ -1435,7 +1435,7 @@ diarization 另保留一个边界测试组：
 - 使用未参与阈值拟合和 enrollment 的 held-out 中英文 fixture；至少两位已知人物、三位未知人物、两类录音设备。
 - 每位已知人物使用 2–5 个 enrollment 样本，另有至少 10 个 held-out utterance；未知人物合计至少 30 个 utterance。
 - 已知人物正确命名率至少 90%，未知 utterance 的 false-known assignment 必须为 0；低 margin 保持 `Unknown`。
-- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 FSMN-VAD -> 1.5s/0.75s global-time window embedding -> NumPy un-clipped affinity/stable pruning/symmetrization/absolute-degree Laplacian/low-frequency normalized-gap/deterministic k-means -> label projection/merge/30s-safe split -> ASR -> centroid matching -> response projection。
+- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 FSMN-VAD -> 1.5s/0.75s global-time window embedding -> NumPy un-clipped affinity/stable pruning/symmetrization/absolute-degree Laplacian/low-frequency normalized-gap/deterministic k-means -> label projection/true-island hard cuts/same-island merge/within-island 480,000-sample split from run start -> ASR -> centroid matching -> response projection。
 - 以超过 32 个匿名 cluster 的 synthetic embedding 验证没有会议参与人数硬限制；另独立验证 `known_speaker_ids[]` 第 33 项只因命名候选边界被拒绝。
 - synthetic vector 只单测 threshold/margin 数学边界；真实 fixture 在 model policy/revision 变化时运行，不在每次普通 CI 重复。
 
