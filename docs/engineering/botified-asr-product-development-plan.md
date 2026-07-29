@@ -1210,30 +1210,29 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
 4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
 5. 只依据已验证的 runtime/image matrix 选择 device 和 image；CPU artifact 中 `device=auto` 与 `device=cpu` 都 canonicalize 为 CPU，只有 manifest 含目标平台 CUDA digest 且 NVIDIA runtime 验证通过时才可选择 CUDA artifact。
-6. 按选定的 manifest digest 拉取对应 OCI image。
-7. 创建配置、credential、data 和 model cache 目录；data 与 model cache 使用互不相等、互不嵌套的独立持久 mount。
+6. 完成既有安装状态 preflight，并确认属于 fresh install 或下述 same-release repair 后，才按选定的 manifest digest 拉取对应 OCI image。
+7. fresh install 创建固定的 engine-managed named volumes `botified-asr-data` 和 `botified-asr-model-cache`，分别挂载到容器内 exact path `/var/lib/botified-asr` 和 `/var/cache/botified-asr/models`；`config.yaml`、`service.env` 和 `client.env` 仍位于当前用户的配置目录。fresh volumes 必须以最终容器用户 `10001:10001` 验证可写后才继续；fresh install 选定的 Docker 或 Podman 此后不得切换。
 8. 未提供 API Key 时生成安全随机 token，分别写入 mode `0600` 的 `service.env` 和 §10.3 `client.env`；不得回显。
-9. 安装单个 systemd service；没有 systemd 时安装可执行启动 wrapper 并明确提示。
+9. 安装唯一可执行 launcher `~/.local/bin/botified-asr-service`；存在 user systemd 时安装单个 systemd user unit，unit 只调用该 launcher，没有 user systemd 时由同一 launcher 作为启动 wrapper 并明确提示。
 10. 启动服务、等待 ready，并用安装器内置的最小 HTTP smoke 执行一个随发布固定的短音频转写。
-11. 输出 base URL、credential 路径、service status、upgrade 和 uninstall 命令。
-12. 重复运行时执行幂等升级，不覆盖用户配置和 API Key。
-13. 升级先拉取并验证新 image；新版本 ready/smoke 失败时恢复旧 image 和 service，保留失败日志。
-14. 升级保留 config、`service.env`、`client.env`、speaker database、model cache、jobs 和未过期结果。
-15. uninstall 默认只停止并移除 service/wrapper，保留上述数据；只有显式 `--purge` 且二次确认后才删除。
-16. manifest 的 processor fingerprint 改变且存在 queued/running job 时拒绝切换，输出完成或取消这些 job 的命令；不让新 image 继续旧 job snapshot。
-17. 停止旧服务后使用 SQLite backup API 创建一致备份；新版本 schema migration、ready 或 smoke 失败时同时恢复旧 DB 和旧 image。model cache 按 revision 隔离，不在原目录原地改写。
-18. 每个 schema migration 必须声明旧 image 是否可读；没有备份/恢复验证的 schema-changing upgrade 直接阻断。
+11. 输出 base URL、credential 路径、service status、repair 和 uninstall 命令。
+12. 只允许 fresh install，或在既有安装的 `release_version` 与 platform image digest 都完全相同时执行 repair；installed `botified-asr-service` launcher 是已安装 engine、version 和 digest 的唯一事实来源，preflight 严格解析它，不读取或创建平行的 installed-state、status 或 manifest 文件。repair 不覆盖或重建 `config.yaml`、API Key、credential 文件或两个 named volumes。
+13. 发现版本或 digest 不同、engine 变化、既有任一 managed 资源但 launcher 缺失、launcher 不符合固定模板、孤儿资源或其他无法明确识别的 managed 状态时，必须在停止旧服务、拉取 image、打开 SQLite 或写配置前 fail closed，并保持旧服务不动。
+14. fresh attempt 只在内存中记录本次新建且 preflight 已确认此前不存在的 exact config/credential 文件、launcher、user unit/wrapper、受控容器和两个 named volumes。任何正常失败都先输出不含 secret 的受控日志，再逆序停止并删除该内存集合中的本次资源，使安装回到 fresh；不得删除任何 preexisting 资源。SIGKILL 后或再次运行时无法证明资源属于本次 attempt 的状态按第 13 项 fail closed，不擅自清理。
+15. uninstall 默认移除 service/unit、launcher/wrapper 和受控容器，但保留配置、credential 和两个 named volumes；只有显式 `--purge` 且二次确认后才额外删除 exact volumes `botified-asr-data` 和 `botified-asr-model-cache`，不得按前缀、label 或目录递归扩大删除范围。
 
 发布/安装细则：
 
-- 首版只安装当前操作员的 rootless container 和 systemd user unit，不同时维护 system service 做法；拒绝以 root 执行。
+- installer 拒绝 EUID 0，只使用当前非 root 用户已经可以访问的 Docker 或 Podman；engine 可以是 rootful 或 rootless，但 installer 不调用 sudo、不安装或切换 engine，也不修改 engine socket、用户组或权限。
+- 首版只安装 systemd user unit 或其 wrapper fallback，容器固定以 `10001:10001` 运行；不把 rootless daemon 声明为已验证前提或发布承诺。
+- `botified-asr-service` 由完整固定模板生成和校验，唯一安装身份字段各出现一次，严格为 `BOTIFIED_ASR_ENGINE=docker` 或 `BOTIFIED_ASR_ENGINE=podman`，以及 `BOTIFIED_ASR_IMAGE=ghcr.io/lzjever/botified-asr:vMAJOR.MINOR.PATCH@sha256:<64-lowercase-hex>`；preflight 拒绝字段缺失、重复、额外安装状态或模板被改写。user unit 不复制 engine、version、tag 或 digest。
 - `device=auto` 只有在当前 manifest 含本平台 CUDA digest且 runtime 校验通过时选择 CUDA；否则确定性使用 CPU，不临时拼装未发布 GPU 路径。
 - unit 位于 `~/.config/systemd/user/botified-asr.service`，通过 `systemctl --user enable --now` 管理。
-- installer 检测 user manager 和 linger；无 user systemd 时仅生成 `~/.local/bin/botified-asr-service` wrapper，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
+- installer 检测 user manager 和 linger；无 user systemd 时只把 `~/.local/bin/botified-asr-service` 作为 wrapper 使用，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
 - `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer、`botified-asr-smoke.flac`、`botified-asr-openapi.json`、`LICENSE` 和 `THIRD_PARTY_NOTICES`；manifest 在校验 checksum 后才解析。
 - manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
 - Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
-- checksum harness 向现有 `botified-releases/tests/installers.sh` 注入损坏 manifest/tarball，并断言拉 image、写 systemd 或替换当前安装前已失败；不另建 installer framework。
+- checksum harness 向现有 `botified-releases/tests/installers.sh` 注入损坏 manifest/tarball，并断言拉 image、写 user unit/wrapper 或改动既有服务前已失败；不另建 installer framework。
 - 唯一卸载入口为已安装的 `botified-asr-uninstall [--purge]`。
 
 不做：
@@ -1506,6 +1505,7 @@ diarization 另保留一个边界测试组：
 - resumable upload；
 - 自动摘要或会议行动项生成；
 - 数据标注和质量管理平台。
+- v1 不做跨版本原地升级；至少出现第二个真实 release 且发生真实 schema delta 后，才按实际迁移需求另行设计，不预留升级接口或兼容层。
 
 ## 20. 风险和处理
 

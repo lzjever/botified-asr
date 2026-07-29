@@ -182,7 +182,7 @@ def test_release_manifest_is_exact_deterministic_and_hashes_real_inputs(
         "release_version": _release_version(),
         "runtime": {
             "container_engines": ["docker", "podman"],
-            "rootless_required": True,
+            "container_user": "10001:10001",
         },
         "schema_version": 1,
     }
