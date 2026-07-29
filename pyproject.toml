@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "botified-asr"
-version = "0.0.0"
+version = "0.1.0"
 description = "Independent Botified ASR service"
 readme = "README.md"
 license = "MIT"

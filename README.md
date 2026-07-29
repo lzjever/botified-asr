@@ -35,8 +35,7 @@ printf 'BOTIFIED_ASR_API_KEY=%s\n' "$BOTIFIED_ASR_API_KEY" \
 chmod 600 ./botified-asr.env
 ```
 
-This file configures only the service container. After a version is formally
-released, replace `vX.Y.Z` below with its actual fixed tag:
+This file configures only the service container. Run the fixed `v0.1.0` release:
 
 ```bash
 docker run --detach \
@@ -45,7 +44,7 @@ docker run --detach \
   --env-file ./botified-asr.env \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
-  ghcr.io/lzjever/botified-asr:vX.Y.Z
+  ghcr.io/lzjever/botified-asr:v0.1.0
 ```
 
 Docker creates the named volume if needed. `/data/state` holds the database,
@@ -79,7 +78,7 @@ docker run --detach \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
   --mount type=bind,src=/absolute/path/config.yaml,dst=/etc/botified-asr/custom.yaml,readonly \
-  ghcr.io/lzjever/botified-asr:vX.Y.Z \
+  ghcr.io/lzjever/botified-asr:v0.1.0 \
   --config /etc/botified-asr/custom.yaml
 ```
 
@@ -128,7 +127,7 @@ the Skill source:
 
 ```bash
 docker build \
-  --build-arg BOTIFIED_ASR_VERSION=0.0.0 \
+  --build-arg BOTIFIED_ASR_VERSION=0.1.0 \
   --tag botified-asr:local \
   .
 scripts/build-skill-tarball /tmp/botified-asr-skill.tar.gz
