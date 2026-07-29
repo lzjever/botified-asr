@@ -1,11 +1,11 @@
-# Botified ASR 产品开发计划
+# Botified ASR 当前产品与技术边界
 > 目标仓库：`botified-asr`
-> 研究基线：2026-07-26
+> 技术基线：2026-07-26
 > 上游基线：FunASR `1.3.29`（`8a34247d`）、SenseVoiceSmall、FSMN-VAD、CAM++
 
 ## 1. 文档定位
 
-本计划用于一次性交付 Botified 生态的独立 ASR 服务。开发团队应完成服务、长音频处理、已知人物注册和命名、OpenAI 兼容接口、在线安装、公开发布以及 Agent Skill 的完整闭环。
+本文记录 Botified ASR 当前产品行为、公开接口、运行时不变量和明确非目标，是实现与互操作所需的唯一产品与技术真相。它不是 backlog、checklist、review/release gate 或状态报告；文中能力不得被解释为待重新实施的任务，也不构成创建 Git tag 或推送 OCI image 的授权。未来工作只由用户明确给出的当前目标启动。
 
 该服务是 Botified 的周边服务，不属于 Botified Core 或 Gateway：
 
@@ -21,20 +21,22 @@ botified-asr
 FunASR + SenseVoice + FSMN-VAD + CAM++
 ```
 
-本计划不要求修改 Botified、OpenClaw、第三方 channel plugin、FunASR 或 SenseVoice。服务通过稳定 HTTP 契约独立演进。
+本文不要求修改 Botified、OpenClaw、第三方 channel plugin、FunASR 或 SenseVoice。服务通过稳定 HTTP 契约独立演进。
 
-## 2. 产品结论
+## 2. 当前产品边界
 
-开发团队必须交付以下完整产品：
+当前产品能力与公开边界如下：
 
 1. 一个可独立部署、兼容 OpenAI Transcriptions API 明确子集的 ASR 服务。
 2. 基于 SenseVoiceSmall 的多语言转写、情感和音频事件识别。
-3. 可逐请求选择的 VAD 和说话人 pipeline。
+3. 已实现可逐请求选择的 VAD 和说话人 pipeline。
 4. 普通 ASR 支持最大 1 GiB、最长 12 小时音频；diarization 固定为最长 30 分钟，并在完整文件接收、解码和 VAD 完成后离线批处理，不提供在线、实时或增量 speaker 输出。
-5. 已知人物的声音样本注册、更新、删除和命名转写。
+5. 已实现已知人物的声音样本注册、更新、删除和命名转写。
 6. 普通同步请求和同一端点上的可靠异步长任务。
-7. 一键在线安装脚本，并由 `lzjever/botified-asr` 的 GitHub Releases 公开。
-8. 一份可单独安装、同时兼容 Codex、OpenClaw 和 Botified 的 Agent Skill。
+7. 正式发布面限定为固定版本、可直接按 README 运行的公开 OCI image。
+8. 一份可从 exact tagged checkout 显式放置或指向、同时兼容 Codex、OpenClaw 和 Botified 的 Agent Skill。
+
+第 3、5 项以及 §8.5、§9、§15 中的 speaker/diarization 是当前行为，不是待办或新的产品切片；不得由本文推导出重新设计默认人物选择、增加校准门禁或自动加载全部已注册人物。
 
 产品不承诺：
 
@@ -63,7 +65,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - 音频解码、VAD、SenseVoice、speaker embedding、结果投影各只有一个实现。
 - HTTP 同步处理和后台 job 不得复制 pipeline。
 - Skill、README 和 OpenAPI 的请求示例从同一公开契约维护，不各自定义字段。
-- `botified-asr` 是服务、Skill、安装器和公开 release assets 的唯一源码与发布仓库；GitHub Releases 只包含本仓库构建的发布物。
+- `botified-asr` 是服务、Skill、离线生成的 OpenAPI、README 和 OCI image 的唯一源码仓库；不复制发布真相。
 
 ### 3.3 YAGNI
 
@@ -86,8 +88,8 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 | API 鉴权 | Bearer Token |
 | 非敏感配置 | 单一 YAML 配置文件 |
 | API secret | 单一环境变量 `BOTIFIED_ASR_API_KEY` |
-| 安装服务 | `install-asr.sh` |
-| 安装 Skill | `install-asr-skill.sh` |
+| 生产运行 | 固定版本 OCI image + README 中唯一 `docker run` |
+| Skill 来源 | 官方 image：matching exact tag；custom image：构建它的同一 checkout |
 
 ## 4. 上游能力和采用边界
 
@@ -122,7 +124,6 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - Python 固定为 `3.11.13`。FunASR 的上游源码基线固定为完整 commit `8a34247dc5ff71bea61b37e57f941680b456753f`；运行时只安装官方 PyPI `funasr==1.3.29` wheel `https://files.pythonhosted.org/packages/9c/10/0a43f6233db074e263c025718afff7e7960976ef5e545c40c92c5f59f1c9/funasr-1.3.29-py3-none-any.whl`，其 SHA-256 固定为 `bc022d3f80cab635227841a401cc872e5b863a207f8fa01262f15c42ed630137`，大小固定为 `956044` bytes；不得在运行时改从 Git tree、sdist 或其他同版本 artifact 安装。
 - 该 wheel 发布的 425 个 `funasr/**` 文件与上述 commit 中的同路径文件逐字节一致；commit-only 的 28 个文件不属于当前 SenseVoice、FSMN-VAD、CAM++ 支持路径。启用 `EnglishTextNormalizer`、RWKV 或这些省略文件承载的其他能力前必须重新核对并更新 runtime artifact manifest。commit 固定源码基线，wheel URL、hash 和 size 固定实际安装物，二者不得相互替代。
 - CPU release 的 `torch` 和 `torchaudio` 均固定为 `2.11.0+cpu`，只从 PyTorch 官方 CPU index `https://download.pytorch.org/whl/cpu` 解析和安装；不得让通用 PyPI 或其他额外 index 覆盖这两个 artifact。
-- CUDA runtime、对应的 PyTorch artifact 和模型必须在各自 release 构建前精确固定；CPU pin 不自动成为 CUDA pin。
 - 发布镜像不得在启动时执行 `pip install -U`。
 - SenseVoice、FSMN-VAD、CAM++ 固定到下列 Hugging Face immutable commit；禁止解析 alias/master 后再记录“实际 revision”：
 
@@ -133,15 +134,13 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 | CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` |
 
 - 上述固定 CAM++ revision 的 speaker embedding 基线统一为 16 kHz mono PCM、80-bin filterbank、192 维 embedding、1.5 秒 window、0.75 秒 shift、right-zero-pad 和 L2 normalization；这是 enrollment、anonymous diarization 和 known matching 的唯一共同提取基线。enrollment consistency 和 known matching 的 similarity decision 使用该 revision/FunASR `yesOrNo` 的官方基线阈值 `0.31`；该阈值不参与 anonymous clustering。
-- 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 接入 loader 前必须建立同等完整的 runtime manifest。
+- 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，不维护第二份 hash 长清单；CAM++ 使用同等完整的 runtime manifest。
 - 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
-- 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
+- 更新上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
 - `runtime.inference_lanes` 每个 lane 独立加载一套 SenseVoice、FSMN-VAD、CAM++ model bundle；同一 lane 的三个 adapter 共用该 lane 的串行执行器，跨 lane 不共享 model、adapter 或可变 cache。
-- 仓库代码采用 MIT license；每个 release 提供 `LICENSE` 和 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
-- SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由 installer 按固定来源/hash下载，不以技术便利替代许可判断。
-- SenseVoice 的预期 artifact hash 在 release 前必须由本地隔离下载重新计算并与 manifest 比较，不能只抄远端元数据。
-- aarch64 CPU artifact 必须在原生 aarch64 runner 完成 fresh-install、模型加载和固定 smoke；x86_64 上的交叉构建不能替代。
-- CUDA artifact 使用独立依赖锁、image digest，并在真实 NVIDIA/CUDA runner 验证；未经验证不得沿用 CPU 结论或标记 CUDA 受支持。
+- 仓库代码采用 MIT license；OCI image 包含 `LICENSE` 和 `THIRD_PARTY_NOTICES`，README 记录模型名称、来源、revision 和 license URL。
+- SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由应用的固定 artifact resolver 按固定来源、revision 和 hash 下载，不以技术便利替代许可判断。
+- aarch64 CPU artifact 必须在原生 aarch64 runner 完成全新 model cache、模型加载和固定 smoke；x86_64 上的交叉构建不能替代。
 
 ### 4.4 可复现 fingerprint
 
@@ -219,7 +218,7 @@ Gateway 不需要理解 FunASR 扩展字段。
 
 ### 5.6 Agent 自助使用
 
-Codex、OpenClaw 或 Botified Agent 安装同一份 Skill，通过稳定脚本检查服务、注册人物、提交长会议、等待结果并生成会议记录。
+官方 image 用户使用 matching exact tagged checkout 中的 Skill，custom image 用户使用构建它的同一 checkout 中的 Skill。Codex、OpenClaw 或 Botified Agent 通过其中的稳定脚本检查服务、注册人物、提交长会议、等待结果并生成会议记录。
 
 ## 6. 公开 API 契约
 
@@ -235,7 +234,7 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 - 比较使用 constant-time 实现。
 - 不在日志、错误或 job 记录中保存 Authorization header。
 - 首版只有一个部署级 API Key，不增加用户或租户概念。
-- 发行运行时不注册 `/docs` 或 `/openapi.json`；OpenAPI JSON 在 release 构建时离线生成。
+- 发行运行时不注册 `/docs` 或 `/openapi.json`；OpenAPI JSON 由与服务产物 matching 的 checkout 按需离线生成。
 
 ### 6.2 `POST /v1/audio/transcriptions`
 
@@ -246,18 +245,10 @@ Authorization: Bearer <BOTIFIED_ASR_API_KEY>
 - 鉴权、成功响应和错误 envelope 在受支持组合内保持兼容。
 - 不宣称兼容完整 OpenAI Audio API；异步 job、持久 speaker profile 和 `funasr` 字段均是 Botified 扩展。
 
-兼容差异必须在 README、OpenAPI 和 Skill 中使用同一张表：
-
-| 能力 | OpenAI 基础调用 | Botified ASR 首版 |
-|---|---|---|
-| 普通同步转写 | 支持 | SDK 可直接调用受支持子集 |
-| model | OpenAI model name | 只接受固定 alias |
-| `srt` / `vtt` | 可用 | 不支持 |
-| `prompt` / 非零 `temperature` / `stream` | 依模型而定 | 不支持 |
-| 异步 job | 非本兼容承诺 | `Prefer: respond-async` 扩展 |
-| 已知人物参考 | 请求内 name + reference | 持久 speaker ID 扩展 |
-| diarization format | 依模型和格式组合 | 固定 alias + 显式 `auto` chunking + `diarized_json` |
-| 情感和事件 | 无 | namespaced `include[]` 扩展 |
+exact matching tag 源码离线生成的 OpenAPI 是完整 machine-readable wire
+truth。README 只用一句话公开上述兼容边界，并指向 matching-tag 的离线
+OpenAPI；Skill 只描述 helper 暴露的用户动作，现有 `references/api.md` 只记录
+helper 的请求和响应映射。README、OpenAPI 和 Skill 不复制同一份兼容矩阵。
 
 标准 SDK 只保证基础同步路径；扩展能力由本仓库 helper 或直接 HTTP 调用。
 
@@ -500,7 +491,7 @@ list 返回：
 
 - `created` 是该 release 的固定构建时间，不在每次请求变化。
 - 单 model GET 返回同一 object；未知 ID 返回 `404 model_not_found`。
-- 服务版本和模型 revision 通过 `botified-asr --version` 与 release manifest 查看，不增加未定义的 `/version` API。
+- 服务版本通过 `botified-asr --version` 和 OCI image tag/label 查看，模型 revision 由 README 与应用内固定 artifact spec 给出；不增加未定义的 `/version` API。
 
 ## 7. 长音频和异步 Job
 
@@ -522,7 +513,7 @@ limits:
   result_retention_hours: 24
 ```
 
-- 部署者可以收紧这些边界，安装器使用以上发布上限。
+- 部署者可通过完整 YAML 高级覆盖收紧这些边界；镜像内置配置使用以上发布上限。
 - `max_upload_bytes` 不得高于 1 GiB，`max_audio_duration_secs` 不得高于 12 小时；服务启动时拒绝超过首版验证上限的配置。
 - `sensevoice-diarize` 另有不可配置的 30 分钟发布硬上限，即 28,800,000 个 mono 16 kHz PCM sample；该上限不收紧普通 `sensevoice` 的 12 小时边界。
 - `max_upload_bytes` 只计算 transcription 请求中唯一 `file` part 的 payload 实际字节数；`file` payload 小于或等于上限时可接受。multipart overhead 另按 §6.2 的独立 1 MiB 上限计算。
@@ -732,7 +723,6 @@ diarization 必须完整接收并处理文件后才能生成匿名 speaker label
 - ffmpeg 只把 bounded PCM block 交给 FSMN-VAD `generate` 的 request-local cache，消费边界后立即丢弃已确认历史；
 - SenseVoice 只接收不超过 30 秒的 final segment；CAM++ 只接收现有 policy 定义的 1.5 秒 window；
 - adapter 不接受原始上传路径，不允许上游入口再次加载完整媒体；
-- 普通 12 小时 ASR 测试采集 request-local VAD cache 的 tensor bytes；首个 10 分钟 warmup 后到结束增长不得超过 1 MiB，且 cache 中不得出现 confirmed-segment 历史列表。
 - diarization 可在 30 分钟硬上限内保留 speech islands 的 `np.int16` PCM、约 2,400 个 CAM++ embedding 和 spectral workspace；模型 adapter 只为当前 window 临时转换 float32，调用结束立即释放，不保留全量 float PCM。
 
 公开入口只调用一个 mode-neutral processor：
@@ -963,44 +953,18 @@ list 返回 `{"object":"list","data":[...]}`，按 `created_at,id` 稳定排序�
 
 ### 10.1 单一配置文件
 
-默认：
+`config/container.yaml` 是标准 OCI image 默认配置的唯一真相，构建时原样复制到：
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/config.yaml
-```
-
-示例：
-
-```yaml
-server:
-  listen: "127.0.0.1:8090"
-  public_base_url: "http://127.0.0.1:8090"
-
-runtime:
-  device: "auto"
-  model_cache_dir: "~/.cache/botified-asr/models"
-  inference_lanes: 1
-
-storage:
-  data_dir: "~/.local/share/botified-asr"
-
-limits:
-  max_upload_bytes: 1073741824
-  max_audio_duration_secs: 43200
-  direct_max_audio_duration_secs: 30
-  sync_max_upload_bytes: 67108864
-  sync_max_audio_duration_secs: 3600
-  max_active_uploads: 4
-  max_queued_jobs: 16
-  max_job_storage_bytes: 21474836480
-  min_filesystem_free_bytes: 2147483648
-  result_retention_hours: 24
+/etc/botified-asr/config.yaml
 ```
 
 规则：
 
-- 非敏感配置只从该文件读取。
-- CLI 仅接受 `--config` 定位文件，不为每个字段再增加 CLI/env alias。
+- ASR 的规范默认端口是 `17770`；不保留旧端口 alias、自动 fallback 或双端口监听。
+- 普通容器用户直接使用镜像内置配置，不创建或挂载 host YAML。
+- 高级部署者如需调整 `runtime.inference_lanes` 或容量边界，以 `config/container.yaml` 为起点提供一份完整 YAML，以 read-only bind mount 放入容器并通过唯一 `--config` 指向；不支持片段合并、逐字段 CLI flag 或 env alias。
+- 非敏感配置只从最终选中的单一 YAML 读取。
 - `~` 在配置加载时由应用统一展开。
 - 当前 CPU artifact 的 `runtime.device` 只接受精确值 `auto` 或 `cpu`，并将两者都 canonicalize 为 `cpu`；不得把 `auto` 直接传给 Torch/FunASR，也不得探测硬件后临时启用当前 artifact 未声明的 CUDA 路径。
 - `storage.data_dir` 和 `runtime.model_cache_dir` 展开 `~` 后必须已经是 absolute path，再以 `resolve(strict=False)` 规范为 canonical path；两个 canonical root 相等、任一位于另一目录树内时均 fail closed。
@@ -1021,41 +985,31 @@ limits:
 BOTIFIED_ASR_API_KEY
 ```
 
-- 应用只读取进程环境中的 `BOTIFIED_ASR_API_KEY`，不定位、打开或解析 `service.env`。
-- installer 创建 mode `0600` 的 `${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/service.env`，systemd/container launcher 从该文件向服务进程注入唯一同名环境变量。
+- 应用只读取进程环境中的 `BOTIFIED_ASR_API_KEY`，不定位、打开或解析 host env-file。
+- 普通 Docker 用户可通过自己选择路径的 `--env-file` 注入该变量；该文件只包含 `BOTIFIED_ASR_API_KEY=<secret>`，仅由 Docker 读取。项目不指定、创建、定位、解析、更新或管理该文件，用户负责其权限与生命周期。
 - YAML 不支持明文 `api_key` 字段。
 - 应用不得 trim 或以其他方式改写该值；整个值必须符合 RFC 6750 `b64token` ASCII grammar：至少一个 `ALPHA`、`DIGIT`、`-`、`.`、`_`、`~`、`+` 或 `/`，之后只允许可选的尾随 `=` padding。
 - 无论监听地址是什么，缺少、空、含空白、Unicode、控制字符、其他非法字符或中间 padding 的 secret 都拒绝启动。
 - secret 校验错误只返回稳定的配置错误，不得回显 secret 的全部或部分内容。
 - 本地开发在进程环境中显式设置测试 token，不提供隐式 no-auth。
 
-### 10.3 唯一客户端连接配置
+### 10.3 Skill helper 客户端进程环境
 
-本机服务、远程服务和三个 Agent runtime 使用同一种客户端连接文件：
-
-```text
-${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env
-```
-
-文件只接受以下两个键：
+Skill helper 只接受调用进程中的完整键对：
 
 ```text
-BOTIFIED_ASR_BASE_URL=http://127.0.0.1:8090
+BOTIFIED_ASR_BASE_URL=http://127.0.0.1:17770
 BOTIFIED_ASR_API_KEY=<secret>
 ```
 
 规则：
 
-- fresh 本机 `install-asr.sh` 创建 `service.env` 和该客户端文件，初始 key 相同；已有 `client.env` 时只创建/保留服务 secret，不改 active target。systemd 从 `service.env` 注入服务进程环境，Skill helper 只读 `client.env`。
-- 连接远程现有服务时，`install-asr-skill.sh` 接受显式 `BOTIFIED_ASR_BASE_URL` 和 `BOTIFIED_ASR_API_KEY`，并写入相同路径。
-- 已存在 `client.env` 且安装命令未提供连接参数时保持现有 active target；同时显式提供远程 URL/Key 时先验证格式再原子切换。
-- URL 与 Key 必须成对提供，拒绝半更新；任何 active target 切换都不得读取或修改 `service.env`。
-- 只安装 Skill 且未给连接信息是允许的；helper 的 `health` 必须返回稳定的 `client_not_configured` 和该文件路径，其他命令同样 fail fast。
-- helper 使用键白名单解析，不执行或 `source` 文件内容。
-- 文件和原子替换临时文件权限均为 `0600`。
+- 两个键必须同时存在、非空且格式有效；缺少任一键、空值或非法值均 fail closed 为稳定的 `invalid_client_config`，所有命令都在网络访问前失败。
+- helper 不定位、打开、解析或 `source` 任何 env/config 文件，也不回退到 `XDG_CONFIG_HOME`、`HOME`、`env.d`、`service.env` 或其他路径。
+- Agent runtime 和 power user 负责把该键对注入 helper 的进程环境；项目不自动生成、持久化、同步或切换连接目标。
+- helper 读取键对后，在调用 curl 或其他子进程前从环境中移除这两个键。
 - token 不写入 Skill、YAML、shell profile、命令示例或日志。
-- `service.env` 是服务启动 secret，不是客户端配置；远程 Skill 安装不得修改它。
-- 不增加第二种客户端配置格式；进程环境中的同名变量只作为显式的一次性覆盖，便于 CI 和运维调用。
+- 不增加命令行连接参数、文件配置、字段 alias 或自动覆盖路径。
 
 ## 11. 健康、日志和数据生命周期
 
@@ -1142,17 +1096,17 @@ storage_leases(
 
 ## 12. 进程和并发模型
 
-- 一个 ASGI 进程对应一个设备。
-- GPU 默认一个 Uvicorn worker，禁止通过 `--workers N` 在同一卡重复加载模型。
+- 一个部署实例运行一个 ASGI 进程，不通过 `--workers N` 复制 model bundle。
 - 阻塞模型调用必须离开 asyncio event loop。
 - `runtime.inference_lanes` 默认值为 `1`，首版仅支持精确整数 `1..2`；它表示单进程内独立完整 model bundle 的数量，不是 Uvicorn worker 或 job worker 数。
-- 每个 inference lane 独立加载并 warmup 完整 SenseVoice、FSMN-VAD、CAM++ bundle，任一 lane 失败则启动 fail closed。模型内存随 lane 数近似线性增加，`2` 必须在目标环境验证 peak memory、启动时间和吞吐后再启用。
-- ffmpeg decode 可以与 GPU inference 重叠，但受有界 channel 控制。
+- 每个 inference lane 独立加载并 warmup 完整 SenseVoice、FSMN-VAD、CAM++ bundle，任一 lane 失败则启动 fail closed。
+- `inference_lanes=2` 只由部署者通过完整配置显式选择，模型内存随 lane 数近似线性增加；应用不探测环境或自动启用。
+- ffmpeg decode 可以与模型推理重叠，但受有界 channel 控制。
 - API 上传、job worker 和模型推理不得各自建立无界队列。
 - 收到 SIGTERM 后立刻停止接收新请求和 claim job，写入 shutdown marker，并给当前工作 30 秒 grace 到达安全点。
 - marker 包含上一进程的唯一 generation；下一次启动在同一个恢复 transaction 中比较 `job.owner_generation`、分类 running rows并清除 marker。marker 的写入、分类、清除和中途崩溃使用 fault injection 覆盖，不能让后续真实 crash 永久绕过计数。
 - ffmpeg 使用独立 process group；取消/关闭时先 TERM，5 秒后仍未退出则 KILL，并关闭 pipe。
-- 已进入底层 CPU/GPU 推理的单次调用不承诺可抢占；超过 grace 由 systemd 在 `TimeoutStopSec=120` 后终止进程，启动恢复依据 shutdown marker 从头重排 job 且不计为 crash retry。
+- 已进入底层的单次模型推理不可抢占；超过 grace 后进程可能被 container runtime 强制终止，启动恢复依据 shutdown marker 从头重排 job 且不计为 crash retry。
 - 成功到达安全点的 running job 在退出事务中回到 queued；sync 请求在 grace 内未完成则断开并清理，不转换为 async。
 
 ## 13. 代码组织
@@ -1162,97 +1116,30 @@ storage_leases(
 - 文件超出清晰职责后再按真实边界拆分。
 - API DTO、domain state 和 SQLite row 不必强行共用一个类型。
 
-## 14. 一键安装和公开发布
+## 14. 容器发布边界
 
-### 14.1 发布物
+### 14.1 公开发布面
 
-`botified-asr` 负责构建：
-
-- CPU OCI image；
-- 通过真实 runner 验证时构建 CUDA OCI image；
-- `botified-asr-skill.tar.gz`；
-- `botified-asr-smoke.flac` 固定短转写音频；
-- 版本和 image digest manifest；
-- 离线生成的 OpenAPI JSON；
-- `LICENSE` 和 `THIRD_PARTY_NOTICES`。
-
-`lzjever/botified-asr` 的 GitHub Releases 发布：
+正式发布时，CPU 首版唯一公开可执行产物是：
 
 ```text
-install-asr.sh
-install-asr-skill.sh
-botified-asr-skill.tar.gz
-botified-asr-smoke.flac
-botified-asr-release.json
-botified-asr-openapi.json
-LICENSE
-THIRD_PARTY_NOTICES
-SHA256SUMS
+ghcr.io/lzjever/botified-asr:vX.Y.Z
 ```
 
-OCI image 发布到固定公开 registry，并在 `botified-asr-release.json` 固定 digest。安装器不得只拉 mutable `latest`。
+同一个不可覆盖的 version tag 是 Linux x86_64 与 aarch64 的 multi-arch OCI image；Docker 按 host platform 选择对应 image。两个平台各自在原生 Linux host 构建并完成模型加载、ready 和同一份固定短音频 smoke；每个平台经 smoke 验证的 image digest 必须原样作为最终 multi-arch tag 的输入，不得在 smoke 后重建替代。首版不发布 mutable `latest` tag。
 
-首版发布矩阵：
+Skill、离线生成的 OpenAPI、固定 smoke、`LICENSE` 和 `THIRD_PARTY_NOTICES` 继续由本仓库 exact Git tag 中的唯一源码构建或读取；license/notices 同时包含在 OCI image。项目不发布 host installer、release manifest、checksum bundle 或 GitHub Release assets，也不为发布创建第二份版本、模型或 artifact 真相。
 
-| 平台 | CPU | CUDA |
-|---|---:|---:|
-| Linux x86_64 | 必须发布并验证 | 仅在真实 runner 验证后发布 |
-| Linux aarch64 | 必须发布并验证 | 不支持 |
+官方公开部署面的收缩不限制开发者和 power user：本仓库继续支持 source execution、完整 `--config` YAML、从当前源码自定义 `docker build`，以及直接使用和打包唯一 Skill 源码；自定义产物不冒充官方固定版本 image。
 
-CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute capability 由锁定依赖决定并写入 manifest；安装器在拉取大资产前校验。未验证的组合不得靠 `device=auto` 猜测启用。
-
-### 14.2 `install-asr.sh`
-
-必须：
-
-1. 支持显式 `BOTIFIED_ASR_VERSION=vMAJOR.MINOR.PATCH`；未设置时从 `lzjever/botified-asr` 的 GitHub Releases latest stable release API 响应解析版本，必须验证 `draft=false`、`prerelease=false`，并严格校验 `tag_name` 为 canonical `vMAJOR.MINOR.PATCH`。不得把 `releases/latest/download` 重定向结果作为版本真相；解析版本后只按 §14.3 的 exact 同名 tag 下载 release assets。
-2. 检测 Linux x86_64/aarch64；不支持的平台在下载大资产前失败。
-3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
-4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
-5. 只依据已验证的 runtime/image matrix 选择 device 和 image；CPU artifact 中 `device=auto` 与 `device=cpu` 都 canonicalize 为 CPU，只有 manifest 含目标平台 CUDA digest 且 NVIDIA runtime 验证通过时才可选择 CUDA artifact。
-6. 完成既有安装状态 preflight，并确认属于 fresh install 或下述 same-release repair 后，才按选定的 manifest digest 拉取对应 OCI image。
-7. fresh install 创建固定的 engine-managed named volumes `botified-asr-data` 和 `botified-asr-model-cache`，分别挂载到容器内 exact path `/var/lib/botified-asr` 和 `/var/cache/botified-asr/models`；`config.yaml`、`service.env` 和 `client.env` 仍位于当前用户的配置目录。fresh volumes 必须以最终容器用户 `10001:10001` 验证可写后才继续；fresh install 选定的 Docker 或 Podman 此后不得切换。
-8. 未提供 API Key 时生成安全随机 token，分别写入 mode `0600` 的 `service.env` 和 §10.3 `client.env`；不得回显。
-9. 安装唯一可执行 launcher `~/.local/bin/botified-asr-service` 和唯一卸载入口 `~/.local/bin/botified-asr-uninstall`；存在 user systemd 时安装单个 systemd user unit，unit 只调用该 launcher，没有 user systemd 时由同一 launcher 作为启动 wrapper 并明确提示。
-10. 启动服务、等待 ready，并用安装器内置的最小 HTTP smoke 执行一个随发布固定的短音频转写。
-11. 输出 base URL、credential 路径、service status、same-release repair 命令和 `botified-asr-uninstall [--purge]`。
-12. 只允许 fresh install，或在既有安装的 `release_version` 与 platform image digest 都完全相同时执行 repair；installed `botified-asr-service` launcher 是已安装 engine、version 和 digest 的唯一事实来源，preflight 严格解析它，不读取或创建平行的 installed-state、status 或 manifest 文件。repair 不覆盖或重建 `config.yaml`、API Key、credential 文件或两个 named volumes。
-13. 发现版本或 digest 不同、engine 变化、既有任一 managed 资源但 launcher 缺失、launcher 不符合固定模板、孤儿资源或其他无法明确识别的 managed 状态时，必须在停止旧服务、拉取 image、打开 SQLite 或写配置前 fail closed，并保持旧服务不动。
-14. fresh attempt 只在内存中记录本次新建且 preflight 已确认此前不存在的 exact config/credential 文件、launcher、uninstaller、user unit、受控容器和两个 named volumes。任何正常失败都先输出不含 secret 的受控日志，再逆序停止并删除该内存集合中的本次资源，使安装回到 fresh；不得删除任何 preexisting 资源。SIGKILL 后或再次运行时无法证明资源属于本次 attempt 的状态按第 13 项 fail closed，不擅自清理。
-15. uninstall 默认只停止服务，删除 systemd user unit（若存在）和受控容器；fallback 下只停止并删除由 launcher 启动的受控容器。默认保留 launcher、唯一 uninstaller、`config.yaml`、`service.env`、`client.env` 以及 exact volumes `botified-asr-data` 和 `botified-asr-model-cache`，因此同一 release 仍可依据 launcher 唯一身份执行 repair，并明确输出 repair 和 `--purge` 命令。只有显式 `--purge` 且输入一次精确的完整 target 确认文本后，才额外删除 launcher、uninstaller、exact files `config.yaml`、`service.env`、`client.env`、仍存在的 exact user unit 和上述两个 exact volumes，使状态恢复为 fresh；不得按前缀、label 或目录递归扩大删除范围。
-
-发布/安装细则：
-
-- installer 拒绝 EUID 0，只使用当前非 root 用户已经可以访问的 Docker 或 Podman；engine 可以是 rootful 或 rootless，但 installer 不调用 sudo、不安装或切换 engine，也不修改 engine socket、用户组或权限。
-- 首版只安装 systemd user unit 或其 wrapper fallback，容器固定以 `10001:10001` 运行；不把 rootless daemon 声明为已验证前提或发布承诺。
-- `botified-asr-service` 由完整固定模板生成和校验，唯一安装身份字段各出现一次，严格为 `BOTIFIED_ASR_ENGINE=docker` 或 `BOTIFIED_ASR_ENGINE=podman`，以及 `BOTIFIED_ASR_IMAGE=ghcr.io/lzjever/botified-asr:vMAJOR.MINOR.PATCH@sha256:<64-lowercase-hex>`；preflight 拒绝字段缺失、重复、额外安装状态或模板被改写。user unit 不复制 engine、version、tag 或 digest。
-- `device=auto` 只有在当前 manifest 含本平台 CUDA digest且 runtime 校验通过时选择 CUDA；否则确定性使用 CPU，不临时拼装未发布 GPU 路径。
-- unit 位于 `~/.config/systemd/user/botified-asr.service`，通过 `systemctl --user enable --now` 管理。
-- installer 检测 user manager 和 linger；无 user systemd 时只把 `~/.local/bin/botified-asr-service` 作为 wrapper 使用，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
-- `SHA256SUMS` 覆盖除自身外的其余八个 release assets，条目按文件名升序排列且文件末尾恰好一个 LF；manifest 在校验 checksum 后才解析。
-- manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
-- Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
-- 本仓库的 installer 测试向 `install-asr.sh` 和 `install-asr-skill.sh` 注入损坏 manifest/tarball，并断言拉 image、写 user unit/wrapper 或改动既有服务前已失败；复用现有测试体系，不另建 installer framework。
-- 唯一卸载入口为已安装的 `~/.local/bin/botified-asr-uninstall [--purge]`。
-
-不做：
-
-- 自动安装 GPU driver；
-- 自动修改防火墙；
-- 默认绑定公网；
-- 默认启用 TLS；
-- 下载来源不明的模型或脚本。
-
-### 14.3 版本关系
+### 14.2 版本关系
 
 - `botified-asr` 使用独立 SemVer。
-- `BOTIFIED_ASR_VERSION` 不复用 `BOTIFIED_VERSION`。
-- `botified-asr` GitHub Releases 直接使用标准 tag `vX.Y.Z`；专用仓库不增加 `asr-` namespace。
-- resolved version（显式 `BOTIFIED_ASR_VERSION` 或本仓库 GitHub Releases latest stable `tag_name`）必须是 canonical `vMAJOR.MINOR.PATCH`：每个十进制段只能是 `0` 或以非零数字开头的数字串，不接受 prerelease、build metadata 或空白；它直接映射到本仓库同名 `$version` release，该 release manifest 固定 `ghcr.io/lzjever/botified-asr:$version` 的 image digest。
-- 未显式指定版本时，本仓库 GitHub Releases 的 latest stable release API 是唯一版本发现入口；不维护 latest pointer 文件或第二份 release 索引。只有全部 assets 上传并校验完成的 non-draft、non-prerelease release 才可成为 latest。
-- Botified Core、Gateway 和 ASR 不要求同版本发布。
-- `botified-asr` README 说明 ASR 独立安装及其与 Core/Gateway 的版本独立性，避免“全家桶”心智。
-- `pyproject.toml` project version、Git tag、GitHub Release tag、manifest `release_version`、image tag/label 和 `botified-asr --version` 必须语义一致；project version 不带前导 `v`，其余版本表示按上述 canonical `vMAJOR.MINOR.PATCH` 对应。
+- 正式发布使用 canonical `vX.Y.Z` Git tag，同名 GHCR image tag 发布后不可覆盖；README 只展示明确 version tag，不解析或推荐 mutable alias。
+- 正式发布时，`pyproject.toml` project version、Git tag、OCI image tag/label 和 `botified-asr --version` 必须语义一致；project version、image label 和 CLI version 不带前导 `v`，Git 与 image tag 使用对应的 `vX.Y.Z`。
+- 本地 custom build/tag 无需对应 canonical Git tag，但不得使用官方 GHCR 命名或以其他方式冒充官方固定版本。
+- 仓库不维护自动发布 workflow；实现、测试或验证构建能力不授权或要求创建 Git tag、推送 GHCR。正式发布仅在用户明确授权后由维护者执行，本文不定义发布 runbook、rollback 或验收清单。
+- Botified Core、Gateway 和 ASR 不要求同版本发布；README 说明 ASR 独立运行和版本边界，避免“全家桶”心智。
 
 ## 15. 通用 Agent Skill
 
@@ -1281,17 +1168,18 @@ description: ...
 
 Skill 指导 Agent：
 
-- 从 §10.3 的唯一 `client.env` 使用服务；
+- 从 §10.3 的唯一客户端键对使用服务；
 - 先检查 ready；
-- 判断普通同步还是长音频 async；
-- 选择 VAD、diarization 和 rich include；
+- 在普通同步、长音频 async 和会议转写三个动作间选择；
+- 会议转写需要候选人物时才列出并显式选择本次 known speaker，不自动列出；
 - 注册、列出、更新和删除人物；
-- 显式选择本次 known speaker；
 - 轮询 job，处理 terminal failure；
-- 输出带 speaker/timestamp 的会议记录；
-- 对 Unknown 和低 similarity 保持诚实；
+- 从 terminal `result.segments` 输出带 speaker/timestamp 的会议记录；
+- 原样保留 Unknown 和低 similarity；
 - 不泄漏 token、原始音频或人物声音样本。
 - “会议记录”在本产品内只表示带 speaker/timestamp 的转写投影；摘要、结论和行动项由下游 Agent 自行生成，不属于服务或 helper。
+- Skill/helper 不暴露任意 model、VAD、format、include 或 language 参数；高级
+  HTTP 组合由匹配 checkout 的离线 OpenAPI 和直接 API 调用承载。
 
 ### 15.3 Deterministic helper
 
@@ -1301,6 +1189,7 @@ Skill 指导 Agent：
 health
 transcribe
 transcribe-long
+transcribe-meeting AUDIO_FILE [SPEAKER_ID ...]
 job-get
 job-wait
 job-delete
@@ -1315,8 +1204,17 @@ speaker-delete
 
 - 不在 Skill 中实现第二个 ASR client library。
 - wrapper 不保存 API Key。
-- wrapper 按 §10.3 的白名单规则读取 `client.env`，允许进程环境做显式覆盖。
-- helper 启动前检查 `curl`；缺少时返回稳定错误和安装前置条件，不擅自安装。
+- wrapper 只消费 §10.3 的完整 paired process env；缺少、半对、空值或非法值
+  均在网络访问前 fail closed。它不定位或解析任何文件，也不增加命令行连接参数
+  或字段 alias。
+- helper 启动前检查 `curl`；缺少时返回稳定错误和运行前置条件，不代管 host package。
+- `transcribe-meeting AUDIO_FILE [SPEAKER_ID ...]` 固定发送
+  `Prefer: respond-async`、`model=sensevoice-diarize`、
+  `response_format=diarized_json`、`chunking_strategy=auto`，并把零到 32 个
+  显式 ID 作为重复 `known_speaker_ids[]` 发送；helper 不自动调用
+  `speaker-list`。ID 复用八位大写 Crockford Base32 校验，重复、格式错误或超过
+  32 个统一返回 `invalid_known_speaker_ids`，`param=known_speaker_ids[]`，
+  exit 65。
 - `job-wait JOB_ID TIMEOUT_SECONDS` 的 timeout 只接受十进制整数
   `1..999999999`；否则返回 `invalid_timeout_seconds`，
   `param=timeout_seconds`，exit 65。它把 Linux `/proc/uptime` 的第一个秒数字段
@@ -1330,11 +1228,12 @@ speaker-delete
   `curl_failed`；唯一例外是 `job-wait` 的 curl exit 28 后重新读取时钟且
   `now >= deadline`，此时返回 `job_wait_timeout`。
 - curl exit 0 时按命令 fail-closed：`health` 仅允许 HTTP 200，`transcribe`
-  仅允许 200，`transcribe-long` 仅允许 202，`job-get` 和 `job-wait` 仅允许
-  200/202，`job-delete` 仅允许 202/204，`speaker-list`、`speaker-get` 和
-  `speaker-put` 仅允许 200，`speaker-add` 仅允许 201，`speaker-delete` 仅允许
-  204。包括 3xx、畸形状态和其他状态在内的非白名单响应丢弃 body，返回
-  `unexpected_http_response`，`param=null`，exit 76。
+  仅允许 200，`transcribe-long` 和 `transcribe-meeting` 仅允许 202，
+  `job-get` 和 `job-wait` 仅允许 200/202，`job-delete` 仅允许 202/204，
+  `speaker-list`、`speaker-get` 和 `speaker-put` 仅允许 200，`speaker-add`
+  仅允许 201，`speaker-delete` 仅允许 204。包括 3xx、畸形状态和其他状态在内
+  的非白名单响应丢弃 body，返回 `unexpected_http_response`，`param=null`，
+  exit 76。
 - `job-wait` 的 HTTP 200 是 terminal：原样输出 JSON 并 exit 0；HTTP 202 是
   active：丢弃该次 JSON，重新读取 deadline 后才决定 timeout 或 sleep。
 - `job-delete JOB_ID` 复用严格 job ID 校验，对同一 job URL 发送 DELETE；HTTP
@@ -1352,135 +1251,65 @@ speaker-delete
 - `job-delete` 或 `speaker-delete` 的 HTTP 204 成功响应无输出；其余成功响应
   原样输出 JSON 供 Agent 处理，不替 Agent 生成总结。
 
-### 15.4 独立安装
+### 15.4 与服务产物匹配的 Skill source
 
-`install-asr-skill.sh --target <runtime>` 使用同一个 skill tarball；每次必须明确且只接受一个 target，不自动检测后静默选择：
+README 是各 Agent runtime 的人类使用位置、显式放置或 source reference 方式及
+配置后首次健康检查的唯一 owner，本文不复制这些路径或步骤。
 
-`install-asr-skill.sh` 的版本选择与 release tag 解析完全复用 §14.2 第 1 项和 §14.3；未指定版本时使用同一个本仓库 GitHub Releases latest stable release API，不维护第二个 latest pointer。
+官方固定版本 image 使用与 image version exact matching 的 canonical
+`vX.Y.Z` Git tag 中的 Skill；自定义 image 使用构建它的同一 checkout 中的
+Skill 或其打包产物，且不声称为官方兼容组合。这些只是显式使用提示，不构成
+installer、runtime 版本承诺或 support matrix；项目不自动探测、复制、切换或
+维护 host Skill 状态。
 
-| Runtime | 默认目录 |
-|---|---|
-| Codex | `~/.codex/skills/botified-asr` |
-| OpenClaw | `~/.agents/skills/botified-asr` |
-| Botified | `~/.local/share/botified/skills/botified-asr` |
-
-- 同一 tarball 是唯一内容来源。
-- target 只接受 `codex`、`openclaw`、`botified`。
-- 安装前校验 SHA-256。
-- artifact 解包和结构验证在独立 staging 完成；内容安装到版本目录，再以同文件系统临时 symlink + rename 原子切换 runtime discovery 路径。
-- 旧版本在切换成功后清理；任一步失败由 trap 保持或恢复原 symlink。普通目录占用目标路径时 fail fast，不递归覆盖用户内容。
-- 本地服务安装后的 Skill 自动使用既有 `client.env`；远程模式只把显式 URL/Key 写入同一文件。
-- 不把服务 URL 或 token 写入 Skill 内容。
-
-## 16. 测试策略
+## 16. 测试边界
 
 ### 16.1 测试原则
 
 - 测本服务拥有的契约，不复制 FunASR 单元测试。
 - 一个行为在最接近实现的层级测试一次。
+- 不用测试强制 README、OpenAPI 和 Skill 复制同一段 prose；OpenAPI wire 与
+  helper 映射分别在最接近其实现的位置验证。
 - API contract 用轻量 fake model adapter；真实模型路径用少量 integration/live smoke。
 - 不将几百 MB fixture 提交进 Git。
 - 性能和模型质量不放进每次普通 unit test。
 
 ### 16.2 Real model integration
 
-使用固定小样本覆盖：
-
-- 中文；
-- 英文；
-- 粤语；
-- 日语；
-- 韩语；
-- 静音；
-- 掌声或笑声；
-- 两人对话。
-
-只验证服务集成和输出结构，不把单句逐字结果写成脆弱 snapshot。
+只保留一份有合法来源的短音频。正式发布时，Linux x86_64 与 aarch64 各自在原生 Linux host 对 §14.1 随后以各自同一 digest 进入最终 tag 的 image 执行普通转写 smoke，验证 ready、真实模型接线和非空的结构化响应；不得 smoke 后重建发布 image。该 smoke 不承担语言、声音事件或模型质量矩阵，也不把逐字结果写成脆弱 snapshot。
 
 ### 16.3 长音频和恢复测试
 
-仓库只保存一个 checksum 固定、许可清晰的约 60 秒双人非静音 fixture。测试机使用固定命令重复编码：
+容量边界、取消清理、重启后未完成任务从头恢复、30 分钟 diarization 上限和 12 小时普通 ASR 上限，各自在最接近 owner 的层级保留一个代表性行为测试。exact 边界使用生成输入和 fake/fast adapter 验证限制值与越界后的首个单位，不要求 500 MiB 或 12 小时真实模型转写。
 
-```bash
-ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
-  -map 0:a:0 -ac 1 -ar 16000 -c:a pcm_s16le -t 16384 long.wav
-```
-
-脚本断言输出可完整解码、duration 为 `16384 ± 0.1` 秒且文件大小在 500–501 MiB；生成文件不提交 Git。另用同一 source 生成恰好 12 小时、低于 1 GiB 的固定 codec 压缩媒体，并断言实际 PCM sample count 为 12 小时；这些长文件只测试普通 ASR，不请求 diarization。
-
-模型 cache 预热后使用以下固定资源上限：
-
-- CPU container memory limit 8 GiB；
-- CUDA runner GPU memory budget 8 GiB，host container memory limit 8 GiB；
-- 相对 warm-ready baseline 的 host peak RSS 增量不超过 1 GiB；
-- 按 `processed_audio_secs` 分桶：首个音频小时后任一 30 分钟音频窗口的 RSS median 不得比首个音频小时 median 高 256 MiB，不依赖任务实际 wall time；
-- 不含预热 model cache 的 job data 磁盘增量不超过 2 GiB。
-
-以下五个场景分别覆盖对应边界：
-
-1. **500 MiB**：一个 job 完成 upload、decode 和 transcription，验证 byte/storage reservation、RSS/GPU/disk 上限，不注入状态机 fault。
-2. **12 小时普通 ASR**：一个压缩媒体 job 只验证实际 PCM duration cap、VAD cache plateau、有界资源和最终结果；不请求 diarization，也不重复承担 crash 测试。
-3. **Crash/CAS**：1–5 分钟 fixture 使用 fake/fast adapter 精确覆盖 `.complete` rename 前后、cancel-vs-success、receiving/deleting、shutdown marker 生命周期；另用跨越至少五个 inference unit 的中型真实模型任务做一次进程 `SIGKILL` 和从头恢复。
-4. **取消**：中型任务运行后 DELETE；五分钟内进入 cancelled，ffmpeg、partial、attempt artifact 和 reservation 清零，随后第二次 DELETE 删除 job。
-5. **公平性**：足够跨越至少五个 inference unit 的中型 job；先用 20 次预热短请求建立 idle p95，再在 long job running 时提交固定 10 秒同步请求，要求在 long job terminal 前完成且延迟不超过 idle p95 三倍加 5 秒。
-
-diarization 另保留一个边界测试组：
-
-- `ffprobe` 可确认 duration 大于 1,800 秒时，在 job publish/模型调用前返回 `413 diarization_too_long`；普通 `sensevoice` 对同一输入仍按 12 小时边界处理。
-- probe 未确认越界时，实际 decode 恰好 28,800,000 samples 可进入离线批处理；读到第 28,800,001 个 sample 时 fail closed 为 `diarization_too_long`，且没有 partial speaker/ASR 结果。
-- 30 分钟 fixture 验证 embedding anchor 约 2,400、speech PCM 为 `np.int16`、没有全量 float PCM，embedding/spectral workspace 在预期上界内。
-- fake CAM++ embedding 固定一个未知人数样本，覆盖 global-grid/no-off-grid final window、any-overlap retention、zero-filled island gaps、fixed logical center，以及 global Voronoi 后逐 true island 求交且不跨 island 合并；同一 fixture 继续固定 float64 clustering、未 clip negative cosine、stable pruning、scale-aware eigenvalue clamp、raw spectral `Y`、低频 normalized-gap、deterministic restart 和绝对时间投影的代表性输出。另覆盖 `N=0/1/2`、all-zero、无合格候选及超过 32 个匿名 cluster 的既有边界。
-- 构造同 label 跨 true VAD islands 及 within-island run 超过 480,000 samples 的样本，验证 island 边界保持 hard cut，within-island run 从 start 每 480,000 samples 切分且恰好等于上限时不切，所有 final segments 均保留同一 speaker label。
-- overlap fixture 固定首版单一主 speaker 输出，并验证完整文件 clustering 完成前不会产生 speaker segment。
-- diarization attempt 在 embedding、clustering 和 final ASR 三个位置分别 crash 后均从输入开头重跑，不恢复 segment/window/cluster checkpoint。
+这些测试不固定 host memory、磁盘或 p95 公平性阈值，不要求真实进程 `SIGKILL`，也不为同一恢复语义枚举多个故障位置；只有真实问题需要复现时才增加针对性用例。
 
 ### 16.4 Skill 测试
 
-同一 skill artifact：
-
-1. helper 全部子命令用 fake HTTP fixture 各验证请求映射、退出码和响应透传；真实服务只保留一条 helper health + short-transcription smoke。
-2. Codex、OpenClaw、Botified 的固定受支持版本分别在隔离 HOME 中显式 `--target` 安装同一 checksum artifact。
-3. 三个 runtime 各验证实际 discovery，并执行相同的 `health + 固定短转写`。
-
-三次 smoke 验证的是不同 runtime discovery 边界，不复制 async/speaker API 测试，也不维护三份 Skill 内容。
+helper 使用本地 fake HTTP fixture 验证各子命令的请求映射、退出码和响应透传。真实服务能力复用 §16.2 的既有 container 短转写 smoke，不为 Codex、OpenClaw 和 Botified 重复 discovery 或 API smoke，也不维护 runtime 版本 support matrix。
 
 ### 16.5 已知人物 best-effort 验证
 
-- 不设置本地校准、held-out 数据集、报告或准确率数字作为 production 启用门禁；真实样本只用于运行 smoke、复现真实问题和验证必要的策略调整。
-- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 FSMN-VAD -> 1.5s/0.75s global-time window embedding -> NumPy un-clipped affinity/stable pruning/symmetrization/absolute-degree Laplacian/low-frequency normalized-gap/deterministic k-means -> label projection/true-island hard cuts/same-island merge/within-island 480,000-sample split from run start -> ASR -> centroid matching -> response projection。
-- 以超过 32 个匿名 cluster 的 synthetic embedding 验证没有会议参与人数硬限制；另独立验证 `known_speaker_ids[]` 第 33 项只因命名候选边界被拒绝。
-- synthetic vector 只固定 `0.31`、唯一最高、低于阈值和最高分 exact tie 的数学边界；真实 fixture 在 model policy/revision 变化或真实问题需要复现时运行，不在每次普通 CI 重复，也不作为 production gate。
+- synthetic vector 在最接近实现的层级保留阈值、唯一最高、exact tie 和 Unknown 行为的代表性数学边界测试。
+- 真实 speaker/model 质量只在 adapter 或固定 model policy/revision 变化，或需要复现真实问题时针对性验证；不设置“两位 known + 一位 Unknown”的中英文会议、held-out 数据集、报告或准确率数字作为 release gate。
 
-## 17. 性能指标
+## 17. 性能测量边界
 
-基准覆盖以下指标，不在没有指定硬件时写死吞吐数字：
-
-- cold start / warm start；
-- 10 秒短音频 p50/p95；
-- 1 小时普通 ASR RTF；
-- 30 分钟离线 diarization RTF；
-- 500 MiB 测试总耗时；
-- manifest 声明 device 的 peak host/device memory；
-- diarization 开关前后成本；
-- 1、2、4 并发短请求；
-- 长 job 并行时短请求 p95。
-
-首版分别测量 `inference_lanes=1` 和 `inference_lanes=2` 的排队、吞吐、启动时间与 peak host/device memory；`2` 只有通过目标环境验证后才启用，禁止为追逐单次基准临时共享 model 实例或增加 job worker。
+只有真实负载、明确目标硬件和具体产品决策同时需要时才做针对性测量；不在本文中固化 benchmark 矩阵、report 或 release gate。
 
 ## 18. 安全和隐私边界
 
-- 默认只监听 loopback。
-- 公网部署由反向代理提供 TLS；安装器不自动签发证书。
+- 官方 Docker 命令仅把 host port 发布到 loopback。
 - 上传文件名不进入文件系统路径。
 - ffmpeg 使用无 shell argv。
 - SQLite、credential、job 和 speaker 数据目录权限最小化。
-- OCI container 使用非 root user、read-only rootfs，不使用 host network，只发布配置的 loopback 端口；仅挂载受控 data、revision-isolated model cache 和只读配置，其中 data root 与 model cache root 必须互不相等、互不嵌套并使用独立持久 mount，服务 secret 由 launcher 注入进程环境。
+- OCI container 使用非 root user；官方运行只发布 loopback host port，并把唯一 named volume 挂载到 `/data`。state root `/data/state` 与 revision-isolated model cache root `/data/models` 必须互不相等、互不嵌套；普通运行不挂 config，高级完整 YAML 只读挂载。服务 secret 与 Skill helper 客户端环境分别遵循 §10.2 和 §10.3：应用不读取 host env-file，helper 不读取任何 env/config 文件。
 - 原始音频和人物样本不进入日志、错误、metrics 或 crash report。
 - API 不返回 embedding。
 - 删除 profile 只立即删除主记录；已入队 job 的私有 embedding snapshot 保留到该 job 删除或 retention 清理，这是可恢复命名语义所需的最短生命周期。
 - Skill 不将 token 放入命令历史示例。
 - description 是不可信文本，只作为 metadata，不进入 prompt 或模型。
-- 发行运行时始终不注册 `/docs` 和 `/openapi.json`；release 离线 OpenAPI artifact 不包含 speaker 数据或其他实例数据。
+- 发行运行时始终不注册 `/docs` 和 `/openapi.json`；离线生成的 OpenAPI 不包含 speaker 数据或其他实例数据。
 
 ## 19. 明确非目标
 
@@ -1505,22 +1334,3 @@ diarization 另保留一个边界测试组：
 - resumable upload；
 - 自动摘要或会议行动项生成；
 - 数据标注和质量管理平台。
-- v1 不做跨版本原地升级；至少出现第二个真实 release 且发生真实 schema delta 后，才按实际迁移需求另行设计，不预留升级接口或兼容层。
-
-## 20. 风险和处理
-
-| 风险 | 处理 |
-|---|---|
-| 500 MiB 解码后内存膨胀 | streaming ffmpeg + bounded VAD segment |
-| 长 job 阻塞语音留言 | bounded batch 后释放 admission |
-| offline spectral workspace 随窗口数增长 | diarization 固定 30 分钟，1.5s/0.75s 全局锚点约 2,400，只保留 int16 speech PCM、embedding 和 bounded NumPy workspace |
-| 用户误以为支持实时 speaker 输出 | 只在完整文件 clustering、投影和 ASR 后返回 diarized result，API 不暴露临时 label 或 partial cluster |
-| 重叠语音归属错误 | 首版明确只输出单一主 speaker，并以真实中英文 overlap fixture 记录质量边界 |
-| 已知人物误匹配 | selected candidates 内唯一最高且 `>= 0.31` 才命名；低于阈值或最高分 exact tie 为 Unknown |
-| 不同麦克风影响声纹 | 多样本平均、best-effort；仅在真实问题出现后调整固定策略 |
-| 上游 mutable pipeline 状态 | 独立模型对象和本服务 orchestration，不逐请求改 AutoModel 配置 |
-| 上游升级破坏 token/timestamp | 精确 pin + real model smoke |
-| 异步结果与文件状态不一致 | receiving/deleting phase + per-attempt artifact + SQLite CAS 对账 |
-| 磁盘占满 | SQLite 原子 reservation + free-space floor + terminal retention |
-| Skill 三平台漂移 | 单一 tarball 和共同 SKILL.md |
-| 安装器破坏宿主环境 | OCI image，不安装 driver/runtime |

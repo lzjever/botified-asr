@@ -5,6 +5,10 @@ description: Check a configured Botified ASR service's readiness, transcribe loc
 
 # Botified ASR Client
 
+The runtime must inject `BOTIFIED_ASR_BASE_URL` and `BOTIFIED_ASR_API_KEY` into
+the helper process as a complete pair. The helper does not locate or parse
+configuration files.
+
 Resolve `scripts/botified-asr` relative to this `SKILL.md` (the skill root), then
 first run `scripts/botified-asr health`. Only after it returns ready, run
 `scripts/botified-asr transcribe AUDIO_FILE` for a basic transcription, or

@@ -80,15 +80,12 @@ exit "$FAKE_CURL_EXIT"
     stderr_path.write_bytes(stderr)
     args_path = tmp_path / "curl-args"
     stdin_path = tmp_path / "curl-stdin"
-    config_home = tmp_path / "config home"
-    home = tmp_path / "home"
-    home.mkdir()
     environment = os.environ.copy()
     environment.update(
         {
             "PATH": f"{fake_bin}:/usr/bin:/bin",
-            "XDG_CONFIG_HOME": str(config_home),
-            "HOME": str(home),
+            "BOTIFIED_ASR_BASE_URL": "https://asr.example:17770/",
+            "BOTIFIED_ASR_API_KEY": TOKEN,
             "FAKE_CURL_ARGS": str(args_path),
             "FAKE_CURL_STDIN": str(stdin_path),
             "FAKE_CURL_BODY": str(body_path),
@@ -99,8 +96,6 @@ exit "$FAKE_CURL_EXIT"
             "FAKE_CURL_UPLOAD": str(tmp_path / "curl-upload"),
         }
     )
-    environment.pop("BOTIFIED_ASR_BASE_URL", None)
-    environment.pop("BOTIFIED_ASR_API_KEY", None)
     return environment, args_path, stdin_path
 
 
@@ -183,34 +178,6 @@ exit 0
         }
     )
     return environment, traces, sleep_log
-
-
-def _write_client_config(
-    environment: dict[str, str],
-    content: bytes,
-    *,
-    mode: int = 0o600,
-) -> Path:
-    path = (
-        Path(environment["XDG_CONFIG_HOME"])
-        / "botified-asr"
-        / "client.env"
-    )
-    path.parent.mkdir(parents=True)
-    path.write_bytes(content)
-    path.chmod(mode)
-    return path
-
-
-def _valid_config(
-    *,
-    base_url: str = "https://asr.example:17770/",
-    token: str = TOKEN,
-) -> bytes:
-    return (
-        f"BOTIFIED_ASR_BASE_URL={base_url}\n"
-        f"BOTIFIED_ASR_API_KEY={token}\n"
-    ).encode()
 
 
 def _run(
@@ -503,175 +470,28 @@ def test_missing_curl_is_stable(tmp_path: Path) -> None:
     assert result.stderr == b""
 
 
-def test_missing_config_returns_a_json_safe_canonical_path(tmp_path: Path) -> None:
+def test_helper_requires_paired_process_environment(
+    tmp_path: Path,
+) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    config_home = tmp_path / 'config "quoted" \\ root'
+    config_home = tmp_path / "legacy-config"
+    client_file = config_home / "botified-asr" / "client.env"
+    client_file.parent.mkdir(parents=True)
+    client_file.write_text(
+        "BOTIFIED_ASR_BASE_URL=https://legacy.example\n"
+        f"BOTIFIED_ASR_API_KEY={TOKEN}\n",
+        encoding="utf-8",
+    )
+    client_file.chmod(0o600)
     environment["XDG_CONFIG_HOME"] = str(config_home)
-
-    result = _run(environment, "health")
-
-    payload = json.loads(result.stdout)
-    assert result.returncode == 78
-    assert payload["error"]["code"] == "client_not_configured"
-    assert payload["client_config_path"] == str(
-        config_home / "botified-asr" / "client.env"
-    )
-    assert result.stderr == b""
-    assert not args_path.exists()
-
-
-@pytest.mark.parametrize(
-    ("xdg_config_home", "home"),
-    [
-        ("relative/config", "/valid/home"),
-        ("/bad\tconfig", "/valid/home"),
-        (None, None),
-        (None, ""),
-        (None, "relative/home"),
-    ],
-)
-def test_invalid_client_config_roots_fail_before_file_or_curl(
-    tmp_path: Path,
-    xdg_config_home: str | None,
-    home: str | None,
-) -> None:
-    environment, args_path, _ = _install_fake_curl(tmp_path)
-    if xdg_config_home is None:
-        environment.pop("XDG_CONFIG_HOME", None)
-    else:
-        environment["XDG_CONFIG_HOME"] = xdg_config_home
-    if home is None:
-        environment.pop("HOME", None)
-    else:
-        environment["HOME"] = home
+    environment.pop("BOTIFIED_ASR_BASE_URL")
+    environment.pop("BOTIFIED_ASR_API_KEY")
 
     result = _run(environment, "health")
 
     assert result.returncode == 78
     assert _error_code(result) == "invalid_client_config"
     assert result.stderr == b""
-    assert not args_path.exists()
-
-
-def test_empty_xdg_config_home_falls_back_to_home(tmp_path: Path) -> None:
-    environment, _, _ = _install_fake_curl(tmp_path)
-    environment["XDG_CONFIG_HOME"] = ""
-    home = tmp_path / "fallback-home"
-    environment["HOME"] = str(home)
-    path = home / ".config" / "botified-asr" / "client.env"
-    path.parent.mkdir(parents=True)
-    path.write_bytes(_valid_config())
-    path.chmod(0o600)
-
-    result = _run(environment, "health")
-
-    assert result.returncode == 0
-    assert result.stdout == b'{"status":"ready"}'
-    assert result.stderr == b""
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        b"",
-        b"\nBOTIFIED_ASR_BASE_URL=https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b"# comment\nBOTIFIED_ASR_BASE_URL=https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b"export BOTIFIED_ASR_BASE_URL=https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b" BOTIFIED_ASR_BASE_URL=https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b"BOTIFIED_ASR_BASE_URL =https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b"BOTIFIED_ASR_BASE_URL=https://asr.example\n",
-        b"BOTIFIED_ASR_BASE_URL=https://one.example\n"
-        b"BOTIFIED_ASR_BASE_URL=https://two.example\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-        b"BOTIFIED_ASR_BASE_URL=https://asr.example\n"
-        b"BOTIFIED_ASR_API_KEY=one\n"
-        b"BOTIFIED_ASR_API_KEY=two\n",
-        b"BOTIFIED_ASR_BASE_URL=https://asr.example\r\n"
-        b"BOTIFIED_ASR_API_KEY=token\n",
-    ],
-)
-def test_malformed_client_file_is_rejected_without_curl_or_secret_leak(
-    tmp_path: Path,
-    content: bytes,
-) -> None:
-    environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, content)
-
-    result = _run(environment, "health")
-
-    assert result.returncode == 78
-    assert _error_code(result) == "invalid_client_config"
-    assert result.stderr == b""
-    assert b"one" not in result.stdout
-    assert b"two" not in result.stdout
-    assert not args_path.exists()
-
-
-def test_client_file_is_never_executed(tmp_path: Path) -> None:
-    environment, args_path, _ = _install_fake_curl(tmp_path)
-    sentinel = tmp_path / "executed"
-    _write_client_config(
-        environment,
-        (
-            "BOTIFIED_ASR_BASE_URL=https://asr.example\n"
-            f"EVIL=$(touch {sentinel})\n"
-            "BOTIFIED_ASR_API_KEY=token\n"
-        ).encode(),
-    )
-
-    result = _run(environment, "health")
-
-    assert result.returncode == 78
-    assert _error_code(result) == "invalid_client_config"
-    assert not sentinel.exists()
-    assert not args_path.exists()
-
-
-@pytest.mark.parametrize("mode", [0o000, 0o200, 0o400, 0o640])
-def test_client_file_mode_must_be_exactly_0600(
-    tmp_path: Path,
-    mode: int,
-) -> None:
-    environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config(), mode=mode)
-
-    result = _run(environment, "health")
-
-    assert result.returncode == 78
-    assert _error_code(result) == "invalid_client_config"
-    assert result.stderr == b""
-    assert not args_path.exists()
-
-
-@pytest.mark.parametrize("unsafe_kind", ["symlink", "directory"])
-def test_client_file_must_be_private_regular_and_not_a_symlink(
-    tmp_path: Path,
-    unsafe_kind: str,
-) -> None:
-    environment, args_path, _ = _install_fake_curl(tmp_path)
-    path = (
-        Path(environment["XDG_CONFIG_HOME"])
-        / "botified-asr"
-        / "client.env"
-    )
-    path.parent.mkdir(parents=True)
-    if unsafe_kind == "symlink":
-        target = tmp_path / "real-client.env"
-        target.write_bytes(_valid_config())
-        target.chmod(0o600)
-        path.symlink_to(target)
-    else:
-        path.mkdir()
-
-    result = _run(environment, "health")
-
-    assert result.returncode == 78
-    assert _error_code(result) == "invalid_client_config"
     assert not args_path.exists()
 
 
@@ -697,16 +517,13 @@ def test_shell_xtrace_never_exposes_the_environment_override(
     assert TOKEN.encode() not in result.stderr
 
 
-def test_paired_environment_override_does_not_read_the_client_file(
+def test_paired_process_environment_is_used_without_child_environment_leak(
     tmp_path: Path,
 ) -> None:
     environment, args_path, stdin_path = _install_fake_curl(tmp_path)
-    _write_client_config(environment, b"this file must not be read\n", mode=0)
-    environment.pop("XDG_CONFIG_HOME")
-    environment.pop("HOME")
     environment.update(
         {
-            "BOTIFIED_ASR_BASE_URL": "https://override.example/",
+            "BOTIFIED_ASR_BASE_URL": "https://asr.example/",
             "BOTIFIED_ASR_API_KEY": TOKEN,
         }
     )
@@ -734,13 +551,14 @@ def test_paired_environment_override_does_not_read_the_client_file(
         ("", "token"),
     ],
 )
-def test_environment_override_must_be_present_valid_and_paired(
+def test_process_environment_must_be_present_nonempty_and_paired(
     tmp_path: Path,
     base_url: str | None,
     api_key: str | None,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
+    environment.pop("BOTIFIED_ASR_BASE_URL")
+    environment.pop("BOTIFIED_ASR_API_KEY")
     if base_url is not None:
         environment["BOTIFIED_ASR_BASE_URL"] = base_url
     if api_key is not None:
@@ -781,7 +599,7 @@ def test_base_url_must_be_a_strict_http_origin(
     base_url: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config(base_url=base_url))
+    environment["BOTIFIED_ASR_BASE_URL"] = base_url
 
     result = _run(environment, "health")
 
@@ -799,7 +617,7 @@ def test_api_key_must_be_an_exact_ascii_rfc6750_b64token(
     api_key: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config(token=api_key))
+    environment["BOTIFIED_ASR_API_KEY"] = api_key
 
     result = _run(environment, "health")
 
@@ -827,13 +645,15 @@ def test_client_configuration_errors_precede_local_input_validation(
     arguments: tuple[str, ...],
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
+    environment.pop("BOTIFIED_ASR_BASE_URL")
+    environment.pop("BOTIFIED_ASR_API_KEY")
     local_input = str(tmp_path / arguments[1])
     local_arguments = (arguments[0], local_input, *arguments[2:])
 
     result = _run(environment, *local_arguments)
 
     assert result.returncode == 78
-    assert _error_code(result) == "client_not_configured"
+    assert _error_code(result) == "invalid_client_config"
     assert result.stderr == b""
     assert local_input.encode() not in result.stdout + result.stderr
     assert not args_path.exists()
@@ -848,7 +668,6 @@ def test_transcribe_requires_a_readable_regular_audio_file(
     invalid_kind: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     audio_path = tmp_path / f"invalid-{invalid_kind}.wav"
     if invalid_kind == "directory":
         audio_path.mkdir()
@@ -872,7 +691,6 @@ def test_audio_fd_open_failure_is_stable_and_does_not_call_curl(
     tmp_path: Path,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     audio_path = tmp_path / "removed-after-validation.wav"
     audio_path.write_bytes(b"audio")
     fake_bin = Path(environment["PATH"].split(":", 1)[0])
@@ -900,7 +718,6 @@ def test_transcribe_long_reuses_audio_file_validation(
     tmp_path: Path,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     audio_path = tmp_path / "missing-long-audio.wav"
 
     result = _run(environment, "transcribe-long", str(audio_path))
@@ -933,7 +750,6 @@ def test_job_get_rejects_invalid_job_id_without_request_or_echo(
     job_id: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "job-get", job_id)
 
@@ -992,7 +808,6 @@ def test_transcribe_long_submits_one_private_async_request(
         exit_code=curl_exit,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
     target = tmp_path / "real-long-audio.wav"
     audio_bytes = b"long local audio bytes"
     target.write_bytes(audio_bytes)
@@ -1093,7 +908,6 @@ def test_transcribe_meeting_submits_exact_private_async_request(
         body=body,
         http_code="202",
     )
-    _write_client_config(environment, _valid_config())
     target = tmp_path / "real-meeting-audio.wav"
     audio_bytes = b"private meeting audio bytes"
     target.write_bytes(audio_bytes)
@@ -1171,7 +985,6 @@ def test_transcribe_meeting_rejects_invalid_known_speakers_before_curl(
     known_speaker_ids: tuple[str, ...],
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     audio_path = tmp_path / "meeting.wav"
     audio_path.write_bytes(b"meeting audio")
 
@@ -1246,7 +1059,6 @@ def test_job_get_preserves_responses_and_shared_errors(
         exit_code=curl_exit,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "job-get", "7K3M9Q2W")
 
@@ -1322,7 +1134,6 @@ def test_job_wait_discards_active_responses_and_caps_backoff(
             (terminal, "200", 0, "0"),
         ],
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(
         environment,
@@ -1408,7 +1219,6 @@ def test_job_wait_rejects_invalid_timeout_after_configuration(
     timeout_seconds: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
 
     result = _run(
         environment,
@@ -1438,7 +1248,6 @@ def test_job_commands_reuse_strict_job_id_validation(
     arguments: tuple[str, ...],
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, *arguments)
 
@@ -1458,7 +1267,6 @@ def test_speaker_commands_reject_dangerous_id_without_request_or_echo(
     command_name: str,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
 
     if command_name == "speaker-put":
         command_arguments = ("../health", "Ada")
@@ -1557,7 +1365,6 @@ def test_job_wait_http_and_transport_precedence(
         tmp_path,
         [(body, http_code, curl_exit, "0")],
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "job-wait", "7K3M9Q2W", "10")
 
@@ -1579,7 +1386,6 @@ def test_job_wait_maps_curl_28_to_timeout_only_after_deadline(
         tmp_path,
         [(private_body, "000", 28, "1.05")],
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "job-wait", "7K3M9Q2W", "1")
 
@@ -1610,7 +1416,6 @@ def test_job_wait_term_exits_and_cleans_without_another_request(
             ),
         ],
     )
-    _write_client_config(environment, _valid_config())
     sleep_ready = traces / "sleep-ready"
     sleep_pid_path = traces / "sleep-pid"
     temporary_root = tmp_path / "private-tmp"
@@ -1684,7 +1489,6 @@ def test_job_wait_term_reaps_blocked_curl_and_cleans(
         tmp_path,
         [(b"", "000", 0, "0")],
     )
-    _write_client_config(environment, _valid_config())
     curl_ready = traces / "curl-ready"
     curl_pid_path = traces / "curl-pid"
     temporary_root = tmp_path / "private-tmp"
@@ -1780,7 +1584,6 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
         body=private_body,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
     if command_name in {
         "transcribe",
         "transcribe-long",
@@ -1830,7 +1633,6 @@ def test_speaker_add_posts_literal_name_and_five_private_samples(
         body=body,
         http_code="201",
     )
-    _write_client_config(environment, _valid_config())
     sample_paths = []
     sample_bytes = []
     for index in range(1, 6):
@@ -1920,7 +1722,6 @@ def test_speaker_add_rejects_an_empty_sample_without_echoing_its_path(
     tmp_path: Path,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     valid_sample = tmp_path / "valid.wav"
     valid_sample.write_bytes(b"voice")
     invalid_sample = tmp_path / "private-empty.wav"
@@ -1946,7 +1747,6 @@ def test_speaker_add_fd_open_failure_does_not_echo_the_sample_path(
     tmp_path: Path,
 ) -> None:
     environment, args_path, _ = _install_fake_curl(tmp_path)
-    _write_client_config(environment, _valid_config())
     first_sample = tmp_path / "first.wav"
     first_sample.write_bytes(b"voice")
     removed_sample = tmp_path / "removed-after-validation.wav"
@@ -2003,7 +1803,6 @@ def test_speaker_put_preserves_literal_description_tristate(
         body=body,
         http_code="200",
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(
         environment,
@@ -2118,7 +1917,6 @@ def test_speaker_commands_use_the_existing_profile_endpoints(
         body=body,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, command_name, *command_arguments)
 
@@ -2172,7 +1970,6 @@ def test_speaker_get_preserves_one_service_error_body(tmp_path: Path) -> None:
         exit_code=22,
         http_code="404",
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "speaker-get", "7K3M9Q2W")
 
@@ -2231,7 +2028,6 @@ def test_job_delete_uses_one_delete_request_and_shared_boundaries(
         exit_code=curl_exit,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "job-delete", "7K3M9Q2W")
 
@@ -2316,7 +2112,6 @@ def test_transcribe_curl_boundary_uses_fd3_and_shared_errors(
         exit_code=curl_exit,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
     target = tmp_path / "real-audio.wav"
     audio_bytes = b"dangerous local audio bytes"
     target.write_bytes(audio_bytes)
@@ -2433,7 +2228,6 @@ def test_health_curl_boundary_is_private_and_preserves_public_results(
         exit_code=curl_exit,
         http_code=http_code,
     )
-    _write_client_config(environment, _valid_config())
 
     result = _run(environment, "health")
 

@@ -114,10 +114,6 @@ curl_failed() {
     exit "$1"
 }
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
 read_monotonic_centiseconds() {
     uptime_contents=$(cat /proc/uptime 2>/dev/null) ||
         job_wait_unavailable
@@ -335,89 +331,13 @@ fi
 base_url_is_set=${BOTIFIED_ASR_BASE_URL+x}
 api_key_is_set=${BOTIFIED_ASR_API_KEY+x}
 
-if [ "$base_url_is_set" != "$api_key_is_set" ]; then
+if [ "$base_url_is_set" != "x" ] || [ "$api_key_is_set" != "x" ]; then
     invalid_client_config
 fi
 
-if [ "$base_url_is_set" = "x" ]; then
-    base_url=$BOTIFIED_ASR_BASE_URL
-    api_key=$BOTIFIED_ASR_API_KEY
-    unset BOTIFIED_ASR_BASE_URL BOTIFIED_ASR_API_KEY
-else
-    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
-        client_config_root=$XDG_CONFIG_HOME
-    else
-        if [ -z "${HOME:-}" ]; then
-            invalid_client_config
-        fi
-        client_config_root=$HOME/.config
-    fi
-
-    case "$client_config_root" in
-        "" | *[[:cntrl:]]*)
-            invalid_client_config
-            ;;
-        /*)
-            ;;
-        *)
-            invalid_client_config
-            ;;
-    esac
-
-    client_config_path=$client_config_root/botified-asr/client.env
-    if [ -L "$client_config_path" ]; then
-        invalid_client_config
-    fi
-    if [ ! -e "$client_config_path" ]; then
-        escaped_path=$(json_escape "$client_config_path") ||
-            invalid_client_config
-        printf \
-            '{"error":{"message":"Botified ASR client is not configured","type":"client_error","param":null,"code":"client_not_configured"},"client_config_path":"%s"}\n' \
-            "$escaped_path"
-        exit 78
-    fi
-    if [ ! -f "$client_config_path" ]; then
-        invalid_client_config
-    fi
-    client_config_mode=$(
-        stat -c '%a' -- "$client_config_path" 2>/dev/null
-    ) || invalid_client_config
-    if [ "$client_config_mode" != "600" ]; then
-        invalid_client_config
-    fi
-
-    base_url_seen=0
-    api_key_seen=0
-    base_url=
-    api_key=
-    while IFS= read -r config_line || [ -n "$config_line" ]; do
-        case "$config_line" in
-            "" | *[[:cntrl:]]*)
-                invalid_client_config
-                ;;
-            BOTIFIED_ASR_BASE_URL=*)
-                if [ "$base_url_seen" -ne 0 ]; then
-                    invalid_client_config
-                fi
-                base_url=${config_line#BOTIFIED_ASR_BASE_URL=}
-                base_url_seen=1
-                ;;
-            BOTIFIED_ASR_API_KEY=*)
-                if [ "$api_key_seen" -ne 0 ]; then
-                    invalid_client_config
-                fi
-                api_key=${config_line#BOTIFIED_ASR_API_KEY=}
-                api_key_seen=1
-                ;;
-            *)
-                invalid_client_config
-                ;;
-        esac
-    done <"$client_config_path"
-    if [ "$base_url_seen" -ne 1 ] || [ "$api_key_seen" -ne 1 ]; then
-        invalid_client_config
-    fi
-fi
+base_url=$BOTIFIED_ASR_BASE_URL
+api_key=$BOTIFIED_ASR_API_KEY
+unset BOTIFIED_ASR_BASE_URL BOTIFIED_ASR_API_KEY
 
 case "$base_url" in
     "" | *[[:space:]]* | *[[:cntrl:]]* | *"@"* | *"?"* | *"#"*)

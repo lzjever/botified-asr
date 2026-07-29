@@ -20,37 +20,32 @@ or authorization.
 
 ## Run the CPU container
 
-The supported production artifact is the fixed-version, multi-architecture CPU
-image. It supports Linux x86_64 and aarch64; no mutable `latest` tag is
-published.
+Formally released versions use a fixed-version, multi-architecture CPU image.
+It supports Linux x86_64 and aarch64; no mutable `latest` tag is published.
 
-Create the client connection file with a random API key:
+Create a private Docker environment file with a random API key:
 
 ```bash
-client_dir="${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr"
-client_env="$client_dir/client.env"
 umask 077
-mkdir -p "$client_dir"
-chmod 700 "$client_dir"
-api_key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-cat > "$client_env" <<EOF
-BOTIFIED_ASR_BASE_URL=http://127.0.0.1:17770
-BOTIFIED_ASR_API_KEY=$api_key
-EOF
-chmod 600 "$client_env"
+export BOTIFIED_ASR_API_KEY="$(
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+)"
+printf 'BOTIFIED_ASR_API_KEY=%s\n' "$BOTIFIED_ASR_API_KEY" \
+  > ./botified-asr.env
+chmod 600 ./botified-asr.env
 ```
 
-The service and the Botified ASR Skill use this same mode `0600` file. Start
-the current fixed version:
+This file configures only the service container. After a version is formally
+released, replace `vX.Y.Z` below with its actual fixed tag:
 
 ```bash
 docker run --detach \
   --name botified-asr \
   --restart on-failure:3 \
-  --env-file "${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env" \
+  --env-file ./botified-asr.env \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
-  ghcr.io/lzjever/botified-asr:v0.0.0
+  ghcr.io/lzjever/botified-asr:vX.Y.Z
 ```
 
 Docker creates the named volume if needed. `/data/state` holds the database,
@@ -63,12 +58,9 @@ Inspect the logs, then make an authenticated ready request:
 ```bash
 docker logs botified-asr
 
-client_env="${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env"
-base_url="$(sed -n 's/^BOTIFIED_ASR_BASE_URL=//p' "$client_env")"
-api_key="$(sed -n 's/^BOTIFIED_ASR_API_KEY=//p' "$client_env")"
 curl --fail-with-body \
-  --header "Authorization: Bearer $api_key" \
-  "$base_url/health/ready"
+  --header "Authorization: Bearer $BOTIFIED_ASR_API_KEY" \
+  http://127.0.0.1:17770/health/ready
 ```
 
 ### Advanced container configuration
@@ -83,11 +75,11 @@ the image version. Copy and edit the whole file, keeping `/data/state` and
 docker run --detach \
   --name botified-asr \
   --restart on-failure:3 \
-  --env-file "${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env" \
+  --env-file ./botified-asr.env \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
   --mount type=bind,src=/absolute/path/config.yaml,dst=/etc/botified-asr/custom.yaml,readonly \
-  ghcr.io/lzjever/botified-asr:v0.0.0 \
+  ghcr.io/lzjever/botified-asr:vX.Y.Z \
   --config /etc/botified-asr/custom.yaml
 ```
 
@@ -152,8 +144,10 @@ or point `skills/botified-asr` at one runtime location: Codex
 `~/.codex/skills/botified-asr`, OpenClaw
 `~/.agents/skills/botified-asr`, or Botified
 `~/.local/share/botified/skills/botified-asr`. The project does not discover or
-copy the Skill automatically. After configuring `client.env`, from that Skill
-root first run `scripts/botified-asr health`.
+copy the Skill automatically. The selected runtime must inject the deployed
+service's `BOTIFIED_ASR_BASE_URL` and `BOTIFIED_ASR_API_KEY` as a complete pair
+into the helper process. The helper does not locate or parse configuration
+files. From the Skill root, first run `scripts/botified-asr health`.
 
 The runtime does not serve an OpenAPI endpoint.
 

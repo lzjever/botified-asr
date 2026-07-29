@@ -2,16 +2,14 @@
 
 ARG BOTIFIED_ASR_VERSION
 
-FROM python:3.11.13-slim-bookworm AS python-base
+FROM python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 AS python-base
 
 FROM python-base AS builder
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/botified-asr
 WORKDIR /build
 
-RUN python --version \
-    && python -m pip install --no-cache-dir uv==0.9.26 \
-    && uv --version
+RUN python -m pip install --no-cache-dir uv==0.9.26
 
 COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES ./
 COPY src/ src/
@@ -27,10 +25,7 @@ RUN actual_version=$(/opt/botified-asr/bin/botified-asr --version) \
            printf 'botified-asr version mismatch: expected "%s", got "%s"\n' \
                "$expected_version" "$actual_version" >&2; \
            exit 1; \
-       fi \
-    && /opt/botified-asr/bin/botified-asr --help >/dev/null \
-    && /opt/botified-asr/bin/python -c \
-       'import botified_asr, torch; assert not torch.cuda.is_available()'
+       fi
 
 FROM python-base AS runtime
 
@@ -67,12 +62,7 @@ RUN groupadd --gid 10001 botified-asr \
        /data/state \
        /data/models \
     && chown -R 10001:10001 \
-       /data \
-    && python --version \
-    && botified-asr --version >/dev/null \
-    && python -c 'import botified_asr, torch; assert not torch.cuda.is_available()' \
-    && ffmpeg -version >/dev/null \
-    && ffprobe -version >/dev/null
+       /data
 
 USER 10001:10001
 

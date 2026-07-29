@@ -17,12 +17,13 @@
 
 ## 产品与架构边界
 
-- 产品目标是单部署实例的多用户并发 ASR 服务；当前必须支持并发 HTTP、有界持久队列、有限且可配置的推理并发、匿名说话人与已注册人物识别，以及取消、容量控制、结果持久化和重启恢复，并交付可拉取、可运行、可验证的 CPU 首版。
+- 当前产品是单部署实例的多用户并发 ASR 服务，已支持并发 HTTP、有界持久队列、有限且可配置的推理并发、匿名说话人与已注册人物识别，以及取消、容量控制、结果持久化和重启恢复；正式发布时的 CPU 产物必须可拉取、可运行、可验证。
 - CPU 首版公开部署面仅为固定版本 OCI image 与 README 中的直接 Docker 运行；不实现 host installer、systemd/unit/wrapper、repair、upgrade/rollback、uninstall 或 multi-engine orchestration。该公开部署边界不限制 source development、完整 `--config` YAML、power user 自定义 Docker build 或唯一 Skill 源码的直接使用与打包。
+- 持久环境配置职责保持最小：Docker `--env-file` 的路径与生命周期由用户管理，文件只向服务进程注入 `BOTIFIED_ASR_API_KEY`；Skill helper 只接受完整 paired process env `BOTIFIED_ASR_BASE_URL` 与 `BOTIFIED_ASR_API_KEY`，不定位或解析任何配置文件。
 - 未完成任务在恢复时从头重跑，不做 segment checkpoint；允许实现上述需求必需的状态与一致性机制。
 - 禁止预建多节点、外部 broker、跨机器抢占、exactly-once、推测性扩展或高频无意义 DB 写入；分布式扩容只能由真实负载数据驱动。
 - 实现偏离这些边界时，立即暂停扩展，在原位置简化或删除偏离内容，并以测试固定修正后的行为。
-- speaker/diarization 以随 release 固定的服务端策略 best-effort 提供，不承诺匿名 speaker 数量、边界或 known 命名准确率；缺少本地校准、held-out 数据或报告不得阻止 production，也不得向客户端开放调参。仅在真实使用问题证明有必要时调整策略；模型输出、结构一致性和容量边界仍须 fail closed。
+- 当前已实现的 speaker/diarization 以随 release 固定的服务端策略 best-effort 提供，不承诺匿名 speaker 数量、边界或 known 命名准确率；缺少本地校准、held-out 数据或报告不得阻止 production，也不得向客户端开放调参。仅在真实使用问题证明有必要时调整策略；模型输出、结构一致性和容量边界仍须 fail closed。
 - embedding fingerprint 只表示向量提取与聚合的兼容性；决策阈值变化不得强制已有 speaker 重新注册。
 
 ## 文档与治理边界
@@ -38,8 +39,7 @@
 
 - 工作与写入范围仅限本 `botified-asr` 仓库；其他仓库只可只读参考，未经用户对具体仓库明确、单独授权，不得修改、提交、推送或以其他方式改变其任何状态。
 - 保持改动聚焦，避免顺手重构、全文件格式化和无关清理。
-- 同时只推进一个主要产品切片及必要的独立审查；完成实现、测试和提交闭环后再进入下一项。
-- 近期切片依次为固定策略启用 enrollment、保守 known speaker 命名、离线 OpenAPI、Skill `speaker-add`、最小结构化日志、README 直接 Docker 运行与容器发布、license/notices、真实运行 smoke；CPU 首版完成前不启动 CUDA 或新架构。
+- 同时只推进一个由当前用户目标授权的主要产品切片；按变更风险执行必要验证，不因文档中的其他能力自动开启后续切片、独立审查、提交或发布。
 - 尊重现有工作区改动；未经授权不得覆盖、删除或改写。
 - 新增文件前先确认现有位置无法承载该事实。
 - 完成前检查实现、测试和文档是否存在重复或不必要的治理负担。
