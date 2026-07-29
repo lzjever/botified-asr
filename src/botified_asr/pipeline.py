@@ -28,7 +28,16 @@ from botified_asr.speaker_snapshot import (
     SelectedSpeaker,
     SelectedSpeakerSnapshot,
 )
-from botified_asr.speakers import is_anonymous_speaker_label
+from botified_asr.speakers import (
+    SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS,
+    SPEAKER_EMBEDDING_DIMENSION,
+    SPEAKER_EMBEDDING_NORM_TOLERANCE,
+    SPEAKER_WINDOW_MAX_SAMPLES,
+    SPEAKER_WINDOW_SHIFT_SAMPLES,
+    SpeakerEmbeddingAdapter,
+    SpeakerEmbeddingWindow,
+    is_anonymous_speaker_label,
+)
 
 ASR_BATCH_MAX_SEGMENTS = 32
 ASR_BATCH_MAX_PCM_SAMPLES = 960_000
@@ -178,6 +187,152 @@ def canonical_speech_pcm(segment: object) -> np.ndarray:
             "Speech segmenter returned an invalid segment",
         )
     return canonical_pcm
+
+
+def _embed_global_speaker_windows(
+    segments: tuple[BufferedSpeechSegment, ...],
+    *,
+    total_samples: int,
+    speaker_adapter: SpeakerEmbeddingAdapter,
+) -> tuple[SpeakerEmbeddingWindow, ...]:
+    def invalid_output() -> PipelineError:
+        return PipelineError(
+            "invalid_model_output",
+            "Speaker embedding input or output is invalid",
+        )
+
+    if type(segments) is not tuple:
+        raise invalid_output()
+    if type(total_samples) is not int or total_samples < 0:
+        raise invalid_output()
+
+    canonical_segments: list[tuple[SpeechSpan, np.ndarray]] = []
+    previous_end = 0
+    for segment in segments:
+        if (
+            not isinstance(segment, BufferedSpeechSegment)
+            or type(segment.span.start_sample) is not int
+            or type(segment.span.end_sample) is not int
+            or type(segment.pcm_start_sample) is not int
+            or not isinstance(segment.pcm, np.ndarray)
+            or segment.pcm.dtype != np.int16
+            or segment.pcm.ndim != 1
+            or not segment.pcm.flags.c_contiguous
+            or segment.pcm_start_sample < 0
+            or segment.span.start_sample < segment.pcm_start_sample
+            or segment.span.end_sample <= segment.span.start_sample
+            or len(segment.pcm)
+            != segment.span.end_sample - segment.pcm_start_sample
+            or len(segment.pcm) > DIRECT_MAX_SAMPLES
+            or segment.span.start_sample < previous_end
+            or segment.span.end_sample > total_samples
+        ):
+            raise invalid_output()
+        try:
+            pcm = canonical_speech_pcm(segment)
+        except PipelineError as error:
+            raise invalid_output() from error
+        canonical_segments.append((segment.span, pcm))
+        previous_end = segment.span.end_sample
+
+    if not canonical_segments:
+        return ()
+
+    windows: list[SpeakerEmbeddingWindow] = []
+    pending_ranges: list[tuple[int, int]] = []
+    pending_pcms: list[np.ndarray] = []
+
+    def flush() -> None:
+        if not pending_pcms:
+            return
+        embeddings = speaker_adapter.embed_exact_windows(tuple(pending_pcms))
+        if type(embeddings) is not tuple or len(embeddings) != len(pending_ranges):
+            raise invalid_output()
+        for (start_sample, end_sample), embedding in zip(
+            pending_ranges,
+            embeddings,
+            strict=True,
+        ):
+            if (
+                not isinstance(embedding, np.ndarray)
+                or embedding.dtype != np.float32
+                or embedding.shape != (SPEAKER_EMBEDDING_DIMENSION,)
+                or not embedding.flags.c_contiguous
+                or not np.isfinite(embedding).all()
+            ):
+                raise invalid_output()
+            norm = float(
+                np.linalg.norm(embedding.astype(np.float64, copy=False))
+            )
+            if (
+                not np.isfinite(norm)
+                or not np.isclose(
+                    norm,
+                    1.0,
+                    rtol=0.0,
+                    atol=SPEAKER_EMBEDDING_NORM_TOLERANCE,
+                )
+            ):
+                raise invalid_output()
+            windows.append(
+                SpeakerEmbeddingWindow(
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    embedding=embedding,
+                )
+            )
+        pending_ranges.clear()
+        pending_pcms.clear()
+
+    segment_cursor = 0
+    for start_sample in range(
+        0,
+        total_samples,
+        SPEAKER_WINDOW_SHIFT_SAMPLES,
+    ):
+        logical_end_sample = start_sample + SPEAKER_WINDOW_MAX_SAMPLES
+        physical_end_sample = min(logical_end_sample, total_samples)
+        while (
+            segment_cursor < len(canonical_segments)
+            and canonical_segments[segment_cursor][0].end_sample <= start_sample
+        ):
+            segment_cursor += 1
+
+        overlaps: list[tuple[SpeechSpan, np.ndarray, int, int]] = []
+        scan_index = segment_cursor
+        while (
+            scan_index < len(canonical_segments)
+            and canonical_segments[scan_index][0].start_sample
+            < physical_end_sample
+        ):
+            span, speech_pcm = canonical_segments[scan_index]
+            overlap_start = max(start_sample, span.start_sample)
+            overlap_end = min(physical_end_sample, span.end_sample)
+            if overlap_start < overlap_end:
+                overlaps.append(
+                    (span, speech_pcm, overlap_start, overlap_end)
+                )
+            scan_index += 1
+        if not overlaps:
+            continue
+
+        pcm = np.zeros(
+            physical_end_sample - start_sample,
+            dtype=np.int16,
+        )
+        for span, speech_pcm, overlap_start, overlap_end in overlaps:
+            pcm[
+                overlap_start - start_sample : overlap_end - start_sample
+            ] = speech_pcm[
+                overlap_start - span.start_sample : overlap_end - span.start_sample
+            ]
+        pending_ranges.append((start_sample, logical_end_sample))
+        pending_pcms.append(pcm)
+        if len(pending_pcms) == SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS:
+            flush()
+
+    flush()
+    return tuple(windows)
 
 
 @dataclass(frozen=True)

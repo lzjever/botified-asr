@@ -11,12 +11,19 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from botified_asr import audio
+from botified_asr.contracts import DIRECT_MAX_SAMPLES
 from botified_asr.errors import PipelineError
 
 SPEAKER_SAMPLE_RATE = audio.SAMPLE_RATE
 SPEAKER_EMBEDDING_DIMENSION = 192
 SPEAKER_WINDOW_MAX_SAMPLES = 24_000
 SPEAKER_WINDOW_SHIFT_SAMPLES = 12_000
+SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS = (
+    DIRECT_MAX_SAMPLES
+    - SPEAKER_WINDOW_MAX_SAMPLES
+    + SPEAKER_WINDOW_SHIFT_SAMPLES
+    - 1
+) // SPEAKER_WINDOW_SHIFT_SAMPLES + 1
 SPEAKER_EMBEDDING_NORM_TOLERANCE = 1e-5
 SPEAKER_DOWNMIX_POLICY_VERSION = "ffmpeg-first-audio-stream-ac1-v1"
 SPEAKER_PADDING_POLICY_VERSION = "right-zero-pad-v1"
@@ -115,6 +122,11 @@ class SpeakerEmbeddingWindow:
 
 @runtime_checkable
 class SpeakerEmbeddingAdapter(Protocol):
+    def embed_exact_windows(
+        self,
+        pcms: tuple[np.ndarray, ...],
+    ) -> tuple[np.ndarray, ...]: ...
+
     def embed_windows(
         self,
         pcm: np.ndarray,

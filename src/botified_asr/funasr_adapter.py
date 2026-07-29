@@ -15,6 +15,7 @@ from botified_asr.pipeline import (
     VadMarker,
 )
 from botified_asr.speakers import (
+    SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS as CAMPLUS_BATCH_MAX_WINDOWS,
     SPEAKER_EMBEDDING_DIMENSION as CAMPLUS_EMBEDDING_DIMENSION,
     SPEAKER_WINDOW_MAX_SAMPLES as CAMPLUS_WINDOW_SAMPLES,
     SPEAKER_WINDOW_SHIFT_SAMPLES as CAMPLUS_WINDOW_SHIFT_SAMPLES,
@@ -79,19 +80,11 @@ class FunAsrCampPlusAdapter:
             )
 
         sample_ranges = _campplus_sample_ranges(len(pcm))
-        normalized = [
-            _normalize_campplus_window(pcm, start_sample, end_sample)
-            for start_sample, end_sample in sample_ranges
-        ]
-        raw_result = self._inference_lane.invoke(
-            lambda: self._model.generate(
-                input=normalized,
-                batch_size=len(normalized),
+        embeddings = self.embed_exact_windows(
+            tuple(
+                pcm[start_sample:end_sample]
+                for start_sample, end_sample in sample_ranges
             )
-        )
-        embeddings = _decode_campplus_embeddings(
-            raw_result,
-            expected_count=len(sample_ranges),
         )
         return tuple(
             SpeakerEmbeddingWindow(
@@ -105,6 +98,36 @@ class FunAsrCampPlusAdapter:
                 strict=True,
             )
         )
+
+    def embed_exact_windows(
+        self,
+        pcms: tuple[np.ndarray, ...],
+    ) -> tuple[np.ndarray, ...]:
+        if (
+            type(pcms) is not tuple
+            or not 1 <= len(pcms) <= CAMPLUS_BATCH_MAX_WINDOWS
+            or any(not _valid_exact_campplus_pcm(pcm) for pcm in pcms)
+        ):
+            raise PipelineError(
+                "invalid_audio",
+                "CAM++ input windows are invalid",
+            )
+
+        normalized = [
+            _normalize_campplus_window(pcm, 0, len(pcm))
+            for pcm in pcms
+        ]
+        raw_result = self._inference_lane.invoke(
+            lambda: self._model.generate(
+                input=normalized,
+                batch_size=len(normalized),
+            )
+        )
+        embeddings = _decode_campplus_embeddings(
+            raw_result,
+            expected_count=len(pcms),
+        )
+        return embeddings
 
 
 class FunAsrSenseVoiceBatchAdapter:
@@ -251,6 +274,16 @@ def _valid_campplus_pcm(pcm: object) -> bool:
         and pcm.ndim == 1
         and pcm.flags.c_contiguous
         and 1 <= len(pcm) <= DIRECT_MAX_SAMPLES
+    )
+
+
+def _valid_exact_campplus_pcm(pcm: object) -> bool:
+    return (
+        isinstance(pcm, np.ndarray)
+        and pcm.dtype == np.int16
+        and pcm.ndim == 1
+        and pcm.flags.c_contiguous
+        and 1 <= len(pcm) <= CAMPLUS_WINDOW_SAMPLES
     )
 
 

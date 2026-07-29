@@ -220,6 +220,35 @@ def _unit(*components: float) -> np.ndarray:
     return embedding
 
 
+class RecordingExactSpeakerAdapter:
+    def __init__(self, *, invalid_output: bool = False) -> None:
+        self.calls: list[tuple[np.ndarray, ...]] = []
+        self.invalid_output = invalid_output
+
+    def embed_exact_windows(
+        self,
+        pcms: tuple[np.ndarray, ...],
+    ) -> tuple[np.ndarray, ...]:
+        self.calls.append(tuple(pcm.copy() for pcm in pcms))
+        if self.invalid_output:
+            return ()
+        return tuple(_unit(1.0, float(index + 1)) for index, _pcm in enumerate(pcms))
+
+    def embed_windows(
+        self,
+        _pcm: np.ndarray,
+    ) -> tuple[speakers.SpeakerEmbeddingWindow, ...]:
+        raise AssertionError("global-grid assembly must use exact windows")
+
+
+def _speech_segment(start: int, values: np.ndarray) -> pipeline.BufferedSpeechSegment:
+    return pipeline.BufferedSpeechSegment(
+        span=pipeline.SpeechSpan(start, start + len(values)),
+        pcm_start_sample=start,
+        pcm=np.ascontiguousarray(values, dtype=np.int16),
+    )
+
+
 def _selected_snapshot(
     profile_ids: tuple[str, ...] = ("00000001",),
 ) -> SelectedSpeakerSnapshot:
@@ -282,6 +311,86 @@ def _assert_empty_processor_result(result: object, ref: object) -> None:
     assert type(result) is pipeline.ProcessorResult
     assert result.artifact_ref is ref
     assert result.speaker_mapping == SpeakerLabelMapping(())
+
+
+def test_global_speaker_windows_follow_absolute_grid_and_preserve_silence() -> None:
+    adapter = RecordingExactSpeakerAdapter()
+    segments = (
+        _speech_segment(1_000, np.full(1_000, 1, dtype=np.int16)),
+        _speech_segment(70_000, np.full(1_000, 2, dtype=np.int16)),
+        _speech_segment(71_500, np.full(501, 3, dtype=np.int16)),
+    )
+
+    windows = pipeline._embed_global_speaker_windows(
+        segments,
+        total_samples=72_001,
+        speaker_adapter=adapter,
+    )
+
+    assert [(window.start_sample, window.end_sample) for window in windows] == [
+        (0, 24_000),
+        (48_000, 72_000),
+        (60_000, 84_000),
+        (72_000, 96_000),
+    ]
+    assert len(adapter.calls) == 1
+    pcms = adapter.calls[0]
+    assert [len(pcm) for pcm in pcms] == [24_000, 24_000, 12_001, 1]
+    assert np.all(pcms[0][1_000:2_000] == 1)
+    assert np.count_nonzero(pcms[0][:1_000]) == 0
+    assert np.count_nonzero(pcms[0][2_000:]) == 0
+    assert np.all(pcms[1][22_000:23_000] == 2)
+    assert np.count_nonzero(pcms[1][23_000:23_500]) == 0
+    assert np.all(pcms[1][23_500:] == 3)
+    assert np.all(pcms[2][10_000:11_000] == 2)
+    assert np.count_nonzero(pcms[2][11_000:11_500]) == 0
+    assert np.all(pcms[2][11_500:] == 3)
+    assert pcms[3].tolist() == [3]
+    assert 48_001 not in tuple(window.start_sample for window in windows)
+
+
+def test_global_speaker_windows_batch_at_existing_exact_window_bound() -> None:
+    adapter = RecordingExactSpeakerAdapter()
+    total_samples = 39 * speakers.SPEAKER_WINDOW_SHIFT_SAMPLES + 1
+
+    windows = pipeline._embed_global_speaker_windows(
+        (
+            _speech_segment(
+                0,
+                np.ones(total_samples, dtype=np.int16),
+            ),
+        ),
+        total_samples=total_samples,
+        speaker_adapter=adapter,
+    )
+
+    assert len(windows) == 40
+    assert [len(call) for call in adapter.calls] == [39, 1]
+    assert windows[-1].start_sample == 468_000
+    assert windows[-1].end_sample == 492_000
+
+
+def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
+    empty_adapter = RecordingExactSpeakerAdapter()
+    assert (
+        pipeline._embed_global_speaker_windows(
+            (),
+            total_samples=72_001,
+            speaker_adapter=empty_adapter,
+        )
+        == ()
+    )
+    assert empty_adapter.calls == []
+
+    invalid_adapter = RecordingExactSpeakerAdapter(invalid_output=True)
+    with pytest.raises(pipeline.PipelineError) as caught:
+        pipeline._embed_global_speaker_windows(
+            (_speech_segment(0, np.ones(1, dtype=np.int16)),),
+            total_samples=1,
+            speaker_adapter=invalid_adapter,
+        )
+
+    assert caught.value.code == "invalid_model_output"
 
 
 def test_auto_without_vad_fails_before_probe() -> None:
@@ -708,6 +817,7 @@ def test_speaker_embedding_adapter_is_a_structural_window_protocol() -> None:
 
     assert getattr(adapter_protocol, "_is_protocol", False)
     assert callable(adapter_protocol.embed_windows)
+    assert callable(adapter_protocol.embed_exact_windows)
 
 
 def test_diarize_readiness_fails_before_probe() -> None:

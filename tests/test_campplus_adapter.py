@@ -100,6 +100,84 @@ def test_campplus_adapter_normalizes_pcm_and_embeddings_in_one_lane_call() -> No
     np.testing.assert_allclose(windows[1].embedding[:2], [-12 / 13, 5 / 13])
 
 
+def test_campplus_exact_windows_use_one_padded_model_batch() -> None:
+    pcms = (
+        np.arange(WINDOW_SAMPLES, dtype=np.int16),
+        np.array([-32_768, 16_384, 1], dtype=np.int16),
+    )
+    raw = _raw_embeddings(2)
+    raw[1, :2] = torch.tensor([3.0, 4.0])
+    model = RecordingModel([{"spk_embedding": raw}])
+    lane = RecordingLane()
+
+    embeddings = _adapter(model, lane).embed_exact_windows(pcms)
+
+    assert len(lane.operations) == 1
+    assert len(model.calls) == 1
+    assert model.calls[0]["batch_size"] == 2
+    inputs = model.calls[0]["input"]
+    assert isinstance(inputs, list)
+    assert len(inputs) == 2
+    np.testing.assert_array_equal(
+        inputs[0],
+        pcms[0].astype(np.float32) / np.float32(32768.0),
+    )
+    np.testing.assert_array_equal(
+        inputs[1][:3],
+        pcms[1].astype(np.float32) / np.float32(32768.0),
+    )
+    assert inputs[1].shape == (WINDOW_SAMPLES,)
+    assert np.count_nonzero(inputs[1][3:]) == 0
+    assert len(embeddings) == 2
+    np.testing.assert_allclose(embeddings[1][:2], [0.6, 0.8])
+
+
+def test_campplus_local_windows_delegate_to_exact_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = RecordingModel([{"spk_embedding": _raw_embeddings(1)}])
+    adapter = _adapter(model, RecordingLane())
+    calls: list[tuple[np.ndarray, ...]] = []
+
+    def embed_exact_windows(
+        pcms: tuple[np.ndarray, ...],
+    ) -> tuple[np.ndarray, ...]:
+        calls.append(pcms)
+        return tuple(
+            np.eye(1, EMBEDDING_DIMENSION, dtype=np.float32)[0]
+            for _pcm in pcms
+        )
+
+    monkeypatch.setattr(adapter, "embed_exact_windows", embed_exact_windows)
+
+    windows = adapter.embed_windows(np.arange(30_000, dtype=np.int16))
+
+    assert [(window.start_sample, window.end_sample) for window in windows] == [
+        (0, 24_000),
+        (6_000, 30_000),
+    ]
+    assert len(calls) == 1
+    assert [len(pcm) for pcm in calls[0]] == [24_000, 24_000]
+    assert model.calls == []
+
+
+def test_campplus_exact_batch_bound_is_derived_from_existing_local_limit() -> None:
+    assert speakers.SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS == 39
+    pcms = tuple(
+        np.zeros(1, dtype=np.int16)
+        for _ in range(speakers.SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS + 1)
+    )
+    model = RecordingModel([{"spk_embedding": _raw_embeddings(len(pcms))}])
+    lane = RecordingLane()
+
+    with pytest.raises(PipelineError) as caught:
+        _adapter(model, lane).embed_exact_windows(pcms)
+
+    assert caught.value.code == "invalid_audio"
+    assert model.calls == []
+    assert lane.operations == []
+
+
 @pytest.mark.parametrize(
     ("sample_count", "expected_ranges"),
     [
