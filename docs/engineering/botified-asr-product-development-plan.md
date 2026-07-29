@@ -1126,9 +1126,9 @@ storage_leases(
 ghcr.io/lzjever/botified-asr:vX.Y.Z
 ```
 
-CPU 首版 `v0.1.0` 的固定 version tag 只包含 Linux x86_64（OCI `linux/amd64`）image。该 image 在原生 Linux x86_64 host 构建，并完成模型加载、ready 和固定短音频 smoke；经 smoke 验证的同一 image digest 必须原样进入最终 tag，不得在 smoke 后重建替代。首版不发布 mutable `latest` tag。
+CPU 首版 `v0.1.x` 的固定 version tag 只包含 Linux x86_64（OCI `linux/amd64`）image。该 image 在原生 Linux x86_64 host 构建，并完成模型加载、ready 和固定短音频 smoke；经 smoke 验证的同一 image digest 必须原样进入最终 tag，不得在 smoke 后重建替代。首版不发布 mutable `latest` tag。
 
-仓库继续保留 Linux aarch64 的源码依赖 lock 与 custom Docker build 兼容路径，但它们不构成 `v0.1.0` 官方 artifact、支持承诺或发布条件。只有出现明确 ARM64 需求并在原生 Linux aarch64 host 完成对应验证后，未来版本才可发布官方 ARM64 image。
+仓库继续保留 Linux aarch64 的源码依赖 lock 与 custom Docker build 兼容路径，但它们不构成 `v0.1.x` 官方 artifact、支持承诺或发布条件。只有出现明确 ARM64 需求并在原生 Linux aarch64 host 完成对应验证后，未来版本才可发布官方 ARM64 image。
 
 Skill、离线生成的 OpenAPI、固定 smoke、`LICENSE` 和 `THIRD_PARTY_NOTICES` 继续由本仓库 exact Git tag 中的唯一源码构建或读取；license/notices 同时包含在 OCI image。项目不发布 host installer、release manifest、checksum bundle 或 GitHub Release assets，也不为发布创建第二份版本、模型或 artifact 真相。
 

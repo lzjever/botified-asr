@@ -5,9 +5,9 @@ Botified agents. It accepts concurrent HTTP requests, bounds persisted work,
 limits inference concurrency, supports cancellation, persists results, and
 restarts unfinished jobs from the beginning after a service restart.
 
-The official v0.1.0 CPU image supports Linux x86_64 (`linux/amd64`) only. The
+The official v0.1.1 CPU image supports Linux x86_64 (`linux/amd64`) only. The
 source dependency lock retains Linux aarch64 compatibility for custom Docker
-builds, but v0.1.0 does not include or promise support for an official ARM64
+builds, but v0.1.1 does not include or promise support for an official ARM64
 artifact. An official ARM64 image will be considered only when explicitly
 needed and after validation on a native Linux aarch64 host.
 
@@ -26,7 +26,7 @@ or authorization.
 
 ## Run the CPU container
 
-The fixed `v0.1.0` CPU image targets Linux x86_64 (`linux/amd64`); no mutable
+The fixed `v0.1.1` CPU image targets Linux x86_64 (`linux/amd64`); no mutable
 `latest` tag is published.
 
 Create a private Docker environment file with a random API key:
@@ -41,7 +41,7 @@ printf 'BOTIFIED_ASR_API_KEY=%s\n' "$BOTIFIED_ASR_API_KEY" \
 chmod 600 ./botified-asr.env
 ```
 
-This file configures only the service container. Run the fixed `v0.1.0` release:
+This file configures only the service container. Run the fixed `v0.1.1` release:
 
 ```bash
 docker run --detach \
@@ -50,7 +50,7 @@ docker run --detach \
   --env-file ./botified-asr.env \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
-  ghcr.io/lzjever/botified-asr:v0.1.0
+  ghcr.io/lzjever/botified-asr:v0.1.1
 ```
 
 Docker creates the named volume if needed. `/data/state` holds the database,
@@ -84,7 +84,7 @@ docker run --detach \
   --publish 127.0.0.1:17770:17770 \
   --mount type=volume,src=botified-asr-data,dst=/data \
   --mount type=bind,src=/absolute/path/config.yaml,dst=/etc/botified-asr/custom.yaml,readonly \
-  ghcr.io/lzjever/botified-asr:v0.1.0 \
+  ghcr.io/lzjever/botified-asr:v0.1.1 \
   --config /etc/botified-asr/custom.yaml
 ```
 
@@ -133,7 +133,7 @@ the Skill source:
 
 ```bash
 docker build \
-  --build-arg BOTIFIED_ASR_VERSION=0.1.0 \
+  --build-arg BOTIFIED_ASR_VERSION=0.1.1 \
   --tag botified-asr:local \
   .
 scripts/build-skill-tarball /tmp/asr-skill.tar.gz
@@ -142,17 +142,54 @@ scripts/build-skill-tarball /tmp/asr-skill.tar.gz
 The local image supports the same complete read-only config mount and
 `--config` override shown above.
 
-The [ASR Skill](skills/asr/) provides the corresponding agent
-client commands. For an official image, use the Skill from its matching exact
-Git tag; for a custom image, use the checkout that built it. Explicitly place
-or point `skills/asr` at one runtime location: Codex
-`~/.codex/skills/asr`, OpenClaw
-`~/.agents/skills/asr`, or Botified
-`~/.local/share/botified/skills/asr`. The project does not discover or
-copy the Skill automatically. The selected runtime must inject the deployed
-service's `BOTIFIED_ASR_BASE_URL` and `BOTIFIED_ASR_API_KEY` as a complete pair
-into the helper process. The helper does not locate or parse configuration
-files. From the Skill root, first run `scripts/botified-asr health`.
+The [ASR Skill](skills/asr/) provides the corresponding agent client commands.
+For an official image, use the Skill from its matching exact Git tag; for a
+custom image, use the checkout that built it.
+
+Install it into Botified's resolved Agent root:
+
+```bash
+AGENTS_DIR=/absolute/path/to/resolved-agents-dir
+: "${AGENTS_DIR:?set AGENTS_DIR to the resolved Agent root}"
+
+install -d -m 0700 \
+  "${AGENTS_DIR}/skills/asr/agents" \
+  "${AGENTS_DIR}/skills/asr/references" \
+  "${AGENTS_DIR}/skills/asr/scripts" \
+  "${AGENTS_DIR}/env.d"
+install -m 0644 \
+  skills/asr/SKILL.md \
+  "${AGENTS_DIR}/skills/asr/SKILL.md"
+install -m 0644 \
+  skills/asr/agents/openai.yaml \
+  "${AGENTS_DIR}/skills/asr/agents/openai.yaml"
+install -m 0644 \
+  skills/asr/references/api.md \
+  "${AGENTS_DIR}/skills/asr/references/api.md"
+install -m 0755 \
+  skills/asr/scripts/botified-asr \
+  "${AGENTS_DIR}/skills/asr/scripts/botified-asr"
+```
+
+Create the Skill client's private configuration as an atomic update:
+
+```bash
+install -m 0600 /dev/null \
+  "${AGENTS_DIR}/env.d/botified-asr.env.tmp"
+# Write exactly these two literal, unquoted NAME=VALUE entries to the .tmp file:
+# BOTIFIED_ASR_BASE_URL=http://asr-host:17770
+# BOTIFIED_ASR_API_KEY=replace_with_actual_key
+mv \
+  "${AGENTS_DIR}/env.d/botified-asr.env.tmp" \
+  "${AGENTS_DIR}/env.d/botified-asr.env"
+```
+
+Define each name only once across `env.d/*.env`. Botified injects them into new
+helper processes; the helper does not locate or parse configuration files.
+From the Skill root, first run `scripts/botified-asr health`.
+
+For another Agent runtime, explicitly place or point `skills/asr` at its Skill
+root and inject the same complete environment pair into the helper process.
 
 The runtime does not serve an OpenAPI endpoint.
 
