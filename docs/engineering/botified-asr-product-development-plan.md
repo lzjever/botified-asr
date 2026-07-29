@@ -137,7 +137,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
 - `runtime.inference_lanes` 每个 lane 独立加载一套 SenseVoice、FSMN-VAD、CAM++ model bundle；同一 lane 的三个 adapter 共用该 lane 的串行执行器，跨 lane 不共享 model、adapter 或可变 cache。
-- 仓库代码采用 MIT license；每个 release 提供 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
+- 仓库代码采用 MIT license；每个 release 提供 `LICENSE` 和 `THIRD_PARTY_NOTICES`，README/manifest 记录模型名称、来源、revision 和 license URL。
 - SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由 installer 按固定来源/hash下载，不以技术便利替代许可判断。
 - SenseVoice 的预期 artifact hash 在 release 前必须由本地隔离下载重新计算并与 manifest 比较，不能只抄远端元数据。
 - aarch64 CPU artifact 必须在原生 aarch64 runner 完成 fresh-install、模型加载和固定 smoke；x86_64 上的交叉构建不能替代。
@@ -500,7 +500,7 @@ list 返回：
 
 - `created` 是该 release 的固定构建时间，不在每次请求变化。
 - 单 model GET 返回同一 object；未知 ID 返回 `404 model_not_found`。
-- 依赖和模型 revision 通过 `botified-asr --version` 与 release manifest 查看，不增加未定义的 `/version` API。
+- 服务版本和模型 revision 通过 `botified-asr --version` 与 release manifest 查看，不增加未定义的 `/version` API。
 
 ## 7. 长音频和异步 Job
 
@@ -1173,7 +1173,8 @@ storage_leases(
 - `botified-asr-skill.tar.gz`；
 - `botified-asr-smoke.flac` 固定短转写音频；
 - 版本和 image digest manifest；
-- 离线生成的 OpenAPI JSON。
+- 离线生成的 OpenAPI JSON；
+- `LICENSE` 和 `THIRD_PARTY_NOTICES`。
 
 `botified-releases` 公开：
 
@@ -1183,6 +1184,9 @@ install-asr-skill.sh
 botified-asr-skill.tar.gz
 botified-asr-smoke.flac
 botified-asr-release.json
+botified-asr-openapi.json
+LICENSE
+THIRD_PARTY_NOTICES
 SHA256SUMS
 ```
 
@@ -1226,7 +1230,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - `device=auto` 只有在当前 manifest 含本平台 CUDA digest且 runtime 校验通过时选择 CUDA；否则确定性使用 CPU，不临时拼装未发布 GPU 路径。
 - unit 位于 `~/.config/systemd/user/botified-asr.service`，通过 `systemctl --user enable --now` 管理。
 - installer 检测 user manager 和 linger；无 user systemd 时仅生成 `~/.local/bin/botified-asr-service` wrapper，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
-- `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer 和 `botified-asr-smoke.flac`；manifest 在校验 checksum 后才解析。
+- `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer、`botified-asr-smoke.flac`、`botified-asr-openapi.json`、`LICENSE` 和 `THIRD_PARTY_NOTICES`；manifest 在校验 checksum 后才解析。
 - manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
 - Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
 - checksum harness 向现有 `botified-releases/tests/installers.sh` 注入损坏 manifest/tarball，并断言拉 image、写 systemd 或替换当前安装前已失败；不另建 installer framework。

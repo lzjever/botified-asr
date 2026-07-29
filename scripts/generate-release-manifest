@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve(strict=True).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from botified_asr.model_artifacts import (  # noqa: E402
+    CAMPLUS_SPEC,
+    FSMN_VAD_SPEC,
+    SENSEVOICE_SPEC,
+    ModelArtifactSpec,
+    ResolvedModelSnapshot,
+)
+from botified_asr.model_loader import _build_processor_fingerprint  # noqa: E402
+
+
+_RELEASE_VERSION = re.compile(
+    r"\Av(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
+_DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+_OUTPUT_NAME = "botified-asr-release.json"
+_ARTIFACT_ARGUMENTS = (
+    ("license", "LICENSE"),
+    ("notices", "THIRD_PARTY_NOTICES"),
+    ("openapi", "botified-asr-openapi.json"),
+    ("skill", "botified-asr-skill.tar.gz"),
+    ("smoke", "botified-asr-smoke.flac"),
+)
+_MODEL_LICENSES = {
+    SENSEVOICE_SPEC: (
+        "FunASR-Model-License-1.1",
+        "https://github.com/modelscope/FunASR/blob/"
+        "8a34247dc5ff71bea61b37e57f941680b456753f/MODEL_LICENSE",
+    ),
+    FSMN_VAD_SPEC: (
+        "Apache-2.0",
+        "https://www.apache.org/licenses/LICENSE-2.0",
+    ),
+    CAMPLUS_SPEC: (
+        "Apache-2.0",
+        "https://www.apache.org/licenses/LICENSE-2.0",
+    ),
+}
+
+
+def _parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    for argument, _ in _ARTIFACT_ARGUMENTS:
+        parser.add_argument(f"--{argument}", required=True, type=Path)
+    parser.add_argument("--index-digest", required=True)
+    parser.add_argument("--amd64-digest", required=True)
+    parser.add_argument("--arm64-digest", required=True)
+    parser.add_argument("--release-version", required=True)
+    parser.add_argument("--output", required=True, type=Path)
+    return parser.parse_args()
+
+
+def _project_release_version() -> str:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as source:
+        version = tomllib.load(source)["project"]["version"]
+    if not isinstance(version, str) or _RELEASE_VERSION.fullmatch(
+        f"v{version}"
+    ) is None:
+        raise RuntimeError("project.version must be canonical X.Y.Z")
+    return f"v{version}"
+
+
+def _validate_digest(value: object, name: str) -> str:
+    if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a canonical SHA-256 digest")
+    return value
+
+
+def _artifact_sha256(path: Path, expected_name: str) -> str:
+    if path.name != expected_name:
+        raise ValueError(f"{expected_name} input has the wrong basename")
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{expected_name} input must be a regular file")
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def _model(model: ModelArtifactSpec) -> dict[str, str]:
+    license_name, license_url = _MODEL_LICENSES[model]
+    return {
+        "id": model.model_id,
+        "license": license_name,
+        "license_url": license_url,
+        "provider": model.provider,
+        "revision": model.revision,
+        "source_url": (
+            f"https://huggingface.co/{model.model_id}/tree/{model.revision}"
+        ),
+    }
+
+
+def _processor_fingerprint() -> str:
+    return _build_processor_fingerprint(
+        ResolvedModelSnapshot(SENSEVOICE_SPEC, Path("/unused/sensevoice")),
+        ResolvedModelSnapshot(FSMN_VAD_SPEC, Path("/unused/fsmn-vad")),
+        ResolvedModelSnapshot(CAMPLUS_SPEC, Path("/unused/campplus")),
+    )
+
+
+def _write_atomic(output: Path, content: bytes) -> None:
+    if output.name != _OUTPUT_NAME:
+        raise ValueError(f"output basename must be {_OUTPUT_NAME}")
+    if output.is_symlink():
+        raise ValueError("output must not be a symbolic link")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(content)
+            os.fchmod(temporary.fileno(), 0o644)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, output)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main() -> None:
+    arguments = _parse_arguments()
+    if (
+        not isinstance(arguments.release_version, str)
+        or _RELEASE_VERSION.fullmatch(arguments.release_version) is None
+        or arguments.release_version != _project_release_version()
+    ):
+        raise ValueError("release version must equal v{project.version}")
+    index_digest = _validate_digest(
+        arguments.index_digest,
+        "index digest",
+    )
+    amd64_digest = _validate_digest(
+        arguments.amd64_digest,
+        "amd64 digest",
+    )
+    arm64_digest = _validate_digest(
+        arguments.arm64_digest,
+        "arm64 digest",
+    )
+    if len({index_digest, amd64_digest, arm64_digest}) != 3:
+        raise ValueError("OCI image digests must be pairwise distinct")
+
+    artifacts = {
+        expected_name: {
+            "sha256": _artifact_sha256(
+                getattr(arguments, argument),
+                expected_name,
+            )
+        }
+        for argument, expected_name in _ARTIFACT_ARGUMENTS
+    }
+    manifest = {
+        "artifacts": artifacts,
+        "models": [
+            _model(SENSEVOICE_SPEC),
+            _model(FSMN_VAD_SPEC),
+            _model(CAMPLUS_SPEC),
+        ],
+        "oci_image": {
+            "index_digest": index_digest,
+            "platforms": {
+                "linux/amd64": {
+                    "device": "cpu",
+                    "digest": amd64_digest,
+                },
+                "linux/arm64": {
+                    "device": "cpu",
+                    "digest": arm64_digest,
+                },
+            },
+            "repository": "ghcr.io/lzjever/botified-asr",
+        },
+        "processor_fingerprint": _processor_fingerprint(),
+        "release_version": arguments.release_version,
+        "runtime": {
+            "container_engines": ["docker", "podman"],
+            "rootless_required": True,
+        },
+        "schema_version": 1,
+    }
+    content = (
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    _write_atomic(arguments.output, content)
+
+
+if __name__ == "__main__":
+    main()
