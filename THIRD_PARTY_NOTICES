@@ -5,6 +5,13 @@ This file identifies third-party components used by Botified ASR and points to
 their license terms. It is not an exhaustive legal analysis. Botified ASR
 source code is separately licensed under the repository MIT LICENSE.
 
+Integration smoke fixture
+-------------------------
+
+`assets/botified-asr-smoke.flac` is a short integration smoke fixture. The
+project maintainers have confirmed that this repository is permitted to
+publicly redistribute this file.
+
 Runtime software
 ----------------
 
