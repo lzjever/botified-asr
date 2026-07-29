@@ -1291,7 +1291,7 @@ transcribe-long
 job-get
 job-wait
 job-delete
-speaker-add
+speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 [SAMPLE_FILE_3 ... SAMPLE_FILE_5]
 speaker-list
 speaker-get
 speaker-put SPEAKER_ID NAME [DESCRIPTION]
@@ -1319,8 +1319,8 @@ speaker-delete
 - curl exit 0 时按命令 fail-closed：`health` 仅允许 HTTP 200，`transcribe`
   仅允许 200，`transcribe-long` 仅允许 202，`job-get` 和 `job-wait` 仅允许
   200/202，`job-delete` 仅允许 202/204，`speaker-list`、`speaker-get` 和
-  `speaker-put` 仅允许 200，`speaker-delete` 仅允许 204。包括 3xx、畸形状态
-  和其他状态在内的非白名单响应丢弃 body，返回
+  `speaker-put` 仅允许 200，`speaker-add` 仅允许 201，`speaker-delete` 仅允许
+  204。包括 3xx、畸形状态和其他状态在内的非白名单响应丢弃 body，返回
   `unexpected_http_response`，`param=null`，exit 76。
 - `job-wait` 的 HTTP 200 是 terminal：原样输出 JSON 并 exit 0；HTTP 202 是
   active：丢弃该次 JSON，重新读取 deadline 后才决定 timeout 或 sleep。
