@@ -213,6 +213,20 @@ jobs:
               botified-asr:test \
               --version
           )" = "botified-asr $BOTIFIED_ASR_VERSION"
+          docker run \
+            --rm \
+            --network none \
+            --read-only \
+            --entrypoint test \
+            botified-asr:test \
+            -r /usr/share/doc/botified-asr/LICENSE
+          docker run \
+            --rm \
+            --network none \
+            --read-only \
+            --entrypoint test \
+            botified-asr:test \
+            -r /usr/share/doc/botified-asr/THIRD_PARTY_NOTICES
 
       - name: Run authenticated transcription smoke
         shell: bash
@@ -239,7 +253,6 @@ jobs:
           runtime:
             device: "cpu"
             model_cache_dir: "/var/cache/botified-asr/models"
-            max_speakers: 32
             inference_lanes: 1
 
           storage:

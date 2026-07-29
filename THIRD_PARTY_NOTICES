@@ -1,0 +1,63 @@
+Botified ASR Third-Party Notices
+================================
+
+This file identifies third-party components used by Botified ASR and points to
+their license terms. It is not an exhaustive legal analysis. Botified ASR
+source code is separately licensed under the repository MIT LICENSE.
+
+Runtime software
+----------------
+
+The direct runtime Python dependencies are:
+
+* FunASR 1.3.29 — MIT
+* NumPy 2.4.6 — BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
+* python-multipart 0.0.20 — Apache-2.0
+* PyYAML 6.0.2 — MIT
+* Starlette 0.47.2 — BSD-3-Clause
+* PyTorch 2.11.0+cpu — BSD-3-Clause; its distribution also includes NOTICE
+* TorchAudio 2.11.0+cpu — BSD-2-Clause
+* Uvicorn 0.35.0 — BSD-3-Clause
+
+The exact resolved package set is recorded in uv.lock. License and NOTICE files
+shipped by the actual Python wheels are retained in their installed
+distribution metadata under /opt/botified-asr. In the CPU container, license
+materials for the Python base image and Debian packages, including ffmpeg and
+ca-certificates, remain under /usr/share/doc and their respective installed
+locations. Those upstream terms continue to apply.
+
+FunASR toolkit
+--------------
+
+The FunASR inference toolkit is distributed under the MIT License:
+
+https://github.com/modelscope/FunASR/blob/8a34247dc5ff71bea61b37e57f941680b456753f/LICENSE
+
+Its pretrained model weights are separate works with separate terms.
+
+Runtime-downloaded models
+-------------------------
+
+The following weights are not distributed in the Botified ASR source package
+or CPU image. The service downloads the named immutable revisions on first use.
+
+* FunAudioLLM/SenseVoiceSmall
+  Revision: 3847d57b6bdf2dd8875cb1508d2af43d80a16bf7
+  Source: https://huggingface.co/FunAudioLLM/SenseVoiceSmall/tree/3847d57b6bdf2dd8875cb1508d2af43d80a16bf7
+  Copyright/licensor: Alibaba Group / FunAudioLLM
+  Terms: FunASR Model Open Source License Agreement 1.1
+  https://github.com/modelscope/FunASR/blob/8a34247dc5ff71bea61b37e57f941680b456753f/MODEL_LICENSE
+
+* funasr/fsmn-vad
+  Revision: df20e6b30c653645fa4ff125cacfcabd1020a669
+  Source: https://huggingface.co/funasr/fsmn-vad/tree/df20e6b30c653645fa4ff125cacfcabd1020a669
+  Project: FunASR
+  License declared by the fixed model card: Apache-2.0
+  https://www.apache.org/licenses/LICENSE-2.0
+
+* funasr/campplus
+  Revision: e4b6ede7ce16997aff4ae69fbca1f0175e2afede
+  Source: https://huggingface.co/funasr/campplus/tree/e4b6ede7ce16997aff4ae69fbca1f0175e2afede
+  Project: FunASR
+  License declared by the fixed model card: Apache-2.0
+  https://www.apache.org/licenses/LICENSE-2.0

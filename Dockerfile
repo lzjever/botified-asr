@@ -13,7 +13,7 @@ RUN python --version \
     && python -m pip install --no-cache-dir uv==0.9.26 \
     && uv --version
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES ./
 COPY src/ src/
 
 RUN uv sync --frozen --no-dev --no-editable
@@ -44,6 +44,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/botified-asr /opt/botified-asr
+COPY --from=builder \
+     /build/LICENSE \
+     /build/THIRD_PARTY_NOTICES \
+     /usr/share/doc/botified-asr/
 
 ARG BOTIFIED_ASR_VERSION
 
