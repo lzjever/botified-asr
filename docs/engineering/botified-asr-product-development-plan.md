@@ -88,7 +88,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 | API 鉴权 | Bearer Token |
 | 非敏感配置 | 单一 YAML 配置文件 |
 | API secret | 单一环境变量 `BOTIFIED_ASR_API_KEY` |
-| 生产运行 | 固定版本 OCI image + README 中唯一 `docker run` |
+| 生产运行 | 固定版本 OCI image；默认使用内置配置，高级部署使用完整 YAML + `--config` |
 | Skill 来源 | 官方 image：matching exact tag；custom image：构建它的同一 checkout |
 
 ## 4. 上游能力和采用边界
@@ -513,7 +513,7 @@ limits:
   result_retention_hours: 24
 ```
 
-- 部署者可通过完整 YAML 高级覆盖收紧这些边界；镜像内置配置使用以上发布上限。
+- 镜像内置配置使用以上默认值，部署者可通过完整 YAML 调整；只有后文明示的固定发布硬上限不得放宽。`max_active_uploads` 和 `max_queued_jobs` 只要求正整数，`4` 和 `16` 是默认值而非发布上限。
 - `max_upload_bytes` 不得高于 1 GiB，`max_audio_duration_secs` 不得高于 12 小时；服务启动时拒绝超过首版验证上限的配置。
 - `sensevoice-diarize` 另有不可配置的 30 分钟发布硬上限，即 28,800,000 个 mono 16 kHz PCM sample；该上限不收紧普通 `sensevoice` 的 12 小时边界。
 - `max_upload_bytes` 只计算 transcription 请求中唯一 `file` part 的 payload 实际字节数；`file` payload 小于或等于上限时可接受。multipart overhead 另按 §6.2 的独立 1 MiB 上限计算。
@@ -836,7 +836,7 @@ SpeakerProfile
 - `A`–`Z` 后按 `AA`、`AB` 延伸；纯大写拉丁字母标签以及大小写不敏感的 `Unknown <该标签>` 是响应保留名称，不得注册，冲突返回 `400 reserved_speaker_name`。
 - `description` 最多 500 个 Unicode 字符。
 - 单实例固定最多 256 个 speaker profile；达到时 POST 返回 `409 speaker_profile_limit_reached`，首版因此不增加 pagination。
-- `embedding_policy_fingerprint = SHA256(model commit + dimension + 16k/downmix + 1.5s/0.75s window/shift + padding + normalization policy version)`。
+- `embedding_policy_fingerprint` 是 `src/botified_asr/speakers.py` 中 `SpeakerEmbeddingPolicy.canonical_bytes` 的 SHA-256；canonical field set 与 serialization 由该实现唯一维护。它绑定 embedding model identity/revision、向量提取和 enrollment aggregation 的兼容性；决策阈值排除项见 §9.5。
 - profile fingerprint 必须与当前只读 model policy 一致；不匹配时返回 `409 speaker_profile_incompatible` 并要求重新 enrollment，不得静默复用。
 - 首版不增加头像、邮箱、角色、组织等字段。
 

@@ -37,7 +37,7 @@ local file, `model=sensevoice`, `response_format=json`, and
 An accepted request returns the service JSON unchanged:
 
 ```json
-{"id":"7K3M9Q2W","status":"queued"}
+{"id":"7K3M9Q2W","status":"queued","created_at":"2026-07-27T12:00:00Z"}
 ```
 
 HTTP error bodies are also returned unchanged. Transport and helper-local
