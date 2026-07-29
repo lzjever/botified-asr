@@ -1,5 +1,5 @@
 ---
-name: botified-asr
+name: asr
 description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long and meeting transcription jobs, register speaker profiles from explicitly provided samples, list or query profiles, or update metadata or delete a job or profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, obtain a transcription, work with a transcription job, or explicitly register or manage a speaker profile.
 ---
 

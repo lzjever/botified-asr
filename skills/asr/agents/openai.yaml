@@ -1,0 +1,4 @@
+interface:
+  display_name: "Botified ASR"
+  short_description: "Transcribe audio and register speaker profiles"
+  default_prompt: "Use $asr to check readiness, transcribe audio, manage transcription jobs, and register or manage speaker profiles only when I explicitly ask."

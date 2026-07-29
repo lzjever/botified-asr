@@ -14,7 +14,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SKILL_ROOT = PROJECT_ROOT / "skills" / "botified-asr"
+SKILL_ROOT = PROJECT_ROOT / "skills" / "asr"
 HELPER = SKILL_ROOT / "scripts" / "botified-asr"
 SKILL_BUILDER = PROJECT_ROOT / "scripts" / "build-skill-tarball"
 TOKEN = "test-token+/=="
@@ -208,35 +208,35 @@ def _without_http_capture_suffix(arguments: list[bytes]) -> list[bytes]:
 def test_skill_tarball_has_exact_safe_ustar_shape_and_contents(
     tmp_path: Path,
 ) -> None:
-    output = tmp_path / "botified-asr-skill.tar.gz"
+    output = tmp_path / "asr-skill.tar.gz"
 
     subprocess.run([SKILL_BUILDER, output], check=True)
 
     expected = [
-        ("botified-asr", tarfile.DIRTYPE, 0o755, None),
+        ("asr", tarfile.DIRTYPE, 0o755, None),
         (
-            "botified-asr/SKILL.md",
+            "asr/SKILL.md",
             tarfile.REGTYPE,
             0o644,
             SKILL_ROOT / "SKILL.md",
         ),
-        ("botified-asr/agents", tarfile.DIRTYPE, 0o755, None),
+        ("asr/agents", tarfile.DIRTYPE, 0o755, None),
         (
-            "botified-asr/agents/openai.yaml",
+            "asr/agents/openai.yaml",
             tarfile.REGTYPE,
             0o644,
             SKILL_ROOT / "agents" / "openai.yaml",
         ),
-        ("botified-asr/references", tarfile.DIRTYPE, 0o755, None),
+        ("asr/references", tarfile.DIRTYPE, 0o755, None),
         (
-            "botified-asr/references/api.md",
+            "asr/references/api.md",
             tarfile.REGTYPE,
             0o644,
             SKILL_ROOT / "references" / "api.md",
         ),
-        ("botified-asr/scripts", tarfile.DIRTYPE, 0o755, None),
+        ("asr/scripts", tarfile.DIRTYPE, 0o755, None),
         (
-            "botified-asr/scripts/botified-asr",
+            "asr/scripts/botified-asr",
             tarfile.REGTYPE,
             0o755,
             HELPER,
@@ -254,7 +254,7 @@ def test_skill_tarball_has_exact_safe_ustar_shape_and_contents(
         ):
             path = PurePosixPath(name)
             assert not path.is_absolute()
-            assert path.parts[0] == "botified-asr"
+            assert path.parts[0] == "asr"
             assert ".." not in path.parts
             assert member.type == kind
             assert member.mode == mode
@@ -340,7 +340,9 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
 
     skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     _, frontmatter, body = skill_text.split("---", 2)
-    assert yaml.safe_load(frontmatter).keys() == {"name", "description"}
+    metadata = yaml.safe_load(frontmatter)
+    assert metadata.keys() == {"name", "description"}
+    assert metadata["name"] == "asr"
     assert "relative to this `SKILL.md` (the skill root)" in body
     assert "scripts/botified-asr health" in body
     assert "scripts/botified-asr transcribe AUDIO_FILE" in body
@@ -369,7 +371,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         < body.index("`scripts/botified-asr transcribe AUDIO_FILE`")
     )
     assert "references/api.md" in body
-    assert "transcrib" in yaml.safe_load(frontmatter)["description"].lower()
+    assert "transcrib" in metadata["description"].lower()
     reference = (SKILL_ROOT / "references" / "api.md").read_text(
         encoding="utf-8"
     )
@@ -398,7 +400,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
                 "Transcribe audio and register speaker profiles"
             ),
             "default_prompt": (
-                "Use $botified-asr to check readiness, transcribe audio, "
+                "Use $asr to check readiness, transcribe audio, "
                 "manage transcription jobs, and register or manage speaker "
                 "profiles only when I explicitly ask."
             ),

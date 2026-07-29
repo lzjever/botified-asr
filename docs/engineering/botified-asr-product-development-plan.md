@@ -1148,7 +1148,7 @@ Skill、离线生成的 OpenAPI、固定 smoke、`LICENSE` 和 `THIRD_PARTY_NOTI
 ### 15.1 唯一源码
 
 ```text
-skills/botified-asr/
+skills/asr/
 ├── SKILL.md
 ├── agents/openai.yaml
 ├── scripts/botified-asr
@@ -1159,7 +1159,7 @@ skills/botified-asr/
 
 ```yaml
 ---
-name: botified-asr
+name: asr
 description: ...
 ---
 ```

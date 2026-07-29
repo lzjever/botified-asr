@@ -12,25 +12,25 @@ from pathlib import Path
 
 
 MEMBERS = (
-    ("botified-asr", ".", tarfile.DIRTYPE, 0o755),
-    ("botified-asr/SKILL.md", "SKILL.md", tarfile.REGTYPE, 0o644),
-    ("botified-asr/agents", "agents", tarfile.DIRTYPE, 0o755),
+    ("asr", ".", tarfile.DIRTYPE, 0o755),
+    ("asr/SKILL.md", "SKILL.md", tarfile.REGTYPE, 0o644),
+    ("asr/agents", "agents", tarfile.DIRTYPE, 0o755),
     (
-        "botified-asr/agents/openai.yaml",
+        "asr/agents/openai.yaml",
         "agents/openai.yaml",
         tarfile.REGTYPE,
         0o644,
     ),
-    ("botified-asr/references", "references", tarfile.DIRTYPE, 0o755),
+    ("asr/references", "references", tarfile.DIRTYPE, 0o755),
     (
-        "botified-asr/references/api.md",
+        "asr/references/api.md",
         "references/api.md",
         tarfile.REGTYPE,
         0o644,
     ),
-    ("botified-asr/scripts", "scripts", tarfile.DIRTYPE, 0o755),
+    ("asr/scripts", "scripts", tarfile.DIRTYPE, 0o755),
     (
-        "botified-asr/scripts/botified-asr",
+        "asr/scripts/botified-asr",
         "scripts/botified-asr",
         tarfile.REGTYPE,
         0o755,
@@ -43,7 +43,7 @@ def main() -> None:
         raise SystemExit("usage: build-skill-tarball OUTPUT")
 
     project_root = Path(__file__).resolve(strict=True).parent.parent
-    source_root = project_root / "skills" / "botified-asr"
+    source_root = project_root / "skills" / "asr"
     output = Path(sys.argv[1])
     if output.is_symlink():
         raise RuntimeError("Output must not be a symbolic link")

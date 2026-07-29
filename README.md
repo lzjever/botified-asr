@@ -136,19 +136,19 @@ docker build \
   --build-arg BOTIFIED_ASR_VERSION=0.1.0 \
   --tag botified-asr:local \
   .
-scripts/build-skill-tarball /tmp/botified-asr-skill.tar.gz
+scripts/build-skill-tarball /tmp/asr-skill.tar.gz
 ```
 
 The local image supports the same complete read-only config mount and
 `--config` override shown above.
 
-The [Botified ASR Skill](skills/botified-asr/) provides the corresponding agent
+The [ASR Skill](skills/asr/) provides the corresponding agent
 client commands. For an official image, use the Skill from its matching exact
 Git tag; for a custom image, use the checkout that built it. Explicitly place
-or point `skills/botified-asr` at one runtime location: Codex
-`~/.codex/skills/botified-asr`, OpenClaw
-`~/.agents/skills/botified-asr`, or Botified
-`~/.local/share/botified/skills/botified-asr`. The project does not discover or
+or point `skills/asr` at one runtime location: Codex
+`~/.codex/skills/asr`, OpenClaw
+`~/.agents/skills/asr`, or Botified
+`~/.local/share/botified/skills/asr`. The project does not discover or
 copy the Skill automatically. The selected runtime must inject the deployed
 service's `BOTIFIED_ASR_BASE_URL` and `BOTIFIED_ASR_API_KEY` as a complete pair
 into the helper process. The helper does not locate or parse configuration
