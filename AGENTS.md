@@ -35,6 +35,7 @@
 
 ## 变更纪律
 
+- 工作与写入范围仅限本 `botified-asr` 仓库；其他仓库只可只读参考，未经用户对具体仓库明确、单独授权，不得修改、提交、推送或以其他方式改变其任何状态。
 - 保持改动聚焦，避免顺手重构、全文件格式化和无关清理。
 - 同时只推进一个主要产品切片及必要的独立审查；完成实现、测试和提交闭环后再进入下一项。
 - 近期切片依次为固定策略启用 enrollment、保守 known speaker 命名、离线 OpenAPI、Skill `speaker-add`、最小结构化日志、安装与 README/license/notices、release assets、真实运行 smoke；CPU 首版完成前不启动 CUDA 或新架构。
