@@ -43,6 +43,21 @@ An accepted request returns the service JSON unchanged:
 HTTP error bodies are also returned unchanged. Transport and helper-local
 failures return JSON with a stable `error.code`.
 
+# Meeting transcription submission
+
+`scripts/botified-asr transcribe-meeting AUDIO_FILE [SPEAKER_ID ...]` sends an
+authenticated POST `/v1/audio/transcriptions` request with `Prefer:
+respond-async`, a readable local file, `model=sensevoice-diarize`,
+`response_format=diarized_json`, and `chunking_strategy=auto`. It accepts zero
+through 32 unique uppercase Crockford Base32 speaker IDs and sends each provided
+ID as a repeated `known_speaker_ids[]` field. The helper does not list or select
+speakers.
+
+Only HTTP 202 is accepted. The service JSON is returned unchanged; use its job
+ID with `job-wait`. After a successful terminal response, the Agent can project
+`result.segments` into a speaker/timestamp meeting transcript while preserving
+`Unknown` speaker labels. The helper does not summarize.
+
 # Get a transcription job
 
 `scripts/botified-asr job-get JOB_ID` sends an authenticated

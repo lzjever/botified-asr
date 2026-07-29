@@ -8,7 +8,7 @@ umask 077
 
 invalid_command() {
     printf '%s\n' \
-        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 [SAMPLE_FILE_3 ... SAMPLE_FILE_5], speaker-put SPEAKER_ID NAME [DESCRIPTION], or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
+        '{"error":{"message":"Expected health, transcribe AUDIO_FILE, transcribe-long AUDIO_FILE, transcribe-meeting AUDIO_FILE [SPEAKER_ID ...], job-get JOB_ID, job-wait JOB_ID TIMEOUT_SECONDS, job-delete JOB_ID, speaker-list, speaker-get SPEAKER_ID, speaker-add NAME SAMPLE_FILE_1 SAMPLE_FILE_2 [SAMPLE_FILE_3 ... SAMPLE_FILE_5], speaker-put SPEAKER_ID NAME [DESCRIPTION], or speaker-delete SPEAKER_ID","type":"client_error","param":"command","code":"invalid_command"}}'
     exit 64
 }
 
@@ -33,6 +33,12 @@ invalid_job_id() {
 invalid_speaker_id() {
     printf '%s\n' \
         '{"error":{"message":"Speaker ID must be 8 uppercase Crockford Base32 characters","type":"client_error","param":"speaker_id","code":"invalid_speaker_id"}}'
+    exit 65
+}
+
+invalid_known_speaker_ids() {
+    printf '%s\n' \
+        '{"error":{"message":"Known speaker IDs must be unique 8-character uppercase Crockford Base32 IDs, with at most 32 IDs","type":"client_error","param":"known_speaker_ids[]","code":"invalid_known_speaker_ids"}}'
     exit 65
 }
 
@@ -215,6 +221,7 @@ perform_request() {
 classify_http_response() {
     case "$command_name:$http_code" in
         health:200 | transcribe:200 | transcribe-long:202 | \
+            transcribe-meeting:202 | \
             job-get:200 | job-get:202 | job-wait:200 | job-delete:202 | \
             speaker-list:200 | speaker-get:200 | speaker-add:201 | \
             speaker-put:200)
@@ -245,6 +252,7 @@ speaker_sample_5=
 speaker_description=
 speaker_description_is_set=0
 wait_timeout=
+meeting_known_speaker_ids=
 
 if [ "$#" -eq 1 ] && [ "$1" = "health" ]; then
     command_name=health
@@ -254,6 +262,31 @@ elif [ "$#" -eq 2 ] && [ "$1" = "transcribe" ]; then
 elif [ "$#" -eq 2 ] && [ "$1" = "transcribe-long" ]; then
     command_name=transcribe-long
     audio_file=$2
+elif [ "$#" -ge 2 ] && [ "$1" = "transcribe-meeting" ]; then
+    command_name=transcribe-meeting
+    audio_file=$2
+    shift 2
+    meeting_known_speaker_count=$#
+    if [ "$meeting_known_speaker_count" -gt 32 ]; then
+        invalid_known_speaker_ids
+    fi
+    meeting_known_speaker_ids_seen=" "
+    for meeting_known_speaker_id do
+        if ! is_crockford_id "$meeting_known_speaker_id"; then
+            invalid_known_speaker_ids
+        fi
+        case "$meeting_known_speaker_ids_seen" in
+            *" $meeting_known_speaker_id "*)
+                invalid_known_speaker_ids
+                ;;
+        esac
+        meeting_known_speaker_ids_seen="${meeting_known_speaker_ids_seen}${meeting_known_speaker_id} "
+        if [ -z "$meeting_known_speaker_ids" ]; then
+            meeting_known_speaker_ids=$meeting_known_speaker_id
+        else
+            meeting_known_speaker_ids="$meeting_known_speaker_ids $meeting_known_speaker_id"
+        fi
+    done
 elif [ "$#" -eq 2 ] && [ "$1" = "job-get" ]; then
     command_name=job-get
     job_id=$2
@@ -458,7 +491,7 @@ case "$command_name" in
         speaker-list | speaker-get | speaker-put | speaker-delete)
         request_input=/dev/null
         ;;
-    transcribe | transcribe-long)
+    transcribe | transcribe-long | transcribe-meeting)
         if [ ! -f "$audio_file" ] || [ ! -r "$audio_file" ]; then
             invalid_audio_file
         fi
@@ -557,23 +590,38 @@ case "$command_name" in
             --request GET \
             --url "$origin/health/ready"
         ;;
-    transcribe | transcribe-long)
+    transcribe | transcribe-long | transcribe-meeting)
         set -- \
             "$@" \
             --request POST
-        if [ "$command_name" = "transcribe-long" ]; then
+        if [ "$command_name" = "transcribe-long" ] ||
+            [ "$command_name" = "transcribe-meeting" ]; then
             set -- \
                 "$@" \
                 --header 'Prefer: respond-async'
         fi
-        set -- \
-            "$@" \
-            --form-string model=sensevoice \
-            --form-string response_format=json
-        if [ "$command_name" = "transcribe-long" ]; then
+        if [ "$command_name" = "transcribe-meeting" ]; then
             set -- \
                 "$@" \
+                --form-string model=sensevoice-diarize \
+                --form-string response_format=diarized_json \
                 --form-string chunking_strategy=auto
+            for meeting_known_speaker_id in $meeting_known_speaker_ids; do
+                set -- \
+                    "$@" \
+                    --form-string \
+                    "known_speaker_ids[]=$meeting_known_speaker_id"
+            done
+        else
+            set -- \
+                "$@" \
+                --form-string model=sensevoice \
+                --form-string response_format=json
+            if [ "$command_name" = "transcribe-long" ]; then
+                set -- \
+                    "$@" \
+                    --form-string chunking_strategy=auto
+            fi
         fi
         set -- \
             "$@" \

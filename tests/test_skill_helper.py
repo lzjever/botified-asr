@@ -378,6 +378,10 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     assert "scripts/botified-asr health" in body
     assert "scripts/botified-asr transcribe AUDIO_FILE" in body
     assert "scripts/botified-asr transcribe-long AUDIO_FILE" in body
+    assert (
+        "scripts/botified-asr transcribe-meeting AUDIO_FILE "
+        "[SPEAKER_ID ...]"
+    ) in body
     assert "scripts/botified-asr job-get JOB_ID" in body
     assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in body
     assert "scripts/botified-asr job-delete JOB_ID" in body
@@ -404,6 +408,10 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
     )
     assert "POST `/v1/audio/transcriptions`" in reference
     assert "`model=sensevoice`" in reference
+    assert "`model=sensevoice-diarize`" in reference
+    assert "`response_format=diarized_json`" in reference
+    assert "`known_speaker_ids[]`" in reference
+    assert "`result.segments`" in reference
     assert "`chunking_strategy=auto`" in reference
     assert "GET `/v1/audio/transcriptions/{job_id}`" in reference
     assert "scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS" in reference
@@ -441,6 +449,7 @@ def test_skill_has_only_the_release_shape_and_minimal_metadata() -> None:
         ("transcribe", "audio.wav", "extra"),
         ("transcribe-long",),
         ("transcribe-long", "audio.wav", "extra"),
+        ("transcribe-meeting",),
         ("job-get",),
         ("job-get", "7K3M9Q2W", "extra"),
         ("job-wait",),
@@ -1044,6 +1053,145 @@ def test_transcribe_long_submits_one_private_async_request(
 
 
 @pytest.mark.parametrize(
+    ("known_speaker_ids", "expected_known_fields"),
+    [
+        ((), []),
+        (
+            ("7K3M9Q2W", "4X7K2M9Q"),
+            [
+                b"--form-string",
+                b"known_speaker_ids[]=7K3M9Q2W",
+                b"--form-string",
+                b"known_speaker_ids[]=4X7K2M9Q",
+            ],
+        ),
+        (
+            tuple(f"{index:08d}" for index in range(32)),
+            [
+                field
+                for index in range(32)
+                for field in (
+                    b"--form-string",
+                    f"known_speaker_ids[]={index:08d}".encode(),
+                )
+            ],
+        ),
+    ],
+    ids=("anonymous", "two-known", "max-known"),
+)
+def test_transcribe_meeting_submits_exact_private_async_request(
+    tmp_path: Path,
+    known_speaker_ids: tuple[str, ...],
+    expected_known_fields: list[bytes],
+) -> None:
+    body = (
+        b'{"id":"7K3M9Q2W","status":"queued",'
+        b'"created_at":"2026-07-27T12:00:00Z"}'
+    )
+    environment, args_path, stdin_path = _install_fake_curl(
+        tmp_path,
+        body=body,
+        http_code="202",
+    )
+    _write_client_config(environment, _valid_config())
+    target = tmp_path / "real-meeting-audio.wav"
+    audio_bytes = b"private meeting audio bytes"
+    target.write_bytes(audio_bytes)
+    audio_path = tmp_path / 'meeting ,;"{}[] $().wav'
+    audio_path.symlink_to(target)
+
+    result = _run(
+        environment,
+        "transcribe-meeting",
+        str(audio_path),
+        *known_speaker_ids,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == body
+    assert result.stderr == b""
+    arguments = _without_http_capture_suffix(
+        args_path.read_bytes().split(b"\0")
+    )
+    assert arguments == [
+        b"--disable",
+        b"--globoff",
+        b"--config",
+        b"-",
+        b"--proto",
+        b"=http,https",
+        b"--silent",
+        b"--fail-with-body",
+        b"--connect-timeout",
+        b"5",
+        b"--request",
+        b"POST",
+        b"--header",
+        b"Prefer: respond-async",
+        b"--form-string",
+        b"model=sensevoice-diarize",
+        b"--form-string",
+        b"response_format=diarized_json",
+        b"--form-string",
+        b"chunking_strategy=auto",
+        *expected_known_fields,
+        b"--form",
+        (
+            b"file=@/dev/fd/3;filename=audio;"
+            b"type=application/octet-stream"
+        ),
+        b"--url",
+        b"https://asr.example:17770/v1/audio/transcriptions",
+        b"",
+    ]
+    assert str(audio_path).encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in args_path.read_bytes()
+    assert TOKEN.encode() not in result.stdout + result.stderr
+    assert stdin_path.read_bytes() == (
+        f'header = "Authorization: Bearer {TOKEN}"\n'.encode()
+    )
+    assert (tmp_path / "curl-upload").read_bytes() == audio_bytes
+    curl_environment = (tmp_path / "curl-env").read_bytes()
+    assert b"BOTIFIED_ASR_BASE_URL=" not in curl_environment
+    assert b"BOTIFIED_ASR_API_KEY=" not in curl_environment
+
+
+@pytest.mark.parametrize(
+    "known_speaker_ids",
+    [
+        ("",),
+        ("malformed/id",),
+        ("7K3M9Q2W", "7K3M9Q2W"),
+        tuple(f"{index:08d}" for index in range(33)),
+    ],
+    ids=("empty", "invalid", "duplicate", "too-many"),
+)
+def test_transcribe_meeting_rejects_invalid_known_speakers_before_curl(
+    tmp_path: Path,
+    known_speaker_ids: tuple[str, ...],
+) -> None:
+    environment, args_path, _ = _install_fake_curl(tmp_path)
+    _write_client_config(environment, _valid_config())
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"meeting audio")
+
+    result = _run(
+        environment,
+        "transcribe-meeting",
+        str(audio_path),
+        *known_speaker_ids,
+    )
+
+    assert result.returncode == 65
+    assert _error_code(result) == "invalid_known_speaker_ids"
+    assert json.loads(result.stdout)["error"]["param"] == (
+        "known_speaker_ids[]"
+    )
+    assert result.stderr == b""
+    assert not args_path.exists()
+
+
+@pytest.mark.parametrize(
     ("body", "curl_stderr", "curl_exit", "http_code", "expected_stdout"),
     [
         (
@@ -1611,6 +1759,7 @@ exec /usr/bin/sleep 30
         ("health", "202"),
         ("transcribe", "202"),
         ("transcribe-long", "200"),
+        ("transcribe-meeting", "200"),
         ("job-get", "204"),
         ("job-delete", "302"),
         ("speaker-list", "202"),
@@ -1632,7 +1781,11 @@ def test_one_shot_commands_fail_closed_on_unexpected_http_status(
         http_code=http_code,
     )
     _write_client_config(environment, _valid_config())
-    if command_name in {"transcribe", "transcribe-long"}:
+    if command_name in {
+        "transcribe",
+        "transcribe-long",
+        "transcribe-meeting",
+    }:
         audio_path = tmp_path / "audio.wav"
         audio_path.write_bytes(b"audio")
         arguments = (command_name, str(audio_path))

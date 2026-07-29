@@ -1,6 +1,6 @@
 ---
 name: botified-asr
-description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long transcription jobs, register speaker profiles from explicitly provided samples, list or query profiles, or update metadata or delete a job or profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, obtain a transcription, work with a long transcription job, or explicitly register or manage a speaker profile.
+description: Check a configured Botified ASR service's readiness, transcribe local audio, submit or query long and meeting transcription jobs, register speaker profiles from explicitly provided samples, list or query profiles, or update metadata or delete a job or profile when explicitly requested. Use when Codex needs to verify client configuration and authentication, obtain a transcription, work with a transcription job, or explicitly register or manage a speaker profile.
 ---
 
 # Botified ASR Client
@@ -9,15 +9,24 @@ Resolve `scripts/botified-asr` relative to this `SKILL.md` (the skill root), the
 first run `scripts/botified-asr health`. Only after it returns ready, run
 `scripts/botified-asr transcribe AUDIO_FILE` for a basic transcription, or
 `scripts/botified-asr transcribe-long AUDIO_FILE` to submit a long transcription
-job. Use the returned job ID with `scripts/botified-asr job-get JOB_ID` to query
-the job's current state or result, or with
+job.
+
+For a meeting transcription, first decide whether registered speakers are
+relevant. Only when candidates are needed, use `scripts/botified-asr
+speaker-list` and select up to 32 IDs; never list speakers automatically. Submit
+with `scripts/botified-asr transcribe-meeting AUDIO_FILE [SPEAKER_ID ...]`,
+omitting all IDs when no known-speaker candidates are selected.
+
+Long and meeting submissions are asynchronous. Use the returned job ID with
+`scripts/botified-asr job-get JOB_ID` to query the job's current state or result,
+or with
 `scripts/botified-asr job-wait JOB_ID TIMEOUT_SECONDS` to wait for its terminal
 response. The wait command outputs only that final response, never intermediate
 active responses. Only when the user explicitly asks to cancel or delete a job,
 run `scripts/botified-asr job-delete JOB_ID`. HTTP 202 reports the immediate
 request without waiting; terminal HTTP 204 produces no output.
 
-Use `scripts/botified-asr speaker-list` to list existing speaker profiles and
+Use `scripts/botified-asr speaker-list` when existing profiles must be listed and
 `scripts/botified-asr speaker-get SPEAKER_ID` to query one. Only when the user
 explicitly asks to register a speaker and provides two to five local sample
 files, run
@@ -32,11 +41,13 @@ or pass a nonempty value to replace it. Only when the user explicitly asks to
 delete a speaker profile, run
 `scripts/botified-asr speaker-delete SPEAKER_ID`.
 
-Return the helper's JSON unchanged. Successful `job-delete` and
-`speaker-delete` HTTP 204 responses intentionally have no output. Treat a
-nonzero exit as a failed readiness check, transcription, submission, query,
-registration, metadata update, wait, or deletion and report its stable error
-code without exposing credentials, local paths, voice samples, or raw
-configuration.
+The helper returns service JSON unchanged and never summarizes it. After a
+meeting job reaches a successful terminal response, project its
+`result.segments` into a speaker/timestamp meeting transcript and preserve every
+`Unknown` speaker label. Successful `job-delete` and `speaker-delete` HTTP 204
+responses intentionally have no output. Treat a nonzero exit as a failed
+readiness check, transcription, submission, query, registration, metadata
+update, wait, or deletion and report its stable error code without exposing
+credentials, local paths, voice samples, or raw configuration.
 
 Read `references/api.md` only when the request or response contract is needed.
