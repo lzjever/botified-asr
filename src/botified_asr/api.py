@@ -5,12 +5,13 @@ import hmac
 import logging
 import re
 import time
-from asyncio import Event, Task, create_task, wait_for
+from asyncio import Event, Task, create_task, shield, wait_for
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypeVar
 
 import anyio
 from python_multipart import MultipartParser
@@ -46,6 +47,7 @@ from botified_asr.contracts import (
 )
 from botified_asr.errors import InferenceSaturated
 from botified_asr.jobs import (
+    DurableJob,
     JobDeletionOutcome,
     JobStatus,
     QueuedJobSpec,
@@ -108,6 +110,7 @@ _RETENTION_SWEEP_BATCH_SIZE = 32
 _RETENTION_SWEEP_INTERVAL_SECONDS = 60.0
 _HTTP_LOGGER = logging.getLogger("botified_asr.http")
 _ERROR_CODE_SCOPE_KEY = "botified_asr.error_code"
+_T = TypeVar("_T")
 
 
 def _log_http_completion(extra: dict[str, object]) -> None:
@@ -461,7 +464,11 @@ def create_app(
         prepared: PreparedSyncResponse | None = None
         response_owns_artifact = False
         try:
-            lease = storage.begin_upload("transcription")
+            lease = await _run_in_threadpool_to_completion(
+                storage.begin_upload,
+                "transcription",
+                discard_on_cancel=storage.abort_upload,
+            )
         except StorageAdmissionError as exc:
             raise _storage_admission_error(exc) from exc
 
@@ -475,8 +482,19 @@ def create_app(
                 prefer_async=prefer_async,
             )
             options = canonicalize_options(fields)
-            input_ref = storage.seal_upload(lease)
-            input_path = storage.resolve_input(input_ref)
+
+            def seal_upload() -> InputRef:
+                nonlocal input_ref
+                input_ref = storage.seal_upload(lease)
+                return input_ref
+
+            input_ref = await _run_in_threadpool_to_completion(
+                seal_upload,
+            )
+            input_path = await _run_in_threadpool_to_completion(
+                storage.resolve_input,
+                input_ref,
+            )
             cancellation = Cancellation()
             try:
                 prepared = await _prepare_while_watching_disconnect(
@@ -521,7 +539,10 @@ def create_app(
                     "Internal server error",
                     error_type="server_error",
                 ) from exc
-            storage.release_input(input_ref)
+            await _run_in_threadpool_to_completion(
+                storage.release_input,
+                input_ref,
+            )
             input_cleanup_complete = True
             response = _PreparedStreamingResponse(prepared)
             response_owns_artifact = True
@@ -532,9 +553,15 @@ def create_app(
             try:
                 if not input_cleanup_complete:
                     if input_ref is None:
-                        storage.abort_upload(lease)
+                        await _run_in_threadpool_to_completion(
+                            storage.abort_upload,
+                            lease,
+                        )
                     else:
-                        storage.release_input(input_ref)
+                        await _run_in_threadpool_to_completion(
+                            storage.release_input,
+                            input_ref,
+                        )
             finally:
                 if prepared is not None and not response_owns_artifact:
                     _close_prepared(prepared)
@@ -951,7 +978,7 @@ async def _prepare_speaker_change(
                 )
         return _PreparedSpeakerChange(name, description, embedding)
     finally:
-        uploads.cleanup()
+        await _run_in_threadpool_to_completion(uploads.cleanup)
 
 
 def _speaker_replacement_matches_policy(
@@ -1158,6 +1185,42 @@ def _close_prepared(prepared: PreparedSyncResponse) -> None:
                 raise
 
 
+async def _run_in_threadpool_to_completion(
+    work: Callable[..., _T],
+    *args: object,
+    discard_on_cancel: Callable[[_T], object] | None = None,
+) -> _T:
+    async def run_work() -> _T:
+        with anyio.CancelScope(shield=True):
+            return await run_in_threadpool(work, *args)
+
+    work_task = create_task(run_work())
+    propagated_cancellation: BaseException | None = None
+    while True:
+        try:
+            with anyio.CancelScope(shield=True):
+                result = await shield(work_task)
+            break
+        except anyio.get_cancelled_exc_class() as error:
+            propagated_cancellation = error
+            if work_task.done():
+                result = work_task.result()
+                break
+    if propagated_cancellation is None:
+        try:
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        except anyio.get_cancelled_exc_class() as error:
+            propagated_cancellation = error
+    if propagated_cancellation is not None:
+        if discard_on_cancel is not None:
+            await _run_in_threadpool_to_completion(
+                discard_on_cancel,
+                result,
+            )
+        raise propagated_cancellation
+    return result
+
+
 async def _submit_async_transcription(
     request: Request,
     storage: Storage,
@@ -1166,7 +1229,11 @@ async def _submit_async_transcription(
     speaker_embedding_policy: SpeakerEmbeddingPolicy,
     job_executor: JobExecutor | None,
 ) -> Response:
-    lease = storage.begin_job_upload(datetime.now(timezone.utc))
+    lease = await _run_in_threadpool_to_completion(
+        storage.begin_job_upload,
+        datetime.now(timezone.utc),
+        discard_on_cancel=storage.abort_job_upload,
+    )
     cleanup_handle: JobUploadLease | JobInputRef = lease
     ownership_transferred = False
     try:
@@ -1177,7 +1244,16 @@ async def _submit_async_transcription(
             prefer_async=True,
         )
         options = canonicalize_options(fields)
-        input_ref = storage.seal_job_upload(lease)
+
+        def seal_job_upload() -> JobInputRef:
+            nonlocal cleanup_handle
+            input_ref = storage.seal_job_upload(lease)
+            cleanup_handle = input_ref
+            return input_ref
+
+        input_ref = await _run_in_threadpool_to_completion(
+            seal_job_upload,
+        )
         cleanup_handle = input_ref
         cancellation = Cancellation()
         try:
@@ -1206,11 +1282,22 @@ async def _submit_async_transcription(
             ),
             processor_fingerprint=processor_fingerprint,
         )
-        try:
+
+        def publish_job() -> DurableJob:
+            nonlocal ownership_transferred
             published = storage.publish_job(
                 input_ref,
                 spec,
                 speaker_embedding_policy=speaker_embedding_policy,
+            )
+            ownership_transferred = True
+            if job_executor is not None:
+                job_executor.wake()
+            return published
+
+        try:
+            published = await _run_in_threadpool_to_completion(
+                publish_job,
             )
         except SelectedSpeakerNotFoundError as exc:
             raise ApiError(
@@ -1226,9 +1313,6 @@ async def _submit_async_transcription(
                 "One or more known speakers are incompatible",
                 param="known_speaker_ids[]",
             ) from exc
-        ownership_transferred = True
-        if job_executor is not None:
-            job_executor.wake()
         return JSONResponse(
             {
                 "id": published.id,
@@ -1243,7 +1327,10 @@ async def _submit_async_transcription(
         )
     finally:
         if not ownership_transferred:
-            storage.abort_job_upload(cleanup_handle)
+            await _run_in_threadpool_to_completion(
+                storage.abort_job_upload,
+                cleanup_handle,
+            )
 
 
 def _diarization_too_long_api_error() -> ApiError:
@@ -1586,13 +1673,13 @@ async def _ingest_multipart(
                 )
                 feed = chunk[offset : offset + feed_size]
                 state.body_bytes += len(feed)
-                parser.write(feed)
+                await _run_in_threadpool_to_completion(parser.write, feed)
                 offset += feed_size
                 if offset < len(chunk) and state.body_bytes == raw_body_limit:
                     raise _invalid_multipart(
                         "Multipart body exceeds file plus overhead limits"
                     )
-        parser.finalize()
+        await _run_in_threadpool_to_completion(parser.finalize)
     except ClientDisconnect as exc:
         raise ApiError(
             400, "client_disconnected", "Client disconnected during upload"

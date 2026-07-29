@@ -852,6 +852,128 @@ def test_multipart_overhead_has_an_independent_limit(storage: Storage) -> None:
     assert storage.total_reserved_bytes() == 0
 
 
+def test_slow_multipart_append_does_not_block_event_loop(
+    storage: Storage,
+) -> None:
+    boundary = b"slow-append-boundary"
+    body = multipart_body(boundary, b"1234")
+    append_entered = threading.Event()
+    release_append = threading.Event()
+    appended: list[bytes] = []
+
+    class ChunkedRequest:
+        headers = {
+            "content-type": ("multipart/form-data; boundary=slow-append-boundary")
+        }
+
+        async def stream(self):
+            split = body.index(b"1234") + 2
+            yield body[:split]
+            yield body[split:]
+
+    def slow_append(payload: bytes) -> None:
+        appended.append(payload)
+        append_entered.set()
+        assert release_append.wait(timeout=1), (
+            "event-loop heartbeat could not run during append"
+        )
+
+    async def invoke() -> dict[str, list[str]]:
+        async def heartbeat() -> None:
+            while not append_entered.is_set():
+                await asyncio.sleep(0)
+            release_append.set()
+
+        fields, _ = await asyncio.wait_for(
+            asyncio.gather(
+                api_module._ingest_multipart(
+                    ChunkedRequest(),
+                    storage,
+                    slow_append,
+                    prefer_async=False,
+                ),
+                heartbeat(),
+            ),
+            timeout=2,
+        )
+        return fields
+
+    fields = asyncio.run(invoke())
+
+    assert fields["model"] == ["sensevoice"]
+    assert b"".join(appended) == b"1234"
+
+
+def test_cancelled_threadpool_acquisition_cleans_owned_upload(
+    storage: Storage,
+) -> None:
+    acquired = threading.Event()
+    release = threading.Event()
+    real_begin = storage.begin_upload
+
+    def slow_begin(resource_kind: str):
+        lease = real_begin(resource_kind)
+        acquired.set()
+        assert release.wait(timeout=1)
+        return lease
+
+    async def invoke() -> None:
+        task = asyncio.create_task(
+            api_module._run_in_threadpool_to_completion(
+                slow_begin,
+                "transcription",
+                discard_on_cancel=storage.abort_upload,
+            )
+        )
+        assert await anyio.to_thread.run_sync(acquired.wait, 1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(invoke())
+
+    assert storage.active_upload_count() == 0
+    assert storage.total_reserved_bytes() == 0
+    assert not list(storage.staging_dir.iterdir())
+
+
+def test_anyio_cancelled_acquisition_cleans_owned_upload(
+    storage: Storage,
+) -> None:
+    acquired = threading.Event()
+    release = threading.Event()
+    real_begin = storage.begin_upload
+
+    def slow_begin(resource_kind: str):
+        lease = real_begin(resource_kind)
+        acquired.set()
+        assert release.wait(timeout=1)
+        return lease
+
+    async def invoke() -> None:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as task_group:
+                async def cancel_when_acquired() -> None:
+                    assert await anyio.to_thread.run_sync(acquired.wait, 1)
+                    scope.cancel()
+                    release.set()
+
+                task_group.start_soon(cancel_when_acquired)
+                await api_module._run_in_threadpool_to_completion(
+                    slow_begin,
+                    "transcription",
+                    discard_on_cancel=storage.abort_upload,
+                )
+        assert scope.cancel_called
+
+    asyncio.run(invoke())
+
+    assert storage.active_upload_count() == 0
+    assert storage.total_reserved_bytes() == 0
+    assert not list(storage.staging_dir.iterdir())
+
+
 def test_same_byte_stream_is_independent_of_asgi_chunking(storage: Storage) -> None:
     boundary = b"stable-boundary"
     body = multipart_body(boundary, b"123456789")

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anyio
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -309,6 +313,78 @@ def test_async_post_returns_exact_202_and_retains_queued_input(
     assert storage.total_reserved_bytes() == len(b"audio")
     assert_probe_only(prober, processor)
     assert wake_calls == 1
+
+
+def test_native_cancel_during_publish_keeps_visible_job(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "7K3M9Q2W"
+    monkeypatch.setattr(storage_module, "generate_job_id", lambda: job_id)
+    real_publish = storage.publish_job
+    publish_committed = threading.Event()
+    release_publish = threading.Event()
+    wake_calls = 0
+
+    def blocking_publish(*args, **kwargs):
+        published = real_publish(*args, **kwargs)
+        publish_committed.set()
+        assert release_publish.wait(timeout=2)
+        return published
+
+    class RecordingExecutor:
+        ready = True
+        failure = None
+
+        def wake(self) -> None:
+            nonlocal wake_calls
+            wake_calls += 1
+
+    monkeypatch.setattr(storage, "publish_job", blocking_publish)
+    app = create_app(
+        api_key="test-secret",
+        readiness=Readiness(True, True, True),
+        storage=storage,
+        processor=RejectingProcessor(),
+        audio_prober=RecordingProber(),
+        processor_fingerprint=PROCESSOR_FINGERPRINT,
+        speaker_embedding_policy=embedding_policy(),
+        job_executor=RecordingExecutor(),  # type: ignore[arg-type]
+        close_storage_on_shutdown=False,
+    )
+
+    async def run() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/audio/transcriptions",
+                    headers=AUTH,
+                    files={
+                        "file": ("audio.wav", b"audio"),
+                        "model": (None, "sensevoice"),
+                    },
+                )
+            )
+            assert await anyio.to_thread.run_sync(publish_committed.wait, 2)
+            task.cancel()
+            release_publish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+    queued = storage.get_visible_job(job_id)
+    assert queued is not None
+    assert queued.status.value == "queued"
+    assert wake_calls == 1
+    storage.delete_or_cancel_job(job_id, CREATED_AT)
+    storage.cleanup_cancelled_job_input(job_id)
+    storage.delete_or_cancel_job(job_id, CREATED_AT)
+    assert_cleaned(storage)
 
 
 def test_async_duration_above_the_sync_limit_is_still_queued(

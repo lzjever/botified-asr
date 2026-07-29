@@ -873,6 +873,52 @@ def _scope(boundary: bytes) -> dict[str, object]:
     }
 
 
+def test_native_cancel_during_seal_releases_input(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_seal = storage.seal_upload
+    seal_entered = threading.Event()
+    release_seal = threading.Event()
+
+    def blocking_seal(lease):
+        input_ref = real_seal(lease)
+        seal_entered.set()
+        assert release_seal.wait(timeout=2)
+        return input_ref
+
+    monkeypatch.setattr(storage, "seal_upload", blocking_seal)
+
+    async def run() -> None:
+        boundary, body = _multipart_body()
+        app = _app(storage, SpyProcessor())
+        request_sent = False
+
+        async def receive() -> dict[str, object]:
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            await anyio.sleep_forever()
+
+        async def send(_message: dict[str, object]) -> None:
+            pass
+
+        task = asyncio.create_task(app(_scope(boundary), receive, send))
+        assert await anyio.to_thread.run_sync(seal_entered.wait, 2)
+        task.cancel()
+        release_seal.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    _assert_no_resources(storage)
+
+
 def test_input_is_released_while_artifact_is_owned_before_first_body(
     storage: Storage,
 ) -> None:
