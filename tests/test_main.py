@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from botified_asr.speaker_enrollment import SpeakerEnrollmentPolicy
+from botified_asr.speaker_matching import KnownSpeakerMatchPolicy
 from botified_asr.speakers import AnonymousSpeakerClusteringPolicy
 
 
@@ -341,6 +342,7 @@ def expected_success_events(
                     low_frequency_beta=2.0,
                     normalized_gap_gamma=0.5,
                 ),
+                "known_speaker_match_policy": KnownSpeakerMatchPolicy(0.31),
             },
         ),
         (
@@ -354,6 +356,7 @@ def expected_success_events(
                     low_frequency_beta=2.0,
                     normalized_gap_gamma=0.5,
                 ),
+                "known_speaker_match_policy": KnownSpeakerMatchPolicy(0.31),
             },
         ),
         (
@@ -442,11 +445,17 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
         for name, _args, kwargs in scenario.events
         if name == "Processor"
     ]
+    match_policies = [
+        kwargs["known_speaker_match_policy"]
+        for name, _args, kwargs in scenario.events
+        if name == "Processor"
+    ]
     enrollment_policies = [
         args[-1]
         for args, _kwargs in scenario.enrollment_processor_calls
     ]
     assert processor_policies[0] is processor_policies[1]
+    assert match_policies[0] is match_policies[1]
     assert enrollment_policies[0] is enrollment_policies[1]
     assert len(scenario.executor_clocks) == 1
     assert callable(scenario.executor_clocks[0])

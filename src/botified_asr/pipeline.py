@@ -24,12 +24,18 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.errors import PipelineError, PipelineNotReady
-from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_matching import (
+    KnownSpeakerMatchPolicy,
+    SpeakerLabelMapping,
+    SpeakerMatchInputError,
+    match_selected_speakers,
+)
 from botified_asr.speaker_snapshot import (
     SelectedSpeaker,
     SelectedSpeakerSnapshot,
 )
 from botified_asr.speakers import (
+    AnonymousSpeakerCluster,
     AnonymousSpeakerClusteringPolicy,
     AnonymousSpeakerClusteringResult,
     SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS,
@@ -1320,12 +1326,14 @@ class Processor:
         vad_adapter: StreamingVadAdapter | None = None,
         speaker_adapter: SpeakerEmbeddingAdapter | None = None,
         speaker_clustering_policy: AnonymousSpeakerClusteringPolicy | None = None,
+        known_speaker_match_policy: KnownSpeakerMatchPolicy | None = None,
     ) -> None:
         self._frontend = frontend
         self._adapter = adapter
         self._vad_adapter = vad_adapter
         self._speaker_adapter = speaker_adapter
         self._speaker_clustering_policy = speaker_clustering_policy
+        self._known_speaker_match_policy = known_speaker_match_policy
 
     def process(
         self,
@@ -1379,7 +1387,9 @@ class Processor:
                 canonical_options.model == "sensevoice-diarize"
                 and canonical_options.chunking_strategy == "auto"
             )
-            if selected_speaker_snapshot.speakers:
+            if selected_speaker_snapshot.speakers and (
+                not is_diarize or self._known_speaker_match_policy is None
+            ):
                 raise PipelineNotReady()
             if is_diarize and (
                 self._vad_adapter is None
@@ -1402,6 +1412,7 @@ class Processor:
                 else media_probe
             )
             blocks = self._frontend.decode(input_path, probe, cancellation)
+            speaker_mapping = SpeakerLabelMapping(())
             if is_diarize:
                 vad_adapter = self._vad_adapter
                 speaker_adapter = self._speaker_adapter
@@ -1424,7 +1435,7 @@ class Processor:
                     effective_max_audio_samples=effective_max_audio_samples,
                 )
                 close_decoder()
-                self._process_offline_diarization(
+                clusters = self._process_offline_diarization(
                     speech_islands,
                     source_segments,
                     cancellation,
@@ -1435,6 +1446,23 @@ class Processor:
                     language=canonical_options.language,
                     total_samples=actual_samples,
                 )
+                if selected_speaker_snapshot.speakers:
+                    known_speaker_match_policy = (
+                        self._known_speaker_match_policy
+                    )
+                    if known_speaker_match_policy is None:
+                        raise PipelineNotReady()
+                    try:
+                        speaker_mapping = match_selected_speakers(
+                            clusters,
+                            selected_speaker_snapshot,
+                            known_speaker_match_policy,
+                        )
+                    except SpeakerMatchInputError as error:
+                        raise PipelineError(
+                            "invalid_model_output",
+                            "Speaker matching input is invalid",
+                        ) from error
             elif is_vad:
                 vad_adapter = self._vad_adapter
                 if vad_adapter is None:
@@ -1460,7 +1488,6 @@ class Processor:
                     ),
                 )
             close_decoder()
-            speaker_mapping = SpeakerLabelMapping(())
             _check_processing_cancellation(cancellation)
             progress_sink.update(
                 processed_samples=actual_samples,
@@ -1694,14 +1721,14 @@ class Processor:
         speaker_clustering_policy: AnonymousSpeakerClusteringPolicy,
         language: str,
         total_samples: int,
-    ) -> None:
+    ) -> tuple[AnonymousSpeakerCluster, ...]:
         if not speech_islands:
             if source_segments:
                 raise PipelineError(
                     "invalid_model_output",
                     "Speech segmenter returned inconsistent speech",
                 )
-            return
+            return ()
 
         def durable_fence() -> None:
             _durable_progress_fence(
@@ -1805,6 +1832,7 @@ class Processor:
                 post_batch_fence=durable_fence,
             )
         writer.flush(post_batch_fence=durable_fence)
+        return clustering_result.clusters
 
     def _process_direct(
         self,

@@ -154,7 +154,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
     "fsmn_vad": "<sha256>",
     "sensevoice": "<sha256>"
   },
-  "processor_compatibility_version": 2,
+  "processor_compatibility_version": 3,
   "result_envelope_version": 1,
   "speaker_snapshot_wire_version": 1,
   "version": 1

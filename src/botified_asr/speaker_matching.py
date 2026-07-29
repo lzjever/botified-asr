@@ -17,30 +17,18 @@ from botified_asr.speakers import AnonymousSpeakerCluster
 @dataclass(frozen=True, slots=True)
 class KnownSpeakerMatchPolicy:
     match_threshold: float
-    top_two_margin: float
 
     def __post_init__(self) -> None:
         threshold = _finite_real(
             self.match_threshold,
             name="known speaker match threshold",
         )
-        margin = _finite_real(
-            self.top_two_margin,
-            name="known speaker top-two margin",
-        )
         if not -1.0 <= threshold <= 1.0:
             raise ValueError("known speaker match threshold must be between -1 and 1")
-        if not 0.0 <= margin <= 2.0:
-            raise ValueError("known speaker top-two margin must be between 0 and 2")
         object.__setattr__(
             self,
             "match_threshold",
             0.0 if threshold == 0.0 else threshold,
-        )
-        object.__setattr__(
-            self,
-            "top_two_margin",
-            0.0 if margin == 0.0 else margin,
         )
 
 
@@ -218,10 +206,7 @@ def _select_match(
             for index, similarity in enumerate(similarities)
             if index != best_index
         )
-        if (
-            best_similarity == second_similarity
-            or best_similarity - second_similarity < policy.top_two_margin
-        ):
+        if best_similarity == second_similarity:
             return None
     selected = selected_speakers[best_index]
     return KnownSpeakerMatch(

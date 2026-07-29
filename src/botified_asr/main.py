@@ -23,6 +23,7 @@ from botified_asr.speaker_enrollment import (
     SpeakerEnrollmentPolicy,
     SpeakerEnrollmentProcessor,
 )
+from botified_asr.speaker_matching import KnownSpeakerMatchPolicy
 from botified_asr.speakers import AnonymousSpeakerClusteringPolicy
 from botified_asr.storage import Storage
 
@@ -81,8 +82,12 @@ def main() -> None:
             low_frequency_beta=2.0,
             normalized_gap_gamma=0.5,
         )
+        speaker_similarity_threshold = 0.31
         speaker_enrollment_policy = SpeakerEnrollmentPolicy(
-            consistency_threshold=0.31,
+            consistency_threshold=speaker_similarity_threshold,
+        )
+        known_speaker_match_policy = KnownSpeakerMatchPolicy(
+            match_threshold=speaker_similarity_threshold,
         )
         processor_pool = TranscriptionProcessorPool(
             tuple(
@@ -92,6 +97,7 @@ def main() -> None:
                     vad_adapter=bundle.vad,
                     speaker_adapter=bundle.speaker,
                     speaker_clustering_policy=speaker_clustering_policy,
+                    known_speaker_match_policy=known_speaker_match_policy,
                 )
                 for bundle in model_pool.bundles
             ),

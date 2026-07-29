@@ -16,7 +16,13 @@ from botified_asr.contracts import (
     CanonicalOptions,
 )
 from botified_asr.speaker_profiles import SpeakerEmbedding
-from botified_asr.speaker_matching import SpeakerLabelMapping
+from botified_asr.speaker_matching import (
+    KnownSpeakerMatch,
+    KnownSpeakerMatchPolicy,
+    SpeakerLabelMapping,
+    SpeakerLabelResolution,
+    SpeakerMatchInputError,
+)
 from botified_asr.speaker_snapshot import SelectedSpeaker, SelectedSpeakerSnapshot
 
 
@@ -1189,6 +1195,7 @@ def test_processor_constructor_rejects_removed_online_speaker_dependencies() -> 
     parameters = signature(pipeline.Processor).parameters
     assert "speaker_adapter" in parameters
     assert "speaker_clustering_policy" in parameters
+    assert "known_speaker_match_policy" in parameters
     assert "speaker_policy" not in parameters
     assert "known_speaker_policy" not in parameters
 
@@ -1226,7 +1233,7 @@ def test_diarize_readiness_fails_before_probe() -> None:
     assert sink.aborted == 1
 
 
-def test_known_diarize_remains_not_ready_with_anonymous_dependencies() -> None:
+def test_known_diarize_without_match_policy_is_not_ready_before_probe() -> None:
     decoder = FakeDecoder(_blocks(1))
     frontend = FakeFrontend(decoder)
     sink = RecordingSink()
@@ -1251,6 +1258,143 @@ def test_known_diarize_remains_not_ready_with_anonymous_dependencies() -> None:
     assert frontend.probe_calls == 0
     assert frontend.decode_calls == 0
     assert decoder.closed == 0
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_known_diarize_returns_mapping_without_changing_anonymous_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    island = pipeline.SpeechSpan(0, BLOCK_SAMPLES)
+    source = _speech_segment(0, np.ones(BLOCK_SAMPLES, dtype=np.int16))
+    _install_segmenter(
+        monkeypatch,
+        ((source,),),
+        completed_outputs=((island,),),
+    )
+    clusters = (
+        speakers.AnonymousSpeakerCluster(
+            "A",
+            tuple(float(value) for value in _unit(1.0, 0.0)),
+        ),
+        speakers.AnonymousSpeakerCluster(
+            "B",
+            tuple(float(value) for value in _unit(0.0, 1.0)),
+        ),
+    )
+    clustering_result = speakers.AnonymousSpeakerClusteringResult(
+        (0, 1),
+        clusters,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "cluster_anonymous_speakers",
+        lambda *_args, **_kwargs: clustering_result,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_project_speaker_regions",
+        lambda *_args, **_kwargs: (
+            (pipeline.SpeechSpan(0, BLOCK_SAMPLES // 2), 0),
+            (pipeline.SpeechSpan(BLOCK_SAMPLES // 2, BLOCK_SAMPLES), 1),
+        ),
+    )
+    sink = RecordingSink()
+    snapshot = _selected_snapshot()
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(FakeDecoder(_blocks(1))),
+            FakeAsrAdapter(),
+            vad_adapter=object(),
+            speaker_adapter=RecordingExactSpeakerAdapter(),
+            speaker_clustering_policy=_clustering_policy(),
+            known_speaker_match_policy=KnownSpeakerMatchPolicy(0.31),
+        ),
+        sink,
+        selected_speaker_snapshot=snapshot,
+        canonical_options=_options(
+            model="sensevoice-diarize",
+            known_speaker_ids=("00000001",),
+        ),
+    )
+
+    assert [record.anonymous_speaker for record in sink.records] == ["A", "B"]
+    assert result.speaker_mapping == SpeakerLabelMapping(
+        (
+            SpeakerLabelResolution(
+                "A",
+                KnownSpeakerMatch(
+                    "00000001",
+                    "Speaker 00000001",
+                    1.0,
+                ),
+            ),
+            SpeakerLabelResolution("B", None),
+        )
+    )
+    assert sink.finalized == 1
+    assert sink.aborted == 0
+
+
+def test_known_match_input_error_aborts_as_invalid_model_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    island = pipeline.SpeechSpan(0, BLOCK_SAMPLES)
+    source = _speech_segment(0, np.ones(BLOCK_SAMPLES, dtype=np.int16))
+    _install_segmenter(
+        monkeypatch,
+        ((source,),),
+        completed_outputs=((island,),),
+    )
+    clustering_result = speakers.AnonymousSpeakerClusteringResult(
+        (0, 0),
+        (
+            speakers.AnonymousSpeakerCluster(
+                "A",
+                tuple(float(value) for value in _unit(1.0, 0.0)),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "cluster_anonymous_speakers",
+        lambda *_args, **_kwargs: clustering_result,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_project_speaker_regions",
+        lambda *_args, **_kwargs: ((island, 0),),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "match_selected_speakers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            SpeakerMatchInputError()
+        ),
+        raising=False,
+    )
+    sink = RecordingSink()
+
+    with pytest.raises(pipeline.PipelineError) as caught:
+        _process(
+            pipeline.Processor(
+                FakeFrontend(FakeDecoder(_blocks(1))),
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=RecordingExactSpeakerAdapter(),
+                speaker_clustering_policy=_clustering_policy(),
+                known_speaker_match_policy=KnownSpeakerMatchPolicy(0.31),
+            ),
+            sink,
+            selected_speaker_snapshot=_selected_snapshot(),
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001",),
+            ),
+        )
+
+    assert caught.value.code == "invalid_model_output"
     assert sink.finalized == 0
     assert sink.aborted == 1
 

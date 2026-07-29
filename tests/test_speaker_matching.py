@@ -75,7 +75,7 @@ def _cosine(
 
 def test_matcher_policy_and_values_are_frozen_and_strict() -> None:
     matching = _matching_module()
-    policy = matching.KnownSpeakerMatchPolicy(0.0, 0.0)
+    policy = matching.KnownSpeakerMatchPolicy(0.31)
     match = matching.KnownSpeakerMatch("00000001", "Alice", 1.0)
     resolution = matching.SpeakerLabelResolution("A", match)
     mapping = matching.SpeakerLabelMapping((resolution,))
@@ -83,23 +83,13 @@ def test_matcher_policy_and_values_are_frozen_and_strict() -> None:
         policy.match_threshold = 0.5
     with pytest.raises(FrozenInstanceError):
         mapping.resolutions = ()
+    assert not hasattr(policy, "top_two_margin")
 
-    for kwargs in (
-        {"match_threshold": True, "top_two_margin": 0.0},
-        {"match_threshold": 0.0, "top_two_margin": False},
-    ):
-        with pytest.raises(TypeError):
-            matching.KnownSpeakerMatchPolicy(**kwargs)
-    for kwargs in (
-        {"match_threshold": math.nan, "top_two_margin": 0.0},
-        {"match_threshold": 0.0, "top_two_margin": math.inf},
-        {"match_threshold": -1.01, "top_two_margin": 0.0},
-        {"match_threshold": 1.01, "top_two_margin": 0.0},
-        {"match_threshold": 0.0, "top_two_margin": -0.01},
-        {"match_threshold": 0.0, "top_two_margin": 2.01},
-    ):
+    with pytest.raises(TypeError):
+        matching.KnownSpeakerMatchPolicy(True)
+    for value in (math.nan, math.inf, -1.01, 1.01):
         with pytest.raises(ValueError):
-            matching.KnownSpeakerMatchPolicy(**kwargs)
+            matching.KnownSpeakerMatchPolicy(value)
 
     error = matching.SpeakerMatchInputError()
     assert isinstance(error, ValueError)
@@ -116,102 +106,54 @@ def test_empty_selected_snapshot_is_anonymous_mode_with_no_mapping() -> None:
     assert matching.match_selected_speakers(
         clusters,
         speaker_snapshot.SelectedSpeakerSnapshot(()),
-        matching.KnownSpeakerMatchPolicy(1.0, 2.0),
+        matching.KnownSpeakerMatchPolicy(1.0),
     ) == matching.SpeakerLabelMapping(())
     assert matching.match_selected_speakers(
         (),
         speaker_snapshot.SelectedSpeakerSnapshot(
             (_selected("00000001", "Alice", 1.0, 0.0),)
         ),
-        matching.KnownSpeakerMatchPolicy(1.0, 2.0),
+        matching.KnownSpeakerMatchPolicy(1.0),
     ) == matching.SpeakerLabelMapping(())
 
 
-def test_single_candidate_threshold_is_inclusive_without_margin() -> None:
+def test_unique_maximum_at_threshold_matches_but_below_or_exact_tie_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     matching = _matching_module()
     cluster = _cluster("A", 1.0, 0.0)
-    selected = _selected("00000001", "Alice", 0.0, 1.0)
-    snapshot = speaker_snapshot.SelectedSpeakerSnapshot((selected,))
-    similarity = _cosine(cluster, selected)
-    assert similarity == 0.0
+    alice = _selected("00000001", "Alice", 1.0, 0.0)
+    bob = _selected("00000002", "Bob", 0.0, 1.0)
+    snapshot = speaker_snapshot.SelectedSpeakerSnapshot((alice, bob))
+    policy = matching.KnownSpeakerMatchPolicy(0.31)
 
-    matched = matching.match_selected_speakers(
-        (cluster,),
-        snapshot,
-        matching.KnownSpeakerMatchPolicy(0.0, 2.0),
+    def resolve(*similarities: float) -> matching.SpeakerLabelMapping:
+        values = iter(similarities)
+        monkeypatch.setattr(
+            matching,
+            "_cosine",
+            lambda *_args: next(values),
+        )
+        return matching.match_selected_speakers(
+            (cluster,),
+            snapshot,
+            policy,
+        )
+
+    assert resolve(0.31, 0.30).resolutions[0].match == (
+        matching.KnownSpeakerMatch(alice.id, alice.name, 0.31)
     )
-    assert matched == matching.SpeakerLabelMapping(
-        (
-            matching.SpeakerLabelResolution(
-                "A",
-                matching.KnownSpeakerMatch(
-                    selected.id,
-                    selected.name,
-                    similarity,
-                ),
-            ),
+    assert resolve(math.nextafter(0.31, -math.inf), 0.30) == (
+        matching.SpeakerLabelMapping(
+            (matching.SpeakerLabelResolution("A", None),)
         )
     )
-
-    rejected = matching.match_selected_speakers(
-        (cluster,),
-        snapshot,
-        matching.KnownSpeakerMatchPolicy(
-            math.nextafter(0.0, math.inf),
-            0.0,
-        ),
-    )
-    assert rejected == matching.SpeakerLabelMapping(
+    assert resolve(0.8, 0.8) == matching.SpeakerLabelMapping(
         (matching.SpeakerLabelResolution("A", None),)
     )
-
-
-def test_multi_candidate_margin_is_inclusive_but_ties_are_unknown() -> None:
-    matching = _matching_module()
-    cluster = _cluster("A", 1.0, 0.0)
-    best = _selected("00000001", "Alice", 1.0, 0.0)
-    second = _selected("00000002", "Bob", 0.0, 1.0)
-    snapshot = speaker_snapshot.SelectedSpeakerSnapshot((best, second))
-    best_similarity = _cosine(cluster, best)
-    margin = best_similarity - _cosine(cluster, second)
-    assert best_similarity == 1.0
-    assert margin == 1.0
-
-    at_margin = matching.match_selected_speakers(
-        (cluster,),
-        snapshot,
-        matching.KnownSpeakerMatchPolicy(1.0, 1.0),
-    )
-    assert at_margin.resolutions[0].match == matching.KnownSpeakerMatch(
-        best.id,
-        best.name,
-        best_similarity,
-    )
-    above_margin = matching.match_selected_speakers(
-        (cluster,),
-        snapshot,
-        matching.KnownSpeakerMatchPolicy(
-            1.0,
-            math.nextafter(1.0, math.inf),
-        ),
-    )
-    assert above_margin == matching.SpeakerLabelMapping(
-        (matching.SpeakerLabelResolution("A", None),)
-    )
-
-    tied = speaker_snapshot.SelectedSpeakerSnapshot(
-        (
-            _selected("00000001", "Alice", 1.0, 0.0),
-            _selected("00000002", "Bob", 1.0, 0.0),
-        )
-    )
-    tie_result = matching.match_selected_speakers(
-        (cluster,),
-        tied,
-        matching.KnownSpeakerMatchPolicy(1.0, 0.0),
-    )
-    assert tie_result == matching.SpeakerLabelMapping(
-        (matching.SpeakerLabelResolution("A", None),)
+    almost_best = math.nextafter(0.8, -math.inf)
+    assert resolve(0.8, almost_best).resolutions[0].match == (
+        matching.KnownSpeakerMatch(alice.id, alice.name, 0.8)
     )
 
 
@@ -224,7 +166,7 @@ def test_multiple_clusters_may_match_the_same_selected_speaker() -> None:
             _cluster("B", 0.8, 0.6),
         ),
         speaker_snapshot.SelectedSpeakerSnapshot((selected,)),
-        matching.KnownSpeakerMatchPolicy(0.75, 2.0),
+        matching.KnownSpeakerMatchPolicy(0.75),
     )
     assert result.resolutions[0].match == matching.KnownSpeakerMatch(
         selected.id,
@@ -256,7 +198,7 @@ def test_nonfinite_cluster_is_rejected() -> None:
         matching.match_selected_speakers(
             (cluster,),
             snapshot,
-            matching.KnownSpeakerMatchPolicy(0.0, 0.0),
+            matching.KnownSpeakerMatchPolicy(0.0),
         )
 
 
@@ -278,5 +220,5 @@ def test_selected_embedding_dimension_must_match_clusters() -> None:
         matching.match_selected_speakers(
             (_cluster("A", 1.0, 0.0),),
             snapshot,
-            matching.KnownSpeakerMatchPolicy(0.0, 0.0),
+            matching.KnownSpeakerMatchPolicy(0.0),
         )
