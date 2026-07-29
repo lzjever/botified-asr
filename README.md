@@ -122,7 +122,10 @@ curl --fail-with-body \
 
 Add `Prefer: respond-async` to submit a persistent asynchronous job.
 
-Generate the versioned offline API description with:
+Only basic synchronous transcription is an OpenAI Audio API compatible subset.
+Asynchronous jobs, speaker profiles, diarization, and `include[]` are Botified
+extensions. Generate the exact wire description on demand from the checkout
+matching the service artifact:
 
 ```bash
 uv run scripts/generate-openapi openapi.json
@@ -143,7 +146,16 @@ The local image supports the same complete read-only config mount and
 `--config` override shown above.
 
 The [Botified ASR Skill](skills/botified-asr/) provides the corresponding agent
-client commands. The runtime does not serve an OpenAPI endpoint.
+client commands. For an official image, use the Skill from its matching exact
+Git tag; for a custom image, use the checkout that built it. Explicitly place
+or point `skills/botified-asr` at one runtime location: Codex
+`~/.codex/skills/botified-asr`, OpenClaw
+`~/.agents/skills/botified-asr`, or Botified
+`~/.local/share/botified/skills/botified-asr`. The project does not discover or
+copy the Skill automatically. After configuring `client.env`, from that Skill
+root first run `scripts/botified-asr health`.
+
+The runtime does not serve an OpenAPI endpoint.
 
 ## Models
 
