@@ -18,7 +18,83 @@ Speaker diarization and identity matching are probabilistic. An unknown or
 incorrect speaker label is possible and must not be treated as authentication
 or authorization.
 
-## Run from source
+## Run the CPU container
+
+The supported production artifact is the fixed-version, multi-architecture CPU
+image. It supports Linux x86_64 and aarch64; no mutable `latest` tag is
+published.
+
+Create the client connection file with a random API key:
+
+```bash
+client_dir="${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr"
+client_env="$client_dir/client.env"
+umask 077
+mkdir -p "$client_dir"
+chmod 700 "$client_dir"
+api_key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+cat > "$client_env" <<EOF
+BOTIFIED_ASR_BASE_URL=http://127.0.0.1:17770
+BOTIFIED_ASR_API_KEY=$api_key
+EOF
+chmod 600 "$client_env"
+```
+
+The service and the Botified ASR Skill use this same mode `0600` file. Start
+the current fixed version:
+
+```bash
+docker run --detach \
+  --name botified-asr \
+  --restart on-failure:3 \
+  --env-file "${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env" \
+  --publish 127.0.0.1:17770:17770 \
+  --mount type=volume,src=botified-asr-data,dst=/data \
+  ghcr.io/lzjever/botified-asr:v0.0.0
+```
+
+Docker creates the named volume if needed. `/data/state` holds the database,
+jobs, results, and speaker data; its sibling `/data/models` holds the model
+cache. The first startup downloads pinned model revisions and can take several
+minutes.
+
+Inspect the logs, then make an authenticated ready request:
+
+```bash
+docker logs botified-asr
+
+client_env="${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env"
+base_url="$(sed -n 's/^BOTIFIED_ASR_BASE_URL=//p' "$client_env")"
+api_key="$(sed -n 's/^BOTIFIED_ASR_API_KEY=//p' "$client_env")"
+curl --fail-with-body \
+  --header "Authorization: Bearer $api_key" \
+  "$base_url/health/ready"
+```
+
+### Advanced container configuration
+
+The image already contains its complete default configuration. To change
+inference lanes, capacity, or the public URL, start with
+[config/container.yaml](config/container.yaml) from the exact Git tag matching
+the image version. Copy and edit the whole file, keeping `/data/state` and
+`/data/models` as non-overlapping siblings, then run:
+
+```bash
+docker run --detach \
+  --name botified-asr \
+  --restart on-failure:3 \
+  --env-file "${XDG_CONFIG_HOME:-$HOME/.config}/botified-asr/client.env" \
+  --publish 127.0.0.1:17770:17770 \
+  --mount type=volume,src=botified-asr-data,dst=/data \
+  --mount type=bind,src=/absolute/path/config.yaml,dst=/etc/botified-asr/custom.yaml,readonly \
+  ghcr.io/lzjever/botified-asr:v0.0.0 \
+  --config /etc/botified-asr/custom.yaml
+```
+
+Botified ASR loads one complete YAML; it does not merge fragments or offer
+per-field environment aliases.
+
+## Develop and build from source
 
 Python 3.11.13, `uv` 0.9.26, and `ffmpeg`/`ffprobe` are required.
 
@@ -31,7 +107,7 @@ server:
   public_base_url: "http://127.0.0.1:17770"
 YAML
 export BOTIFIED_ASR_API_KEY='replace-with-a-long-random-token'
-uv run botified-asr
+uv run botified-asr --config ~/.config/botified-asr/config.yaml
 ```
 
 The example above listens on `127.0.0.1:17770`. In another shell:
@@ -45,16 +121,27 @@ curl --fail-with-body \
   http://127.0.0.1:17770/v1/audio/transcriptions
 ```
 
-Add `Prefer: respond-async` to submit a persistent asynchronous job. For remote
-access, keep the service or container host port bound to loopback and place an
-authenticated TLS reverse proxy in front of it. Botified ASR does not configure
-TLS or a firewall.
+Add `Prefer: respond-async` to submit a persistent asynchronous job.
 
 Generate the versioned offline API description with:
 
 ```bash
 uv run scripts/generate-openapi openapi.json
 ```
+
+Power users can build a non-official image from the current checkout and package
+the Skill source:
+
+```bash
+docker build \
+  --build-arg BOTIFIED_ASR_VERSION=0.0.0 \
+  --tag botified-asr:local \
+  .
+scripts/build-skill-tarball /tmp/botified-asr-skill.tar.gz
+```
+
+The local image supports the same complete read-only config mount and
+`--config` override shown above.
 
 The [Botified ASR Skill](skills/botified-asr/) provides the corresponding agent
 client commands. The runtime does not serve an OpenAPI endpoint.

@@ -48,6 +48,7 @@ COPY --from=builder \
      /build/LICENSE \
      /build/THIRD_PARTY_NOTICES \
      /usr/share/doc/botified-asr/
+COPY config/container.yaml /etc/botified-asr/config.yaml
 
 ARG BOTIFIED_ASR_VERSION
 
@@ -63,11 +64,10 @@ RUN groupadd --gid 10001 botified-asr \
        --shell /usr/sbin/nologin \
        botified-asr \
     && mkdir -p \
-       /var/lib/botified-asr \
-       /var/cache/botified-asr/models \
+       /data/state \
+       /data/models \
     && chown -R 10001:10001 \
-       /var/lib/botified-asr \
-       /var/cache/botified-asr \
+       /data \
     && python --version \
     && botified-asr --version >/dev/null \
     && python -c 'import botified_asr, torch; assert not torch.cuda.is_available()' \
@@ -77,3 +77,4 @@ RUN groupadd --gid 10001 botified-asr \
 USER 10001:10001
 
 ENTRYPOINT ["botified-asr"]
+CMD ["--config", "/etc/botified-asr/config.yaml"]

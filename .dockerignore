@@ -3,6 +3,8 @@
 !README.md
 !LICENSE
 !THIRD_PARTY_NOTICES
+!config/
+!config/container.yaml
 !pyproject.toml
 !uv.lock
 !src/

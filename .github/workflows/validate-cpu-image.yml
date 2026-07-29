@@ -38,10 +38,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$PUBLISH" = "true" ]; then
-            test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
-            test "$GITHUB_REF" = "refs/heads/main"
-          fi
 
           version="$(
             python3 - <<'PY'
@@ -59,8 +55,14 @@ jobs:
           print(version)
           PY
           )"
+          release_version="v$version"
+          if [ "$PUBLISH" = "true" ]; then
+            test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
+            test "$GITHUB_REF" = "refs/tags/$release_version"
+            test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          fi
           printf 'project_version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          printf 'release_version=v%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'release_version=%s\n' "$release_version" >> "$GITHUB_OUTPUT"
 
   validate:
     name: Validate ${{ matrix.image_arch }}
@@ -100,19 +102,18 @@ jobs:
           printf 'BOTIFIED_ASR_VERSION=%s\n' \
             '${{ needs.prepare.outputs.project_version }}' \
             >> "$GITHUB_ENV"
-          printf 'BOTIFIED_ASR_RELEASE_VERSION=%s\n' \
-            '${{ needs.prepare.outputs.release_version }}' \
-            >> "$GITHUB_ENV"
 
       - name: Authenticate staging registry
         if: ${{ inputs.publish }}
         env:
+          BOTIFIED_ASR_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
           GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
-          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_REF" = "refs/tags/$BOTIFIED_ASR_RELEASE_VERSION"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
           printf '%s' "$GITHUB_TOKEN" \
             | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -183,29 +184,11 @@ jobs:
 
           container_name="botified-asr-cpu-validation"
           runtime_root="${{ runner.temp }}/botified-asr-validation"
-          config_dir="$runtime_root/config"
-          data_dir="$runtime_root/data"
-          model_cache_dir="$runtime_root/model-cache"
-          config_path="$config_dir/config.yaml"
-          health_response="$runtime_root/health.json"
-          transcription_response="$runtime_root/transcription.json"
+          health_response="${{ runner.temp }}/botified-asr-health.json"
+          transcription_response="${{ runner.temp }}/botified-asr-transcription.json"
 
-          mkdir -p "$config_dir" "$data_dir" "$model_cache_dir"
-          sudo chown -R 10001:10001 "$data_dir" "$model_cache_dir"
-
-          cat > "$config_path" <<'YAML'
-          server:
-            listen: "0.0.0.0:17770"
-            public_base_url: "http://127.0.0.1:17770"
-
-          runtime:
-            device: "cpu"
-            model_cache_dir: "/var/cache/botified-asr/models"
-            inference_lanes: 1
-
-          storage:
-            data_dir: "/var/lib/botified-asr"
-          YAML
+          mkdir "$runtime_root"
+          sudo chown 10001:10001 "$runtime_root"
 
           on_exit() {
             status=$?
@@ -233,14 +216,9 @@ jobs:
             --security-opt no-new-privileges \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=1g,mode=1777 \
             --mount \
-              "type=bind,src=$config_path,dst=/etc/botified-asr/config.yaml,readonly" \
-            --mount \
-              "type=bind,src=$data_dir,dst=/var/lib/botified-asr" \
-            --mount \
-              "type=bind,src=$model_cache_dir,dst=/var/cache/botified-asr/models" \
+              "type=bind,src=$runtime_root,dst=/data" \
             --env BOTIFIED_ASR_API_KEY \
-            botified-asr:test \
-            --config /etc/botified-asr/config.yaml
+            botified-asr:test
 
           host_port="$(
             docker container inspect \
@@ -303,11 +281,14 @@ jobs:
 
       - name: Push validated architecture image
         if: ${{ inputs.publish }}
+        env:
+          BOTIFIED_ASR_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
-          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_REF" = "refs/tags/$BOTIFIED_ASR_RELEASE_VERSION"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
           image="ghcr.io/lzjever/botified-asr"
           staging_ref="$image:staging-${GITHUB_RUN_ID}-${{ matrix.image_arch }}"
@@ -341,7 +322,6 @@ jobs:
               raise SystemExit("staging reference unexpectedly contains an image index")
           PY
 
-          docker logout ghcr.io
           docker buildx imagetools inspect "$image@$digest" >/dev/null
 
       - name: Stop validation container
@@ -371,24 +351,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: read
       packages: write
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-
       - name: Create and verify staging multi-architecture image
         id: staging
         env:
+          BOTIFIED_ASR_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
           GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
-          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_REF" = "refs/tags/$BOTIFIED_ASR_RELEASE_VERSION"
 
           image="ghcr.io/lzjever/botified-asr"
           printf '%s' "$GITHUB_TOKEN" \
@@ -512,125 +487,7 @@ jobs:
 
           {
             printf 'index_digest=%s\n' "$index_digest"
-            printf 'amd64_digest=%s\n' "$amd64_digest"
-            printf 'arm64_digest=%s\n' "$arm64_digest"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Build and verify release bundle
-        env:
-          AMD64_DIGEST: ${{ steps.staging.outputs.amd64_digest }}
-          ARM64_DIGEST: ${{ steps.staging.outputs.arm64_digest }}
-          BOTIFIED_ASR_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
-          INDEX_DIGEST: ${{ steps.staging.outputs.index_digest }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          image="ghcr.io/lzjever/botified-asr"
-          release_dir="$RUNNER_TEMP/botified-asr-release"
-          mkdir "$release_dir"
-          cp LICENSE THIRD_PARTY_NOTICES assets/botified-asr-smoke.flac \
-            "$release_dir/"
-
-          python_container=(
-            --rm
-            --network none
-            --read-only
-            --user "$(id -u):$(id -g)"
-            --env PYTHONDONTWRITEBYTECODE=1
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace,readonly"
-            --mount "type=bind,src=$release_dir,dst=/release"
-            --entrypoint python3
-            "$image@$AMD64_DIGEST"
-          )
-          docker run "${python_container[@]}" \
-            /workspace/scripts/build-skill-tarball \
-            /release/botified-asr-skill.tar.gz
-          docker run "${python_container[@]}" \
-            /workspace/scripts/generate-openapi \
-            /release/botified-asr-openapi.json
-          docker run "${python_container[@]}" \
-            /workspace/scripts/generate-release-manifest \
-            --license /release/LICENSE \
-            --notices /release/THIRD_PARTY_NOTICES \
-            --openapi /release/botified-asr-openapi.json \
-            --skill /release/botified-asr-skill.tar.gz \
-            --smoke /release/botified-asr-smoke.flac \
-            --index-digest "$INDEX_DIGEST" \
-            --amd64-digest "$AMD64_DIGEST" \
-            --arm64-digest "$ARM64_DIGEST" \
-            --release-version "$BOTIFIED_ASR_RELEASE_VERSION" \
-            --output /release/botified-asr-release.json
-
-          python3 \
-            - "$release_dir" \
-            "$BOTIFIED_ASR_RELEASE_VERSION" \
-            "$INDEX_DIGEST" \
-            "$AMD64_DIGEST" \
-            "$ARM64_DIGEST" <<'PY'
-          import hashlib
-          import json
-          import stat
-          import sys
-          from pathlib import Path
-
-          release_dir = Path(sys.argv[1])
-          release_version, index_digest, amd64_digest, arm64_digest = sys.argv[2:]
-          artifact_names = {
-              "LICENSE",
-              "THIRD_PARTY_NOTICES",
-              "botified-asr-openapi.json",
-              "botified-asr-skill.tar.gz",
-              "botified-asr-smoke.flac",
-          }
-          expected_members = artifact_names | {"botified-asr-release.json"}
-          members = {path.name for path in release_dir.iterdir()}
-          if members != expected_members:
-              raise SystemExit(f"unexpected release bundle members: {members!r}")
-          for name in expected_members:
-              metadata = (release_dir / name).lstat()
-              if not stat.S_ISREG(metadata.st_mode):
-                  raise SystemExit(f"release bundle member is not a regular file: {name}")
-
-          with (release_dir / "botified-asr-release.json").open(
-              encoding="utf-8"
-          ) as source:
-              manifest = json.load(source)
-          expected_artifacts = {}
-          for name in artifact_names:
-              with (release_dir / name).open("rb") as source:
-                  digest = hashlib.file_digest(source, "sha256").hexdigest()
-              expected_artifacts[name] = {"sha256": digest}
-          if manifest.get("artifacts") != expected_artifacts:
-              raise SystemExit("release manifest artifact hashes do not match")
-          if manifest.get("release_version") != release_version:
-              raise SystemExit("release manifest version does not match")
-          expected_image = {
-              "index_digest": index_digest,
-              "platforms": {
-                  "linux/amd64": {
-                      "device": "cpu",
-                      "digest": amd64_digest,
-                  },
-                  "linux/arm64": {
-                      "device": "cpu",
-                      "digest": arm64_digest,
-                  },
-              },
-              "repository": "ghcr.io/lzjever/botified-asr",
-          }
-          if manifest.get("oci_image") != expected_image:
-              raise SystemExit("release manifest OCI image does not match")
-          PY
-
-      - name: Upload release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: botified-asr-${{ needs.prepare.outputs.release_version }}
-          path: ${{ runner.temp }}/botified-asr-release
-          if-no-files-found: error
-          overwrite: true
 
       - name: Publish stable multi-architecture image
         env:
@@ -641,7 +498,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "lzjever/botified-asr"
-          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_REF" = "refs/tags/$BOTIFIED_ASR_RELEASE_VERSION"
 
           image="ghcr.io/lzjever/botified-asr"
           stable_ref="$image:$BOTIFIED_ASR_RELEASE_VERSION"

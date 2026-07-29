@@ -1,0 +1,23 @@
+server:
+  listen: "0.0.0.0:17770"
+  public_base_url: "http://127.0.0.1:17770"
+
+runtime:
+  device: "cpu"
+  model_cache_dir: "/data/models"
+  inference_lanes: 1
+
+storage:
+  data_dir: "/data/state"
+
+limits:
+  max_upload_bytes: 1073741824
+  max_audio_duration_secs: 43200
+  direct_max_audio_duration_secs: 30
+  sync_max_upload_bytes: 67108864
+  sync_max_audio_duration_secs: 3600
+  max_active_uploads: 4
+  max_queued_jobs: 16
+  max_job_storage_bytes: 21474836480
+  min_filesystem_free_bytes: 2147483648
+  result_retention_hours: 24
