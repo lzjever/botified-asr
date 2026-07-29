@@ -13,7 +13,7 @@
 - 不得为了测试便利或流程需要新增 production 抽象。
 - 测试应验证可观察行为与重要不变量，而不是证明开发流程。
 - 测试优先覆盖行为、不损坏性、容量、取消与恢复、清理和 wire contract；同一重要故障类别默认保留一个代表性测试，仅在真实事故或高风险边界下扩展矩阵。
-- 出现无明确用户结果、无数据却需要 production 参数、第二事实源、测试流程化、未来分布式能力污染或简单需求引出多层抽象时，立即暂停并在原位置简化。
+- 出现无明确用户结果、凭空新增或向客户端开放 production 参数、第二事实源、测试流程化、未来分布式能力污染或简单需求引出多层抽象时，立即暂停并在原位置简化。
 
 ## 产品与架构边界
 
@@ -21,7 +21,7 @@
 - 未完成任务在恢复时从头重跑，不做 segment checkpoint；允许实现上述需求必需的状态与一致性机制。
 - 禁止预建多节点、外部 broker、跨机器抢占、exactly-once、推测性扩展或高频无意义 DB 写入；分布式扩容只能由真实负载数据驱动。
 - 实现偏离这些边界时，立即暂停扩展，在原位置简化或删除偏离内容，并以测试固定修正后的行为。
-- 无真实校准数据不得设置 production 决策参数；enrollment consistency、anonymous clustering、known match 和 top-two ambiguity margin 完成校准前，production 必须 fail closed 且不得向客户端开放调参。
+- speaker/diarization 以随 release 固定的服务端策略 best-effort 提供，不承诺匿名 speaker 数量、边界或 known 命名准确率；缺少本地校准、held-out 数据或报告不得阻止 production，也不得向客户端开放调参。仅在真实使用问题证明有必要时调整策略；模型输出、结构一致性和容量边界仍须 fail closed。
 - embedding fingerprint 只表示向量提取与聚合的兼容性；决策阈值变化不得强制已有 speaker 重新注册。
 
 ## 文档与治理边界
@@ -37,7 +37,7 @@
 
 - 保持改动聚焦，避免顺手重构、全文件格式化和无关清理。
 - 同时只推进一个主要产品切片及必要的独立审查；完成实现、测试和提交闭环后再进入下一项。
-- 近期切片依次为离线 OpenAPI、Skill `speaker-add`、真实 speaker 阈值校准、production speaker/diarization、最小结构化日志、安装与 README/license/notices、release assets、真实验收；CPU 首版完成前不启动 CUDA 或新架构。
+- 近期切片依次为固定策略启用 enrollment、保守 known speaker 命名、离线 OpenAPI、Skill `speaker-add`、最小结构化日志、安装与 README/license/notices、release assets、真实运行 smoke；CPU 首版完成前不启动 CUDA 或新架构。
 - 尊重现有工作区改动；未经授权不得覆盖、删除或改写。
 - 新增文件前先确认现有位置无法承载该事实。
 - 完成前检查实现、测试和文档是否存在重复或不必要的治理负担。

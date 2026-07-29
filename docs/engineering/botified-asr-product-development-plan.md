@@ -45,6 +45,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - 仅凭姓名、描述推断人物身份；
 - 对重叠语音做到无误分离；
 - 把余弦相似度表述成身份概率；
+- 匿名 speaker 数量、边界或 known speaker 命名准确率；
 - 多租户账号、计费或管理后台。
 
 ## 3. 核心工程约束
@@ -131,6 +132,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 | FSMN-VAD | `funasr/fsmn-vad@df20e6b30c653645fa4ff125cacfcabd1020a669` | `model.pt` | `b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5` |
 | CAM++ | `funasr/campplus@e4b6ede7ce16997aff4ae69fbca1f0175e2afede` | `campplus_cn_common.bin` | `3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8` |
 
+- 上述固定 CAM++ revision 的 speaker embedding 基线统一为 16 kHz mono PCM、80-bin filterbank、192 维 embedding、1.5 秒 window、0.75 秒 shift、right-zero-pad 和 L2 normalization；这是 enrollment、anonymous diarization 和 known matching 的唯一共同提取基线。enrollment consistency 和 known matching 的 similarity decision 使用该 revision/FunASR `yesOrNo` 的官方基线阈值 `0.31`；该阈值不参与 anonymous clustering。
 - 表中的 primary weight hash 只证明权重文件，不构成完整 snapshot attestation。SenseVoice runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`；FSMN-VAD runtime snapshot 还必须包含并校验 `configuration.json`、`config.yaml` 和 `am.mvn`。这些文件的路径与逐文件 SHA-256 以 `src/botified_asr/model_artifacts.py` 的代码 manifest 为唯一真相，文档和 release manifest 从该来源生成或校验，不维护第二份 hash 长清单；CAM++ 接入 loader 前必须建立同等完整的 runtime manifest。
 - 模型首次下载只从上述 Hugging Face immutable commit 进入按 revision 隔离的 cache；每次 ready/load 前逐文件校验完整 runtime manifest 的 SHA-256，全部通过后才允许加载并 warmup。
 - 升级上游时运行本仓库的真实模型 smoke，不依赖“语义版本应当兼容”的假设。
@@ -316,7 +318,7 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 - 客户端必须显式提交 `response_format=diarized_json`；缺省或其他值均返回 `400`，服务不得自动补齐。
 - 固定只接受实际音频不超过 30 分钟的完整文件，不提供流式响应、在线 diarization、实时 speaker label 或处理中间 speaker 结果。
 - FSMN-VAD 先得到全文件绝对时间 speech islands；在 islands 内按现有 CAM++ policy 使用 1.5 秒 window、0.75 秒 shift 的全局时间锚点提取 embedding。
-- 完整文件处理结束后，使用本地 NumPy spectral clustering 和经真实数据校准的低频 normalized-gap 规则发现未知 speaker 数；将 window label 投影回时间轴，只在同一 true VAD island 内合并 touching 同标签区间，true island 是 hard cut 且不得跨 island 合并。within-island 同 speaker run 超过 480,000 samples 时，只从 run start 每 480,000 samples 切成同标签 final segments，之后才执行 ASR/rich 处理。
+- 完整文件处理结束后，使用本地 NumPy spectral clustering 和随 release 固定的低频 normalized-gap 规则发现未知 speaker 数；将 window label 投影回时间轴，只在同一 true VAD island 内合并 touching 同标签区间，true island 是 hard cut 且不得跨 island 合并。within-island 同 speaker run 超过 480,000 samples 时，只从 run start 每 480,000 samples 切成同标签 final segments，之后才执行 ASR/rich 处理。
 - 已知人物只在匿名 clustering 完成后命名；最多 32 个 `known_speaker_ids[]` 只是 profile matching 候选边界，不限制实际 speaker 数。
 - 首版重叠语音只输出一个主 speaker，不承诺分离或同时标注多个说话人；这是明确质量限制，不增加 overlap 专用模型。
 
@@ -703,7 +705,7 @@ bounded upload
   -> ordinary ASR: one-time ASR/rich processing per VAD segment -> result writer
   -> diarization: retain at most 30 minutes of int16 speech PCM
        -> after decoder EOF: CAM++ embeddings on 1.5s/0.75s global-time windows inside speech islands
-       -> local NumPy spectral clustering + calibrated low-frequency normalized-gap K selection
+       -> local NumPy spectral clustering + release-fixed low-frequency normalized-gap K selection
        -> project window labels and merge adjacent equal labels
        -> keep true VAD islands as hard cuts; split within-island same-speaker runs from run start every 480,000 samples
        -> one-time ASR/rich processing per final segment
@@ -800,7 +802,7 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 ### 8.5 Offline diarization
 
-production speaker/diarization 在独立 held-out 的真实中文和英文数据、不同设备/麦克风上分别达到既定质量指标前必须 fail closed；用于选择 row-wise pruning `p`、低频范围 `β` 和 normalized-gap 门槛 `γ` 的校准数据本身不得作为过线依据。当前 `EN4`/`ZH5` 实验只用于选择下面的唯一候选，不是 production 质量证据，也不为此增加报告或平行流程文档。
+production speaker/diarization 以 best-effort 能力发布，不承诺匿名 speaker 数量、边界或 known 命名准确率，也不以本地校准、held-out 数据或报告作为启用门禁；仅在真实使用问题证明有必要时调整固定策略。CAM++ 提取和 similarity decision 统一沿用 §4.3 的固定基线。
 
 唯一实现固定为：
 
@@ -810,7 +812,7 @@ production speaker/diarization 在独立 held-out 的真实中文和英文数据
 4. 令 `degree = sum(abs(M), axis=1)`；以 `L = -M` 初始化并将 `L` 的 diagonal 设为 `degree`，然后执行 `(w, V) = np.linalg.eigh(L)` 得到升序完整有界谱和对应 eigenvectors。令 `eigen_tol = np.finfo(np.float64).eps * N * np.linalg.norm(L, ord=np.inf)`；`[-eigen_tol, 0)` 内的 eigenvalue clamp 为 `0`，小于 `-eigen_tol` 或任一模型输出、矩阵、谱值 non-finite 时返回 `invalid_model_output`。
 5. `N=0` 返回空结果，`N=1` 或 `N=2` 直接取 `K=1`。`N>=3` 时，对数据域内的 `K=k` 候选 `2 <= k <= N-1`，按 zero-based `w` 计算 `gap = w[k] - w[k - 1]` 和 `g = gap / max(abs(w[k]), 1e-12)`；这里的 `1e-12` 是 normalized-gap 的独立固定算法常量，不是 `eigen_tol`。只有 `w[k] <= β * median(degree)` 且 `g >= γ` 的候选合格。取 `g` 最大的 `k`，并列时取最小 `k`；无合格候选时取 `K=1`，all-zero affinity/spectrum 因此自然得到 `K=1`。这里没有固定 speaker/K 上限，最高 `N-1` 只是当前数据可定义的自然上界。
 6. `K>1` 时令 raw spectral embedding `Y = V[:, :K]`；`Y` 的行与 canonical absolute anchors 一一对应，不得 row-normalize。对 `Y` 执行 NumPy-only deterministic 10 次相互独立的 k-means++ restart 和有界 Lloyd iteration；各 restart 使用固定 PRNG seed stream，distance 计算、等距 assignment、empty cluster、每轮 tie 和 best-inertia tie 都必须稳定，best inertia 并列时保留较早的成功 restart。不收敛或无法保持 `K` 个非空 cluster 的 restart 跳过；全部 restart 失败则返回 `invalid_model_output`，不得减少 `K`、回退 `K=1` 或启用第二路径。成功后按各 cluster 最早 absolute anchor 排序并依次标为 `A`、`B`、……；每个 cluster centroid 由其原始 float64 `X` rows 求 mean 后 L2 normalize。该 mean non-finite 或 L2 norm `<= 0` 时返回 `invalid_model_output`。`K=1` 不运行 k-means，但使用同一原始 `X` centroid 规则。该路径不调用 FunASR `ClusterBackend`，也不增加 SciPy、scikit-learn 或其他依赖。
-7. `p`、`β`、`γ` 必须是 finite，且满足 `0 <= p <= 1`、`β > 0`、`0 < γ <= 1`；它们必须用真实中文和英文数据校准，并随只读 processor clustering policy 发布，不进入客户端参数或 YAML，也不进入 `embedding_policy_fingerprint`。任一值或上述 clustering 语义变化都必须递增 `processor_compatibility_version`，从而改变 `processor_fingerprint`，但不得要求已有 speaker 重新 enrollment。独立 held-out 未过线时 production speaker/diarization 继续 fail closed。
+7. 首版 anonymous clustering policy 固定为 `p = 1.0`、`β = 2.0`、`γ = 0.5`，以 best-effort 方式随只读 processor policy 发布；三者必须是 finite，且满足 `0 <= p <= 1`、`β > 0`、`0 < γ <= 1`。它们不进入客户端参数或 YAML，也不进入 `embedding_policy_fingerprint`；仅在真实使用问题证明有必要时调整。任一值或上述 clustering 语义变化都必须递增 `processor_compatibility_version`，从而改变 `processor_fingerprint`，但不得要求已有 speaker 重新 enrollment。
 8. 以 kept logical centers 在完整时间轴建立全局一维 Voronoi cells；相邻 centers 的切点取 `ceil((c_left + c_right) / 2)` 且切点 sample 归右侧，首尾 cell 向两端延伸后 clip 到 `[0, total_samples)`。每个带 cluster label 的 cell 分别与每个 true VAD island 求交并丢弃空交集；只合并同一 island 内 touching 且同 label 的 regions，绝不跨 island 或 silence 合并，true island 边界因此天然是 hard cut。within-island run 长度超过 `DIRECT_MAX_SAMPLES = 480_000` 时，从 run start 起每 480,000 samples 切分，恰好等于上限时不切；所有片段保留同一 speaker label，不得把超限 run 交给 SenseVoice。
 9. 对 final segments 各执行一次 ASR/rich 处理，再使用第 6 步的 cluster centroid 与最多 32 个已选 profile 匹配命名，最后投影 `diarized_json`。
 
@@ -867,7 +869,7 @@ samples[]=voice-2.wav
 - 每个样本由同一人录制是操作员责任；首版不增加第二套“样本是否单人”检测模型，也不虚假承诺能自动证明身份。
 - 不可解码、没有人声或出现非有限 embedding 分别返回稳定的 `invalid_audio`、`no_speech`、`invalid_speaker_embedding`。
 - 每个 sample 先将其 window embedding 等权平均并归一化为 sample centroid；2–5 个 sample centroid 再等权平均并归一化，避免长样本因 window 更多而获得更大权重。
-- 一致性只比较 sample centroid pair；任一 pair 低于随 policy 发布的 enrollment threshold 时拒绝 `speaker_samples_inconsistent`。这只拦截明显混杂，不宣称证明同一身份。
+- 一致性只比较 sample centroid pair，并固定使用 §4.3 所述 CAM++ revision-compatible 官方 `yesOrNo` 阈值 `0.31`；任一 pair 低于该值时拒绝 `speaker_samples_inconsistent`。这只 best-effort 拦截明显混杂，不宣称证明同一身份或准确率。
 - 全部样本成功才创建 profile。
 - 创建完成立即删除原始和解码样本。
 - POST/PUT 复用 §11.3 generic storage ledger、typed upload lease、reservation、受控 staging 和启动对账；进程崩溃遗留样本按 writing lease cleanup 删除，不建立第二套清理器。
@@ -910,14 +912,13 @@ DELETE /v1/speakers/{speaker_id}
 anonymous clustering
   -> cluster centroid
   -> compare with selected profile embeddings
-  -> threshold + top-two margin
+  -> unique maximum cosine + threshold 0.31
   -> known name or Unknown
 ```
 
-- threshold 和 top-two margin 是服务级固定模型策略，不由每个客户端随意调整。
-- 阈值必须通过真实设备、普通话/英语和不同麦克风样本校准。
-- `embedding_policy_fingerprint` 只表示向量提取与聚合的兼容性，不包含 enrollment threshold、clustering `p/β/γ`、match threshold 或 top-two margin；变更这些决策阈值需要重新运行对应的 held-out 测试，但不得因此要求已有 speaker 重新 enrollment。影响 clustering 输出的变化由 `processor_compatibility_version` 进入 `processor_fingerprint`。
-- 相似度达到阈值但与第二名区分不足时保持 Unknown。
+- 每个 anonymous cluster 只与本次显式 selected candidates 比较，不搜索未选择的 profile。仅当最高 cosine 是唯一最大值且 `>= 0.31` 时使用该 profile 名称；最高值 `< 0.31` 或最高分 exact tie 时保持 Unknown。这里固定使用 §4.3 所述 CAM++ revision-compatible 官方 `yesOrNo` 阈值，不使用 top-two margin，也不按过阈值候选数量判定。
+- 该规则是服务级固定的 best-effort 策略，不由客户端调整，也不承诺命名准确率；仅在真实使用问题证明有必要时调整。
+- `embedding_policy_fingerprint` 只表示向量提取与聚合的兼容性，不包含 enrollment threshold、clustering `p/β/γ` 或 match threshold；变更这些决策策略不得要求已有 speaker 重新 enrollment。影响 clustering 或 matching 输出的变化由 `processor_compatibility_version` 进入 `processor_fingerprint`。
 - 多个 anonymous cluster 可以匹配同一已知人物，以容忍长会议 cluster fragmentation。
 - 匹配只使用声音；name 和 description 不进入模型。
 - 未提交候选时跳过 profile matching 并输出 `A/B/...`；提交候选时只有未命中 cluster 使用 `Unknown A/B/...`。
@@ -1430,14 +1431,12 @@ diarization 另保留一个边界测试组：
 
 三次 smoke 验证的是不同 runtime discovery 边界，不复制 async/speaker API 测试，也不维护三份 Skill 内容。
 
-### 16.5 已知人物质量指标
+### 16.5 已知人物 best-effort 验证
 
-- 使用未参与阈值拟合和 enrollment 的 held-out 中英文 fixture；至少两位已知人物、三位未知人物、两类录音设备。
-- 每位已知人物使用 2–5 个 enrollment 样本，另有至少 10 个 held-out utterance；未知人物合计至少 30 个 utterance。
-- 已知人物正确命名率至少 90%，未知 utterance 的 false-known assignment 必须为 0；低 margin 保持 `Unknown`。
+- 不设置本地校准、held-out 数据集、报告或准确率数字作为 production 启用门禁；真实样本只用于运行 smoke、复现真实问题和验证必要的策略调整。
 - 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 FSMN-VAD -> 1.5s/0.75s global-time window embedding -> NumPy un-clipped affinity/stable pruning/symmetrization/absolute-degree Laplacian/low-frequency normalized-gap/deterministic k-means -> label projection/true-island hard cuts/same-island merge/within-island 480,000-sample split from run start -> ASR -> centroid matching -> response projection。
 - 以超过 32 个匿名 cluster 的 synthetic embedding 验证没有会议参与人数硬限制；另独立验证 `known_speaker_ids[]` 第 33 项只因命名候选边界被拒绝。
-- synthetic vector 只单测 threshold/margin 数学边界；真实 fixture 在 model policy/revision 变化时运行，不在每次普通 CI 重复。
+- synthetic vector 只固定 `0.31`、唯一最高、低于阈值和最高分 exact tie 的数学边界；真实 fixture 在 model policy/revision 变化或真实问题需要复现时运行，不在每次普通 CI 重复，也不作为 production gate。
 
 ## 17. 性能指标
 
@@ -1503,8 +1502,8 @@ diarization 另保留一个边界测试组：
 | offline spectral workspace 随窗口数增长 | diarization 固定 30 分钟，1.5s/0.75s 全局锚点约 2,400，只保留 int16 speech PCM、embedding 和 bounded NumPy workspace |
 | 用户误以为支持实时 speaker 输出 | 只在完整文件 clustering、投影和 ASR 后返回 diarized result，API 不暴露临时 label 或 partial cluster |
 | 重叠语音归属错误 | 首版明确只输出单一主 speaker，并以真实中英文 overlap fixture 记录质量边界 |
-| 已知人物误匹配 | threshold + top-two margin，默认 Unknown |
-| 不同麦克风影响声纹 | 多样本平均，真实环境校准 |
+| 已知人物误匹配 | selected candidates 内唯一最高且 `>= 0.31` 才命名；低于阈值或最高分 exact tie 为 Unknown |
+| 不同麦克风影响声纹 | 多样本平均、best-effort；仅在真实问题出现后调整固定策略 |
 | 上游 mutable pipeline 状态 | 独立模型对象和本服务 orchestration，不逐请求改 AutoModel 配置 |
 | 上游升级破坏 token/timestamp | 精确 pin + real model smoke |
 | 异步结果与文件状态不一致 | receiving/deleting phase + per-attempt artifact + SQLite CAS 对账 |
