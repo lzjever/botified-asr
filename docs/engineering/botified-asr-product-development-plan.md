@@ -33,7 +33,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 4. 普通 ASR 支持最大 1 GiB、最长 12 小时音频；diarization 固定为最长 30 分钟，并在完整文件接收、解码和 VAD 完成后离线批处理，不提供在线、实时或增量 speaker 输出。
 5. 已知人物的声音样本注册、更新、删除和命名转写。
 6. 普通同步请求和同一端点上的可靠异步长任务。
-7. 一键在线安装脚本，并在 `lzjever/botified-releases` 公开。
+7. 一键在线安装脚本，并由 `lzjever/botified-asr` 的 GitHub Releases 公开。
 8. 一份可单独安装、同时兼容 Codex、OpenClaw 和 Botified 的 Agent Skill。
 
 产品不承诺：
@@ -63,7 +63,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - 音频解码、VAD、SenseVoice、speaker embedding、结果投影各只有一个实现。
 - HTTP 同步处理和后台 job 不得复制 pipeline。
 - Skill、README 和 OpenAPI 的请求示例从同一公开契约维护，不各自定义字段。
-- `botified-asr` 是 Skill 的唯一源码仓库；`botified-releases` 只发布构建产物。
+- `botified-asr` 是服务、Skill、安装器和公开 release assets 的唯一源码与发布仓库；GitHub Releases 只包含本仓库构建的发布物。
 
 ### 3.3 YAGNI
 
@@ -1176,7 +1176,7 @@ storage_leases(
 - 离线生成的 OpenAPI JSON；
 - `LICENSE` 和 `THIRD_PARTY_NOTICES`。
 
-`botified-releases` 公开：
+`lzjever/botified-asr` 的 GitHub Releases 发布：
 
 ```text
 install-asr.sh
@@ -1205,7 +1205,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 
 必须：
 
-1. 支持显式 `BOTIFIED_ASR_VERSION=vMAJOR.MINOR.PATCH`；未设置时从 `botified-releases` `main` 根文件 `botified-asr-latest` 解析版本。两种来源都只接受 canonical `vMAJOR.MINOR.PATCH`，并按 §14.3 映射为 `asr-$version`。
+1. 支持显式 `BOTIFIED_ASR_VERSION=vMAJOR.MINOR.PATCH`；未设置时从 `lzjever/botified-asr` 的 GitHub Releases latest stable release API 响应解析版本，必须验证 `draft=false`、`prerelease=false`，并严格校验 `tag_name` 为 canonical `vMAJOR.MINOR.PATCH`。不得把 `releases/latest/download` 重定向结果作为版本真相；解析版本后只按 §14.3 的 exact 同名 tag 下载 release assets。
 2. 检测 Linux x86_64/aarch64；不支持的平台在下载大资产前失败。
 3. 检测 Docker 或 Podman；不存在时给出前置条件，不擅自安装系统容器运行时。
 4. 先下载 release manifest 和 SHA256SUMS，严格校验 checksums 后才解析 manifest，并验证其 schema、目标 platform 与 runtime/image matrix。
@@ -1229,10 +1229,10 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - `device=auto` 只有在当前 manifest 含本平台 CUDA digest且 runtime 校验通过时选择 CUDA；否则确定性使用 CPU，不临时拼装未发布 GPU 路径。
 - unit 位于 `~/.config/systemd/user/botified-asr.service`，通过 `systemctl --user enable --now` 管理。
 - installer 检测 user manager 和 linger；无 user systemd 时只把 `~/.local/bin/botified-asr-service` 作为 wrapper 使用，无 linger 时明确说明重启后不会自启并给出管理员应执行的 `loginctl enable-linger <user>`，不擅自 sudo。
-- `SHA256SUMS` 覆盖 manifest、Skill tarball、两个 installer、`botified-asr-smoke.flac`、`botified-asr-openapi.json`、`LICENSE` 和 `THIRD_PARTY_NOTICES`；manifest 在校验 checksum 后才解析。
+- `SHA256SUMS` 覆盖除自身外的其余八个 release assets，条目按文件名升序排列且文件末尾恰好一个 LF；manifest 在校验 checksum 后才解析。
 - manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
 - Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
-- checksum harness 向现有 `botified-releases/tests/installers.sh` 注入损坏 manifest/tarball，并断言拉 image、写 user unit/wrapper 或改动既有服务前已失败；不另建 installer framework。
+- 本仓库的 installer 测试向 `install-asr.sh` 和 `install-asr-skill.sh` 注入损坏 manifest/tarball，并断言拉 image、写 user unit/wrapper 或改动既有服务前已失败；复用现有测试体系，不另建 installer framework。
 - 唯一卸载入口为已安装的 `botified-asr-uninstall [--purge]`。
 
 不做：
@@ -1247,12 +1247,12 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 
 - `botified-asr` 使用独立 SemVer。
 - `BOTIFIED_ASR_VERSION` 不复用 `BOTIFIED_VERSION`。
-- `botified-releases` 使用 namespaced release tag `asr-vX.Y.Z`，避免与 Core/Gateway 的 `vX.Y.Z` tag 冲突。
-- resolved version（显式 `BOTIFIED_ASR_VERSION` 或 `botified-asr-latest` pointer）必须是 canonical `vMAJOR.MINOR.PATCH`：每个十进制段只能是 `0` 或以非零数字开头的数字串，不接受 prerelease、build metadata 或空白；它映射到 `asr-$version` release 和该 release manifest 固定的 `ghcr.io/lzjever/botified-asr:$version` image digest。
-- `botified-asr-latest` 的唯一内容是该 canonical version 加单个 LF，不接受多行或缺少末尾 LF；它只定位当前 ASR 稳定 release，不复制 manifest 字段，并在对应 release assets 全部发布且校验完成后最后更新。
+- `botified-asr` GitHub Releases 直接使用标准 tag `vX.Y.Z`；专用仓库不增加 `asr-` namespace。
+- resolved version（显式 `BOTIFIED_ASR_VERSION` 或本仓库 GitHub Releases latest stable `tag_name`）必须是 canonical `vMAJOR.MINOR.PATCH`：每个十进制段只能是 `0` 或以非零数字开头的数字串，不接受 prerelease、build metadata 或空白；它直接映射到本仓库同名 `$version` release，该 release manifest 固定 `ghcr.io/lzjever/botified-asr:$version` 的 image digest。
+- 未显式指定版本时，本仓库 GitHub Releases 的 latest stable release API 是唯一版本发现入口；不维护 latest pointer 文件或第二份 release 索引。只有全部 assets 上传并校验完成的 non-draft、non-prerelease release 才可成为 latest。
 - Botified Core、Gateway 和 ASR 不要求同版本发布。
-- `botified-releases` README 说明各组件独立安装，避免“全家桶”心智。
-- release manifest、image label 和 `botified-asr --version` 必须一致。
+- `botified-asr` README 说明 ASR 独立安装及其与 Core/Gateway 的版本独立性，避免“全家桶”心智。
+- `pyproject.toml` project version、Git tag、GitHub Release tag、manifest `release_version`、image tag/label 和 `botified-asr --version` 必须语义一致；project version 不带前导 `v`，其余版本表示按上述 canonical `vMAJOR.MINOR.PATCH` 对应。
 
 ## 15. 通用 Agent Skill
 
@@ -1356,7 +1356,7 @@ speaker-delete
 
 `install-asr-skill.sh --target <runtime>` 使用同一个 skill tarball；每次必须明确且只接受一个 target，不自动检测后静默选择：
 
-`install-asr-skill.sh` 的版本选择与 release tag 解析完全复用 §14.2 第 1 项和 §14.3；不得使用仓库级 `releases/latest` 或维护第二个 latest pointer。
+`install-asr-skill.sh` 的版本选择与 release tag 解析完全复用 §14.2 第 1 项和 §14.3；未指定版本时使用同一个本仓库 GitHub Releases latest stable release API，不维护第二个 latest pointer。
 
 | Runtime | 默认目录 |
 |---|---|
