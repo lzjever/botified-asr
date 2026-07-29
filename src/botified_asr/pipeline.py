@@ -29,6 +29,7 @@ from botified_asr.speaker_snapshot import (
     SelectedSpeakerSnapshot,
 )
 from botified_asr.speakers import (
+    AnonymousSpeakerClusteringResult,
     SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS,
     SPEAKER_EMBEDDING_DIMENSION,
     SPEAKER_EMBEDDING_NORM_TOLERANCE,
@@ -333,6 +334,181 @@ def _embed_global_speaker_windows(
 
     flush()
     return tuple(windows)
+
+
+def _project_speaker_regions(
+    speech_islands: tuple[SpeechSpan, ...],
+    windows: tuple[SpeakerEmbeddingWindow, ...],
+    clustering_result: AnonymousSpeakerClusteringResult,
+    *,
+    total_samples: int,
+) -> tuple[tuple[SpeechSpan, int], ...]:
+    def invalid_output() -> PipelineError:
+        return PipelineError(
+            "invalid_model_output",
+            "Speaker region projection input is invalid",
+        )
+
+    if (
+        type(speech_islands) is not tuple
+        or type(windows) is not tuple
+        or type(clustering_result) is not AnonymousSpeakerClusteringResult
+        or type(total_samples) is not int
+        or total_samples < 0
+    ):
+        raise invalid_output()
+    window_cluster_ordinals = clustering_result.window_cluster_ordinals
+    clusters = clustering_result.clusters
+    if (
+        type(window_cluster_ordinals) is not tuple
+        or type(clusters) is not tuple
+        or len(window_cluster_ordinals) != len(windows)
+    ):
+        raise invalid_output()
+
+    previous_end: int | None = None
+    for island in speech_islands:
+        if (
+            type(island) is not SpeechSpan
+            or type(island.start_sample) is not int
+            or type(island.end_sample) is not int
+            or island.start_sample < 0
+            or island.end_sample <= island.start_sample
+            or island.end_sample > total_samples
+            or previous_end is not None
+            and island.start_sample < previous_end
+        ):
+            raise invalid_output()
+        previous_end = island.end_sample
+
+    previous_start: int | None = None
+    for window in windows:
+        if (
+            type(window) is not SpeakerEmbeddingWindow
+            or type(window.start_sample) is not int
+            or type(window.end_sample) is not int
+            or window.start_sample < 0
+            or window.start_sample >= total_samples
+            or window.start_sample % SPEAKER_WINDOW_SHIFT_SAMPLES != 0
+            or window.end_sample
+            != window.start_sample + SPEAKER_WINDOW_MAX_SAMPLES
+            or previous_start is not None
+            and window.start_sample <= previous_start
+        ):
+            raise invalid_output()
+        previous_start = window.start_sample
+
+    if not speech_islands and not windows:
+        if window_cluster_ordinals or clusters:
+            raise invalid_output()
+        return ()
+    if not speech_islands or not windows:
+        raise invalid_output()
+    if not clusters:
+        raise invalid_output()
+
+    used_clusters = [False] * len(clusters)
+    for ordinal in window_cluster_ordinals:
+        if (
+            type(ordinal) is not int
+            or ordinal < 0
+            or ordinal >= len(clusters)
+        ):
+            raise invalid_output()
+        used_clusters[ordinal] = True
+    if not all(used_clusters):
+        raise invalid_output()
+
+    island_cursor = 0
+    for window in windows:
+        physical_end = min(window.end_sample, total_samples)
+        while (
+            island_cursor < len(speech_islands)
+            and speech_islands[island_cursor].end_sample
+            <= window.start_sample
+        ):
+            island_cursor += 1
+        if (
+            island_cursor == len(speech_islands)
+            or speech_islands[island_cursor].start_sample >= physical_end
+        ):
+            raise invalid_output()
+
+    window_cursor = 0
+    for island in speech_islands:
+        while (
+            window_cursor < len(windows)
+            and min(windows[window_cursor].end_sample, total_samples)
+            <= island.start_sample
+        ):
+            window_cursor += 1
+        if (
+            window_cursor == len(windows)
+            or windows[window_cursor].start_sample >= island.end_sample
+        ):
+            raise invalid_output()
+
+    boundaries = [0]
+    for left, right in zip(windows, windows[1:], strict=False):
+        left_center = left.start_sample + SPEAKER_WINDOW_MAX_SAMPLES // 2
+        right_center = right.start_sample + SPEAKER_WINDOW_MAX_SAMPLES // 2
+        midpoint = (left_center + right_center + 1) // 2
+        clipped = min(max(midpoint, 0), total_samples)
+        boundaries.append(max(boundaries[-1], clipped))
+    boundaries.append(total_samples)
+
+    projected: list[tuple[SpeechSpan, int]] = []
+    cell_cursor = 0
+    for island in speech_islands:
+        while (
+            cell_cursor < len(window_cluster_ordinals)
+            and boundaries[cell_cursor + 1] <= island.start_sample
+        ):
+            cell_cursor += 1
+        merged: list[tuple[int, int, int]] = []
+        scan_index = cell_cursor
+        while (
+            scan_index < len(window_cluster_ordinals)
+            and boundaries[scan_index] < island.end_sample
+        ):
+            ordinal = window_cluster_ordinals[scan_index]
+            start_sample = max(
+                island.start_sample,
+                boundaries[scan_index],
+            )
+            end_sample = min(
+                island.end_sample,
+                boundaries[scan_index + 1],
+            )
+            if start_sample >= end_sample:
+                scan_index += 1
+                continue
+            if (
+                merged
+                and merged[-1][1] == start_sample
+                and merged[-1][2] == ordinal
+            ):
+                merged[-1] = (
+                    merged[-1][0],
+                    end_sample,
+                    ordinal,
+                )
+            else:
+                merged.append((start_sample, end_sample, ordinal))
+            scan_index += 1
+        if not merged:
+            raise invalid_output()
+        for start_sample, end_sample, ordinal in merged:
+            while end_sample - start_sample > DIRECT_MAX_SAMPLES:
+                split_end = start_sample + DIRECT_MAX_SAMPLES
+                projected.append(
+                    (SpeechSpan(start_sample, split_end), ordinal)
+                )
+                start_sample = split_end
+            projected.append(
+                (SpeechSpan(start_sample, end_sample), ordinal)
+            )
+    return tuple(projected)
 
 
 @dataclass(frozen=True)

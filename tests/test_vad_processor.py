@@ -393,6 +393,217 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
     assert caught.value.code == "invalid_model_output"
 
 
+def test_speaker_region_projection_handles_empty_and_single_window() -> None:
+    assert (
+        pipeline._project_speaker_regions(
+            (),
+            (),
+            speakers.AnonymousSpeakerClusteringResult((), ()),
+            total_samples=0,
+        )
+        == ()
+    )
+
+    island = pipeline.SpeechSpan(100, 9_000)
+    assert pipeline._project_speaker_regions(
+        (island,),
+        (
+            speakers.SpeakerEmbeddingWindow(
+                0,
+                speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+                _unit(1.0),
+            ),
+        ),
+        speakers.AnonymousSpeakerClusteringResult(
+            (0,),
+            (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+        ),
+        total_samples=10_000,
+    ) == ((island, 0),)
+
+
+def test_speaker_region_projection_uses_global_midpoints_and_merges_labels() -> None:
+    windows = tuple(
+        speakers.SpeakerEmbeddingWindow(
+            start,
+            start + speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+            _unit(1.0),
+        )
+        for start in (0, 12_000, 24_000)
+    )
+
+    assert pipeline._project_speaker_regions(
+        (pipeline.SpeechSpan(10_000, 40_000),),
+        windows,
+        speakers.AnonymousSpeakerClusteringResult(
+            (0, 0, 1),
+            (
+                speakers.AnonymousSpeakerCluster("A", (1.0,)),
+                speakers.AnonymousSpeakerCluster("B", (1.0,)),
+            ),
+        ),
+        total_samples=40_000,
+    ) == (
+        (pipeline.SpeechSpan(10_000, 30_000), 0),
+        (pipeline.SpeechSpan(30_000, 40_000), 1),
+    )
+
+
+def test_speaker_region_projection_does_not_merge_touching_islands() -> None:
+    islands = (
+        pipeline.SpeechSpan(0, 18_000),
+        pipeline.SpeechSpan(18_000, 30_000),
+    )
+
+    assert pipeline._project_speaker_regions(
+        islands,
+        (
+            speakers.SpeakerEmbeddingWindow(
+                0,
+                speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+                _unit(1.0),
+            ),
+        ),
+        speakers.AnonymousSpeakerClusteringResult(
+            (0,),
+            (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+        ),
+        total_samples=30_000,
+    ) == (
+        (islands[0], 0),
+        (islands[1], 0),
+    )
+
+
+def test_speaker_region_projection_splits_only_over_direct_limit() -> None:
+    window = speakers.SpeakerEmbeddingWindow(
+        0,
+        speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+        _unit(1.0),
+    )
+    exact = pipeline.SpeechSpan(7, 7 + DIRECT_MAX_SAMPLES)
+    over = pipeline.SpeechSpan(7, 8 + DIRECT_MAX_SAMPLES)
+
+    assert pipeline._project_speaker_regions(
+        (exact,),
+        (window,),
+        speakers.AnonymousSpeakerClusteringResult(
+            (0,),
+            (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+        ),
+        total_samples=exact.end_sample,
+    ) == ((exact, 0),)
+    assert pipeline._project_speaker_regions(
+        (over,),
+        (window,),
+        speakers.AnonymousSpeakerClusteringResult(
+            (0,),
+            (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+        ),
+        total_samples=over.end_sample,
+    ) == (
+        (pipeline.SpeechSpan(7, 7 + DIRECT_MAX_SAMPLES), 0),
+        (
+            pipeline.SpeechSpan(
+                7 + DIRECT_MAX_SAMPLES,
+                8 + DIRECT_MAX_SAMPLES,
+            ),
+            0,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("islands", "windows", "clustering_result", "total_samples"),
+    (
+        (
+            (pipeline.SpeechSpan(0, 100),),
+            (
+                speakers.SpeakerEmbeddingWindow(
+                    0,
+                    speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+                    _unit(1.0),
+                ),
+            ),
+            speakers.AnonymousSpeakerClusteringResult(
+                (),
+                (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+            ),
+            100,
+        ),
+        (
+            (pipeline.SpeechSpan(0, 100),),
+            (
+                speakers.SpeakerEmbeddingWindow(
+                    12_000,
+                    36_000,
+                    _unit(1.0),
+                ),
+            ),
+            speakers.AnonymousSpeakerClusteringResult(
+                (0,),
+                (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+            ),
+            36_000,
+        ),
+        (
+            (pipeline.SpeechSpan(0, 100),),
+            (
+                speakers.SpeakerEmbeddingWindow(
+                    0,
+                    speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+                    _unit(1.0),
+                ),
+            ),
+            speakers.AnonymousSpeakerClusteringResult(
+                (1,),
+                (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+            ),
+            100,
+        ),
+        (
+            (
+                pipeline.SpeechSpan(0, 100),
+                pipeline.SpeechSpan(24_000, 24_100),
+            ),
+            (
+                speakers.SpeakerEmbeddingWindow(
+                    0,
+                    speakers.SPEAKER_WINDOW_MAX_SAMPLES,
+                    _unit(1.0),
+                ),
+            ),
+            speakers.AnonymousSpeakerClusteringResult(
+                (0,),
+                (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+            ),
+            24_100,
+        ),
+    ),
+    ids=(
+        "cardinality",
+        "window-outside-speech",
+        "ordinal-out-of-range",
+        "island-without-window",
+    ),
+)
+def test_speaker_region_projection_rejects_inconsistent_inputs(
+    islands: tuple[pipeline.SpeechSpan, ...],
+    windows: tuple[speakers.SpeakerEmbeddingWindow, ...],
+    clustering_result: speakers.AnonymousSpeakerClusteringResult,
+    total_samples: int,
+) -> None:
+    with pytest.raises(pipeline.PipelineError) as caught:
+        pipeline._project_speaker_regions(
+            islands,
+            windows,
+            clustering_result,
+            total_samples=total_samples,
+        )
+
+    assert caught.value.code == "invalid_model_output"
+
+
 def test_auto_without_vad_fails_before_probe() -> None:
     decoder = FakeDecoder(())
     frontend = FakeFrontend(decoder)
