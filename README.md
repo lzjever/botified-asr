@@ -5,7 +5,13 @@ Botified agents. It accepts concurrent HTTP requests, bounds persisted work,
 limits inference concurrency, supports cancellation, persists results, and
 restarts unfinished jobs from the beginning after a service restart.
 
-The current CPU runtime supports Linux x86_64 and aarch64. It provides:
+The official v0.1.0 CPU image supports Linux x86_64 (`linux/amd64`) only. The
+source dependency lock retains Linux aarch64 compatibility for custom Docker
+builds, but v0.1.0 does not include or promise support for an official ARM64
+artifact. An official ARM64 image will be considered only when explicitly
+needed and after validation on a native Linux aarch64 host.
+
+The service provides:
 
 - synchronous transcription and persistent asynchronous jobs through the same
   HTTP resource;
@@ -20,8 +26,8 @@ or authorization.
 
 ## Run the CPU container
 
-Formally released versions use a fixed-version, multi-architecture CPU image.
-It supports Linux x86_64 and aarch64; no mutable `latest` tag is published.
+The fixed `v0.1.0` CPU image targets Linux x86_64 (`linux/amd64`); no mutable
+`latest` tag is published.
 
 Create a private Docker environment file with a random API key:
 

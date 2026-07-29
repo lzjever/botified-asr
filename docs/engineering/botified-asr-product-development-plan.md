@@ -140,7 +140,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 - `runtime.inference_lanes` 每个 lane 独立加载一套 SenseVoice、FSMN-VAD、CAM++ model bundle；同一 lane 的三个 adapter 共用该 lane 的串行执行器，跨 lane 不共享 model、adapter 或可变 cache。
 - 仓库代码采用 MIT license；OCI image 包含 `LICENSE` 和 `THIRD_PARTY_NOTICES`，README 记录模型名称、来源、revision 和 license URL。
 - SenseVoice 权重许可与 FunASR toolkit 代码许可分别审核；只有许可明确允许再分发时才烘入 OCI，否则由应用的固定 artifact resolver 按固定来源、revision 和 hash 下载，不以技术便利替代许可判断。
-- aarch64 CPU artifact 必须在原生 aarch64 runner 完成全新 model cache、模型加载和固定 smoke；x86_64 上的交叉构建不能替代。
+- 官方 CPU artifact 的平台范围与原生验证边界由 §14.1 唯一定义；源码依赖兼容不得外推为正式 artifact 或支持承诺。
 
 ### 4.4 可复现 fingerprint
 
@@ -1126,7 +1126,9 @@ storage_leases(
 ghcr.io/lzjever/botified-asr:vX.Y.Z
 ```
 
-同一个不可覆盖的 version tag 是 Linux x86_64 与 aarch64 的 multi-arch OCI image；Docker 按 host platform 选择对应 image。两个平台各自在原生 Linux host 构建并完成模型加载、ready 和同一份固定短音频 smoke；每个平台经 smoke 验证的 image digest 必须原样作为最终 multi-arch tag 的输入，不得在 smoke 后重建替代。首版不发布 mutable `latest` tag。
+CPU 首版 `v0.1.0` 的固定 version tag 只包含 Linux x86_64（OCI `linux/amd64`）image。该 image 在原生 Linux x86_64 host 构建，并完成模型加载、ready 和固定短音频 smoke；经 smoke 验证的同一 image digest 必须原样进入最终 tag，不得在 smoke 后重建替代。首版不发布 mutable `latest` tag。
+
+仓库继续保留 Linux aarch64 的源码依赖 lock 与 custom Docker build 兼容路径，但它们不构成 `v0.1.0` 官方 artifact、支持承诺或发布条件。只有出现明确 ARM64 需求并在原生 Linux aarch64 host 完成对应验证后，未来版本才可发布官方 ARM64 image。
 
 Skill、离线生成的 OpenAPI、固定 smoke、`LICENSE` 和 `THIRD_PARTY_NOTICES` 继续由本仓库 exact Git tag 中的唯一源码构建或读取；license/notices 同时包含在 OCI image。项目不发布 host installer、release manifest、checksum bundle 或 GitHub Release assets，也不为发布创建第二份版本、模型或 artifact 真相。
 
@@ -1276,7 +1278,7 @@ installer、runtime 版本承诺或 support matrix；项目不自动探测、复
 
 ### 16.2 Real model integration
 
-只保留一份有合法来源的短音频。正式发布时，Linux x86_64 与 aarch64 各自在原生 Linux host 对 §14.1 随后以各自同一 digest 进入最终 tag 的 image 执行普通转写 smoke，验证 ready、真实模型接线和非空的结构化响应；不得 smoke 后重建发布 image。该 smoke 不承担语言、声音事件或模型质量矩阵，也不把逐字结果写成脆弱 snapshot。
+只保留一份有合法来源的短音频。正式发布时，只对 §14.1 明确列出的官方平台，在原生 Linux host 对随后以同一 digest 进入最终 tag 的 image 执行普通转写 smoke，验证 ready、真实模型接线和非空的结构化响应；不得 smoke 后重建发布 image。该 smoke 不承担语言、声音事件或模型质量矩阵，也不把逐字结果写成脆弱 snapshot。
 
 ### 16.3 长音频和恢复测试
 
