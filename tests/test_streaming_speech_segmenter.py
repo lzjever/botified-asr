@@ -60,6 +60,23 @@ def _process(
     *,
     is_final: bool,
 ) -> tuple[pipeline.BufferedSpeechSegment, ...]:
+    emitted, _completed_true_islands = _process_step(
+        segmenter,
+        block,
+        is_final=is_final,
+    )
+    return emitted
+
+
+def _process_step(
+    segmenter: object,
+    block: DecodedBlock,
+    *,
+    is_final: bool,
+) -> tuple[
+    tuple[pipeline.BufferedSpeechSegment, ...],
+    tuple[pipeline.SpeechSpan, ...],
+]:
     return segmenter.process(block, is_final=is_final)  # type: ignore[attr-defined, no-any-return]
 
 
@@ -102,6 +119,37 @@ def test_open_speech_forces_exactly_one_no_overlap_segment_at_480k() -> None:
     assert emitted[0].pcm_start_sample == 0
     np.testing.assert_array_equal(emitted[0].pcm, source)
     assert adapter.calls == len(blocks)
+
+
+def test_forced_chunk_precedes_one_completed_true_island() -> None:
+    source = np.arange(496_000, dtype=np.int32).astype(np.int16)
+    blocks = _blocks(source)
+    adapter = FakeStreamingVadAdapter(
+        (((0, None),),) + ((),) * 50 + (((None, 31_000),),)
+    )
+    segmenter = _segmenter(adapter)
+
+    for block in blocks[:49]:
+        assert _process_step(segmenter, block, is_final=False) == ((), ())
+
+    emitted, completed_true_islands = _process_step(
+        segmenter,
+        blocks[49],
+        is_final=False,
+    )
+    assert len(emitted) == 1
+    assert emitted[0].span == pipeline.SpeechSpan(0, 480_000)
+    assert completed_true_islands == ()
+
+    assert _process_step(segmenter, blocks[50], is_final=False) == ((), ())
+    emitted, completed_true_islands = _process_step(
+        segmenter,
+        blocks[51],
+        is_final=True,
+    )
+    assert len(emitted) == 1
+    assert emitted[0].span == pipeline.SpeechSpan(480_000, 496_000)
+    assert completed_true_islands == (pipeline.SpeechSpan(0, 496_000),)
 
 
 def test_forced_cut_clamps_late_end_and_rebegin_without_duplicate_pcm() -> None:

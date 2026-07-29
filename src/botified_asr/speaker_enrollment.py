@@ -223,7 +223,10 @@ class SpeakerEnrollmentProcessor:
                 raise _audio_too_long_error()
 
             _check_cancellation(cancellation)
-            emitted = segmenter.process(current, is_final=is_final)
+            emitted, _completed_true_islands = segmenter.process(
+                current,
+                is_final=is_final,
+            )
             _check_cancellation(cancellation)
             if type(emitted) is not tuple:
                 raise PipelineError(

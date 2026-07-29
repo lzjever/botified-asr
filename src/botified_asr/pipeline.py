@@ -191,6 +191,7 @@ def canonical_speech_pcm(segment: object) -> np.ndarray:
 
 
 def _embed_global_speaker_windows(
+    speech_islands: tuple[SpeechSpan, ...],
     segments: tuple[BufferedSpeechSegment, ...],
     *,
     total_samples: int,
@@ -202,10 +203,23 @@ def _embed_global_speaker_windows(
             "Speaker embedding input or output is invalid",
         )
 
-    if type(segments) is not tuple:
+    if type(speech_islands) is not tuple or type(segments) is not tuple:
         raise invalid_output()
     if type(total_samples) is not int or total_samples < 0:
         raise invalid_output()
+
+    previous_end = 0
+    for island in speech_islands:
+        if (
+            not isinstance(island, SpeechSpan)
+            or type(island.start_sample) is not int
+            or type(island.end_sample) is not int
+            or island.start_sample < previous_end
+            or island.end_sample <= island.start_sample
+            or island.end_sample > total_samples
+        ):
+            raise invalid_output()
+        previous_end = island.end_sample
 
     canonical_segments: list[tuple[SpeechSpan, np.ndarray]] = []
     previous_end = 0
@@ -236,8 +250,66 @@ def _embed_global_speaker_windows(
         canonical_segments.append((segment.span, pcm))
         previous_end = segment.span.end_sample
 
-    if not canonical_segments:
+    if not speech_islands:
+        if canonical_segments:
+            raise invalid_output()
         return ()
+
+    masked_pieces: list[tuple[SpeechSpan, np.ndarray]] = []
+    island_index = 0
+    segment_index = 0
+    covered_until = speech_islands[0].start_sample
+    segment_had_overlap = False
+    while (
+        island_index < len(speech_islands)
+        and segment_index < len(canonical_segments)
+    ):
+        island = speech_islands[island_index]
+        span, speech_pcm = canonical_segments[segment_index]
+        if span.end_sample <= island.start_sample:
+            if not segment_had_overlap:
+                raise invalid_output()
+            segment_index += 1
+            segment_had_overlap = False
+            continue
+        if island.end_sample <= span.start_sample:
+            if covered_until != island.end_sample:
+                raise invalid_output()
+            island_index += 1
+            if island_index < len(speech_islands):
+                covered_until = speech_islands[island_index].start_sample
+            continue
+
+        overlap_start = max(island.start_sample, span.start_sample)
+        overlap_end = min(island.end_sample, span.end_sample)
+        if overlap_start != covered_until:
+            raise invalid_output()
+        masked_pieces.append(
+            (
+                SpeechSpan(overlap_start, overlap_end),
+                speech_pcm[
+                    overlap_start - span.start_sample : overlap_end
+                    - span.start_sample
+                ],
+            )
+        )
+        covered_until = overlap_end
+        segment_had_overlap = True
+
+        if span.end_sample <= island.end_sample:
+            segment_index += 1
+            segment_had_overlap = False
+        if island.end_sample <= span.end_sample:
+            island_index += 1
+            if island_index < len(speech_islands):
+                covered_until = speech_islands[island_index].start_sample
+
+    if island_index != len(speech_islands):
+        raise invalid_output()
+    if segment_index < len(canonical_segments) and segment_had_overlap:
+        segment_index += 1
+    if segment_index != len(canonical_segments):
+        raise invalid_output()
 
     windows: list[SpeakerEmbeddingWindow] = []
     pending_ranges: list[tuple[int, int]] = []
@@ -285,7 +357,8 @@ def _embed_global_speaker_windows(
         pending_ranges.clear()
         pending_pcms.clear()
 
-    segment_cursor = 0
+    island_cursor = 0
+    piece_cursor = 0
     for start_sample in range(
         0,
         total_samples,
@@ -294,39 +367,42 @@ def _embed_global_speaker_windows(
         logical_end_sample = start_sample + SPEAKER_WINDOW_MAX_SAMPLES
         physical_end_sample = min(logical_end_sample, total_samples)
         while (
-            segment_cursor < len(canonical_segments)
-            and canonical_segments[segment_cursor][0].end_sample <= start_sample
+            island_cursor < len(speech_islands)
+            and speech_islands[island_cursor].end_sample <= start_sample
         ):
-            segment_cursor += 1
+            island_cursor += 1
 
-        overlaps: list[tuple[SpeechSpan, np.ndarray, int, int]] = []
-        scan_index = segment_cursor
-        while (
-            scan_index < len(canonical_segments)
-            and canonical_segments[scan_index][0].start_sample
-            < physical_end_sample
+        if (
+            island_cursor == len(speech_islands)
+            or speech_islands[island_cursor].start_sample
+            >= physical_end_sample
         ):
-            span, speech_pcm = canonical_segments[scan_index]
-            overlap_start = max(start_sample, span.start_sample)
-            overlap_end = min(physical_end_sample, span.end_sample)
-            if overlap_start < overlap_end:
-                overlaps.append(
-                    (span, speech_pcm, overlap_start, overlap_end)
-                )
-            scan_index += 1
-        if not overlaps:
             continue
 
         pcm = np.zeros(
             physical_end_sample - start_sample,
             dtype=np.int16,
         )
-        for span, speech_pcm, overlap_start, overlap_end in overlaps:
+        while (
+            piece_cursor < len(masked_pieces)
+            and masked_pieces[piece_cursor][0].end_sample <= start_sample
+        ):
+            piece_cursor += 1
+        scan_index = piece_cursor
+        while (
+            scan_index < len(masked_pieces)
+            and masked_pieces[scan_index][0].start_sample
+            < physical_end_sample
+        ):
+            span, speech_pcm = masked_pieces[scan_index]
+            overlap_start = max(start_sample, span.start_sample)
+            overlap_end = min(physical_end_sample, span.end_sample)
             pcm[
                 overlap_start - start_sample : overlap_end - start_sample
             ] = speech_pcm[
                 overlap_start - span.start_sample : overlap_end - span.start_sample
             ]
+            scan_index += 1
         pending_ranges.append((start_sample, logical_end_sample))
         pending_pcms.append(pcm)
         if len(pending_pcms) == SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS:
@@ -986,7 +1062,10 @@ class StreamingSpeechSegmenter:
         block: DecodedBlock,
         *,
         is_final: bool,
-    ) -> tuple[BufferedSpeechSegment, ...]:
+    ) -> tuple[
+        tuple[BufferedSpeechSegment, ...],
+        tuple[SpeechSpan, ...],
+    ]:
         if self._terminal:
             raise PipelineError(
                 "invalid_model_output",
@@ -997,11 +1076,12 @@ class StreamingSpeechSegmenter:
                 block,
                 is_final=is_final,
             )
-            return self._pcm_buffer.consume(
+            emitted = self._pcm_buffer.consume(
                 block,
                 completed_spans=completed_spans,
                 open_start_sample=self._vad_session.open_start_sample,
             )
+            return emitted, completed_spans
         except Exception:
             self._terminal = True
             raise
@@ -1375,7 +1455,10 @@ class Processor:
                     "Decoded audio exceeds the configured duration limit",
                 )
             check_cancellation()
-            emitted = segmenter.process(current, is_final=is_final)
+            emitted, _completed_true_islands = segmenter.process(
+                current,
+                is_final=is_final,
+            )
             durable_fence()
             if type(emitted) is not tuple:
                 raise PipelineError(

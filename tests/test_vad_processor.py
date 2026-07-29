@@ -161,7 +161,7 @@ class ScriptedSegmenter:
         self.calls.append((block, is_final))
         if self.events is not None:
             self.events.append("fsmn")
-        return output
+        return output, ()
 
 
 def _install_segmenter(
@@ -322,6 +322,7 @@ def test_global_speaker_windows_follow_absolute_grid_and_preserve_silence() -> N
     )
 
     windows = pipeline._embed_global_speaker_windows(
+        tuple(segment.span for segment in segments),
         segments,
         total_samples=72_001,
         speaker_adapter=adapter,
@@ -354,6 +355,7 @@ def test_global_speaker_windows_batch_at_existing_exact_window_bound() -> None:
     total_samples = 39 * speakers.SPEAKER_WINDOW_SHIFT_SAMPLES + 1
 
     windows = pipeline._embed_global_speaker_windows(
+        (pipeline.SpeechSpan(0, total_samples),),
         (
             _speech_segment(
                 0,
@@ -375,6 +377,7 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
     assert (
         pipeline._embed_global_speaker_windows(
             (),
+            (),
             total_samples=72_001,
             speaker_adapter=empty_adapter,
         )
@@ -382,15 +385,64 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
     )
     assert empty_adapter.calls == []
 
+    with pytest.raises(pipeline.PipelineError) as extra_segment:
+        pipeline._embed_global_speaker_windows(
+            (),
+            (_speech_segment(0, np.ones(1, dtype=np.int16)),),
+            total_samples=1,
+            speaker_adapter=empty_adapter,
+        )
+    assert extra_segment.value.code == "invalid_model_output"
+
+    with pytest.raises(pipeline.PipelineError) as source_gap:
+        pipeline._embed_global_speaker_windows(
+            (pipeline.SpeechSpan(0, 3),),
+            (
+                _speech_segment(0, np.ones(1, dtype=np.int16)),
+                _speech_segment(2, np.ones(1, dtype=np.int16)),
+            ),
+            total_samples=3,
+            speaker_adapter=empty_adapter,
+        )
+    assert source_gap.value.code == "invalid_model_output"
+
     invalid_adapter = RecordingExactSpeakerAdapter(invalid_output=True)
     with pytest.raises(pipeline.PipelineError) as caught:
         pipeline._embed_global_speaker_windows(
+            (pipeline.SpeechSpan(0, 1),),
             (_speech_segment(0, np.ones(1, dtype=np.int16)),),
             total_samples=1,
             speaker_adapter=invalid_adapter,
         )
 
     assert caught.value.code == "invalid_model_output"
+
+
+def test_global_speaker_windows_mask_chunk_spill_outside_true_island() -> None:
+    adapter = RecordingExactSpeakerAdapter()
+
+    windows = pipeline._embed_global_speaker_windows(
+        (pipeline.SpeechSpan(456_000, 468_000),),
+        (
+            _speech_segment(
+                456_000,
+                np.full(24_000, 7, dtype=np.int16),
+            ),
+        ),
+        total_samples=480_000,
+        speaker_adapter=adapter,
+    )
+
+    assert [(window.start_sample, window.end_sample) for window in windows] == [
+        (444_000, 468_000),
+        (456_000, 480_000),
+    ]
+    assert len(adapter.calls) == 1
+    first, second = adapter.calls[0]
+    assert np.count_nonzero(first[:12_000]) == 0
+    assert np.all(first[12_000:] == 7)
+    assert np.all(second[:12_000] == 7)
+    assert np.count_nonzero(second[12_000:]) == 0
 
 
 def test_speaker_region_projection_handles_empty_and_single_window() -> None:

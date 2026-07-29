@@ -141,12 +141,15 @@ class _ScriptedSegmenter:
         block: DecodedBlock,
         *,
         is_final: bool,
-    ) -> tuple[BufferedSpeechSegment, ...]:
+    ) -> tuple[
+        tuple[BufferedSpeechSegment, ...],
+        tuple[object, ...],
+    ]:
         del block
         self.final_flags.append(is_final)
         if self.cancellation is not None:
             self.cancellation.cancel()
-        return self.output if is_final else ()
+        return (self.output if is_final else ()), ()
 
 
 class _EmbeddingAdapter:
