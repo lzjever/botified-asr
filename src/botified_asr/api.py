@@ -1179,6 +1179,16 @@ async def _submit_async_transcription(
             storage.abort_job_upload(cleanup_handle)
 
 
+def _diarization_too_long_api_error() -> ApiError:
+    return ApiError(
+        413,
+        "diarization_too_long",
+        f"Diarization audio must not exceed "
+        f"{DIARIZATION_MAX_DURATION_SECONDS} seconds",
+        param="file",
+    )
+
+
 def _validate_transcription_preflight(
     storage: Storage,
     options: CanonicalOptions,
@@ -1190,13 +1200,7 @@ def _validate_transcription_preflight(
         options.model == "sensevoice-diarize"
         and probe.duration_seconds > DIARIZATION_MAX_DURATION_SECONDS
     ):
-        raise ApiError(
-            413,
-            "diarization_too_long",
-            f"Diarization audio must not exceed "
-            f"{DIARIZATION_MAX_DURATION_SECONDS} seconds",
-            param="file",
-        )
+        raise _diarization_too_long_api_error()
     if probe.duration_seconds > storage.limits.max_audio_duration_secs:
         raise ApiError(
             413,
@@ -1400,6 +1404,8 @@ def _processing_api_error(
                 "Audio exceeds max_audio_duration_secs",
                 param="file",
             )
+        if exc.code == "diarization_too_long":
+            return _diarization_too_long_api_error()
         return ApiError(
             500,
             "internal_error",

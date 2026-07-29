@@ -148,6 +148,11 @@ class SpyProcessor:
                     "audio_too_long",
                     "decoded past /private/effective-duration-cap",
                 )
+            if self.behavior == "diarization_too_long":
+                raise PipelineError(
+                    "diarization_too_long",
+                    "decoded past /private/diarization-duration-cap",
+                )
             if self.behavior == "unknown_pipeline":
                 raise PipelineError(
                     "unexpected_pipeline_code",
@@ -615,6 +620,32 @@ def test_sync_vad_actual_duration_overflow_is_exact_413_and_cleans(
         }
     }
     assert "/private/effective-duration-cap" not in response.text
+    assert processor.calls == 1
+    _assert_no_resources(storage)
+
+
+def test_sync_diarization_actual_overflow_is_exact_413_and_cleans(
+    storage: Storage,
+) -> None:
+    processor = SpyProcessor("diarization_too_long")
+
+    with TestClient(_app(storage, processor)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=_diarized_files(),
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {
+            "message": "Diarization audio must not exceed 1800 seconds",
+            "type": "invalid_request_error",
+            "param": "file",
+            "code": "diarization_too_long",
+        }
+    }
+    assert "/private/diarization-duration-cap" not in response.text
     assert processor.calls == 1
     _assert_no_resources(storage)
 

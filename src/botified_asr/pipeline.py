@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unicodedata
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -18,6 +18,7 @@ from botified_asr.audio import (
 )
 from botified_asr.contracts import (
     CANONICAL_JSONL_MAX_RECORD_BYTES,
+    DIARIZATION_MAX_AUDIO_SAMPLES,
     DIRECT_MAX_SAMPLES,
     MAX_AUDIO_SAMPLES,
     CanonicalOptions,
@@ -29,6 +30,7 @@ from botified_asr.speaker_snapshot import (
     SelectedSpeakerSnapshot,
 )
 from botified_asr.speakers import (
+    AnonymousSpeakerClusteringPolicy,
     AnonymousSpeakerClusteringResult,
     SPEAKER_EMBEDDING_BATCH_MAX_WINDOWS,
     SPEAKER_EMBEDDING_DIMENSION,
@@ -37,6 +39,7 @@ from botified_asr.speakers import (
     SPEAKER_WINDOW_SHIFT_SAMPLES,
     SpeakerEmbeddingAdapter,
     SpeakerEmbeddingWindow,
+    cluster_anonymous_speakers,
     is_anonymous_speaker_label,
 )
 
@@ -196,6 +199,7 @@ def _embed_global_speaker_windows(
     *,
     total_samples: int,
     speaker_adapter: SpeakerEmbeddingAdapter,
+    post_batch_fence: Callable[[], None],
 ) -> tuple[SpeakerEmbeddingWindow, ...]:
     def invalid_output() -> PipelineError:
         return PipelineError(
@@ -319,6 +323,7 @@ def _embed_global_speaker_windows(
         if not pending_pcms:
             return
         embeddings = speaker_adapter.embed_exact_windows(tuple(pending_pcms))
+        post_batch_fence()
         if type(embeddings) is not tuple or len(embeddings) != len(pending_ranges):
             raise invalid_output()
         for (start_sample, end_sample), embedding in zip(
@@ -1205,6 +1210,107 @@ class CanonicalJsonlSegmentSink:
         self._state = "aborted"
 
 
+def _check_processing_cancellation(cancellation: Cancellation) -> None:
+    if cancellation.cancelled:
+        raise PipelineError("cancelled", "Audio processing was cancelled")
+
+
+def _durable_progress_fence(
+    cancellation: Cancellation,
+    progress_sink: ProgressSink,
+    processed_samples: int,
+) -> None:
+    _check_processing_cancellation(cancellation)
+    progress_sink.update(
+        processed_samples=processed_samples,
+        total_samples=None,
+    )
+    _check_processing_cancellation(cancellation)
+
+
+class _AsrBatchWriter:
+    def __init__(
+        self,
+        adapter: AsrAdapter,
+        *,
+        language: str,
+        cancellation: Cancellation,
+        segment_sink: SegmentSink,
+    ) -> None:
+        self._adapter = adapter
+        self._language = language
+        self._cancellation = cancellation
+        self._segment_sink = segment_sink
+        self._pending: list[tuple[BufferedSpeechSegment, str | None]] = []
+        self._pending_pcm_samples = 0
+        self._next_record_index = 0
+
+    def enqueue(
+        self,
+        segment: BufferedSpeechSegment,
+        *,
+        anonymous_speaker: str | None,
+        post_batch_fence: Callable[[], None],
+    ) -> None:
+        if not isinstance(segment, BufferedSpeechSegment):
+            raise PipelineError(
+                "invalid_model_output",
+                "Speech segmenter returned an invalid segment",
+            )
+        exceeds_batch = bool(self._pending) and (
+            len(self._pending) + 1 > ASR_BATCH_MAX_SEGMENTS
+            or self._pending_pcm_samples + len(segment.pcm)
+            > ASR_BATCH_MAX_PCM_SAMPLES
+            or segment.span.end_sample - self._pending[0][0].span.start_sample
+            > ASR_BATCH_MAX_WALL_SAMPLES
+        )
+        if exceeds_batch:
+            self.flush(post_batch_fence=post_batch_fence)
+        self._pending.append((segment, anonymous_speaker))
+        self._pending_pcm_samples += len(segment.pcm)
+
+    def flush(self, *, post_batch_fence: Callable[[], None]) -> None:
+        if not self._pending:
+            return
+        _check_processing_cancellation(self._cancellation)
+        pending = tuple(self._pending)
+        batch_result = self._adapter.transcribe_batch(
+            tuple(segment.pcm for segment, _label in pending),
+            language=self._language,
+        )
+        post_batch_fence()
+        if (
+            type(batch_result) is not tuple
+            or len(batch_result) != len(pending)
+            or any(not isinstance(result, AsrResult) for result in batch_result)
+        ):
+            raise PipelineError(
+                "invalid_model_output",
+                "ASR model returned an invalid batch result",
+            )
+        for (segment, anonymous_speaker), result in zip(
+            pending,
+            batch_result,
+            strict=True,
+        ):
+            if result.text == "":
+                continue
+            self._segment_sink.append(
+                SegmentRecord(
+                    index=self._next_record_index,
+                    start_sample=segment.span.start_sample,
+                    end_sample=segment.span.end_sample,
+                    text=result.text,
+                    language=result.language,
+                    annotations=result.annotations,
+                    anonymous_speaker=anonymous_speaker,
+                )
+            )
+            self._next_record_index += 1
+        self._pending.clear()
+        self._pending_pcm_samples = 0
+
+
 class Processor:
     def __init__(
         self,
@@ -1212,10 +1318,14 @@ class Processor:
         adapter: AsrAdapter,
         *,
         vad_adapter: StreamingVadAdapter | None = None,
+        speaker_adapter: SpeakerEmbeddingAdapter | None = None,
+        speaker_clustering_policy: AnonymousSpeakerClusteringPolicy | None = None,
     ) -> None:
         self._frontend = frontend
         self._adapter = adapter
         self._vad_adapter = vad_adapter
+        self._speaker_adapter = speaker_adapter
+        self._speaker_clustering_policy = speaker_clustering_policy
 
     def process(
         self,
@@ -1269,7 +1379,13 @@ class Processor:
                 canonical_options.model == "sensevoice-diarize"
                 and canonical_options.chunking_strategy == "auto"
             )
-            if is_diarize:
+            if selected_speaker_snapshot.speakers:
+                raise PipelineNotReady()
+            if is_diarize and (
+                self._vad_adapter is None
+                or self._speaker_adapter is None
+                or self._speaker_clustering_policy is None
+            ):
                 raise PipelineNotReady()
             if is_vad and self._vad_adapter is None:
                 raise PipelineNotReady()
@@ -1286,7 +1402,40 @@ class Processor:
                 else media_probe
             )
             blocks = self._frontend.decode(input_path, probe, cancellation)
-            if is_vad:
+            if is_diarize:
+                vad_adapter = self._vad_adapter
+                speaker_adapter = self._speaker_adapter
+                speaker_clustering_policy = self._speaker_clustering_policy
+                if (
+                    vad_adapter is None
+                    or speaker_adapter is None
+                    or speaker_clustering_policy is None
+                ):
+                    raise PipelineNotReady()
+                (
+                    actual_samples,
+                    speech_islands,
+                    source_segments,
+                ) = self._collect_diarization_speech(
+                    blocks,
+                    cancellation,
+                    progress_sink,
+                    vad_adapter=vad_adapter,
+                    effective_max_audio_samples=effective_max_audio_samples,
+                )
+                close_decoder()
+                self._process_offline_diarization(
+                    speech_islands,
+                    source_segments,
+                    cancellation,
+                    progress_sink,
+                    segment_sink,
+                    speaker_adapter=speaker_adapter,
+                    speaker_clustering_policy=speaker_clustering_policy,
+                    language=canonical_options.language,
+                    total_samples=actual_samples,
+                )
+            elif is_vad:
                 vad_adapter = self._vad_adapter
                 if vad_adapter is None:
                     raise PipelineNotReady()
@@ -1312,8 +1461,7 @@ class Processor:
                 )
             close_decoder()
             speaker_mapping = SpeakerLabelMapping(())
-            if cancellation.cancelled:
-                raise PipelineError("cancelled", "Audio processing was cancelled")
+            _check_processing_cancellation(cancellation)
             progress_sink.update(
                 processed_samples=actual_samples,
                 total_samples=actual_samples,
@@ -1342,84 +1490,138 @@ class Processor:
         language: str,
         effective_max_audio_samples: int,
     ) -> int:
-        segmenter = StreamingSpeechSegmenter(vad_adapter)
-        pending: list[BufferedSpeechSegment] = []
-        pending_pcm_samples = 0
-        next_record_index = 0
-        processed_end_sample = 0
+        writer = _AsrBatchWriter(
+            self._adapter,
+            language=language,
+            cancellation=cancellation,
+            segment_sink=segment_sink,
+        )
 
-        def check_cancellation() -> None:
-            if cancellation.cancelled:
-                raise PipelineError("cancelled", "Audio processing was cancelled")
-
-        def durable_fence() -> None:
-            check_cancellation()
-            progress_sink.update(
-                processed_samples=processed_end_sample,
-                total_samples=None,
-            )
-            check_cancellation()
-
-        def flush() -> None:
-            nonlocal pending
-            nonlocal pending_pcm_samples
-            nonlocal next_record_index
-            if not pending:
-                return
-            check_cancellation()
-            segments = tuple(pending)
-            batch_result = self._adapter.transcribe_batch(
-                tuple(segment.pcm for segment in segments),
-                language=language,
-            )
-            durable_fence()
-            if (
-                type(batch_result) is not tuple
-                or len(batch_result) != len(segments)
-                or any(not isinstance(result, AsrResult) for result in batch_result)
-            ):
-                raise PipelineError(
-                    "invalid_model_output",
-                    "ASR model returned an invalid batch result",
+        def consume(
+            emitted: tuple[BufferedSpeechSegment, ...],
+            _completed_true_islands: tuple[SpeechSpan, ...],
+            fence_samples: int,
+        ) -> None:
+            for segment in emitted:
+                writer.enqueue(
+                    segment,
+                    anonymous_speaker=None,
+                    post_batch_fence=lambda: _durable_progress_fence(
+                        cancellation,
+                        progress_sink,
+                        fence_samples,
+                    ),
                 )
-            for segment, result in zip(
-                segments,
-                batch_result,
-                strict=True,
-            ):
-                if result.text == "":
-                    continue
-                segment_sink.append(
-                    SegmentRecord(
-                        index=next_record_index,
-                        start_sample=segment.span.start_sample,
-                        end_sample=segment.span.end_sample,
-                        text=result.text,
-                        language=result.language,
-                        annotations=result.annotations,
+
+        actual_samples = self._traverse_vad(
+            blocks,
+            cancellation,
+            progress_sink,
+            vad_adapter=vad_adapter,
+            effective_max_audio_samples=effective_max_audio_samples,
+            diarization_max_audio_samples=None,
+            consume=consume,
+        )
+        writer.flush(
+            post_batch_fence=lambda: _durable_progress_fence(
+                cancellation,
+                progress_sink,
+                actual_samples,
+            )
+        )
+        return actual_samples
+
+    def _collect_diarization_speech(
+        self,
+        blocks: DecodedBlocks,
+        cancellation: Cancellation,
+        progress_sink: ProgressSink,
+        *,
+        vad_adapter: StreamingVadAdapter,
+        effective_max_audio_samples: int,
+    ) -> tuple[
+        int,
+        tuple[SpeechSpan, ...],
+        tuple[BufferedSpeechSegment, ...],
+    ]:
+        speech_islands: list[SpeechSpan] = []
+        source_segments: list[BufferedSpeechSegment] = []
+
+        def collect(
+            emitted: tuple[BufferedSpeechSegment, ...],
+            completed_true_islands: tuple[SpeechSpan, ...],
+            _fence_samples: int,
+        ) -> None:
+            speech_islands.extend(completed_true_islands)
+            for segment in emitted:
+                canonical_pcm = canonical_speech_pcm(segment)
+                owned_pcm = np.array(
+                    canonical_pcm,
+                    dtype=np.int16,
+                    order="C",
+                    copy=True,
+                )
+                source_segments.append(
+                    BufferedSpeechSegment(
+                        span=segment.span,
+                        pcm_start_sample=segment.span.start_sample,
+                        pcm=owned_pcm,
                     )
                 )
-                next_record_index += 1
-            pending = []
-            pending_pcm_samples = 0
 
-        def enqueue(segment: BufferedSpeechSegment) -> None:
-            nonlocal pending_pcm_samples
-            if not isinstance(segment, BufferedSpeechSegment):
+        actual_samples = self._traverse_vad(
+            blocks,
+            cancellation,
+            progress_sink,
+            vad_adapter=vad_adapter,
+            effective_max_audio_samples=effective_max_audio_samples,
+            diarization_max_audio_samples=DIARIZATION_MAX_AUDIO_SAMPLES,
+            consume=collect,
+        )
+        return actual_samples, tuple(speech_islands), tuple(source_segments)
+
+    def _traverse_vad(
+        self,
+        blocks: DecodedBlocks,
+        cancellation: Cancellation,
+        progress_sink: ProgressSink,
+        *,
+        vad_adapter: StreamingVadAdapter,
+        effective_max_audio_samples: int,
+        diarization_max_audio_samples: int | None,
+        consume: Callable[
+            [
+                tuple[BufferedSpeechSegment, ...],
+                tuple[SpeechSpan, ...],
+                int,
+            ],
+            None,
+        ],
+    ) -> int:
+        segmenter = StreamingSpeechSegmenter(vad_adapter)
+        processed_end_sample = 0
+
+        def validated_end(block: DecodedBlock, expected_start: int) -> int:
+            if block.start_sample != expected_start:
                 raise PipelineError(
-                    "invalid_model_output",
-                    "Speech segmenter returned an invalid segment",
+                    "invalid_audio",
+                    "Decoded audio blocks are not contiguous",
                 )
-            exceeds_batch = bool(pending) and (
-                len(pending) + 1 > ASR_BATCH_MAX_SEGMENTS
-                or pending_pcm_samples + len(segment.pcm) > ASR_BATCH_MAX_PCM_SAMPLES
-                or segment.span.end_sample - pending[0].span.start_sample
-                > ASR_BATCH_MAX_WALL_SAMPLES
-            )
-            if exceeds_batch:
-                flush()
-            pending.append(segment)
-            pending_pcm_samples += len(segment.pcm)
+            end_sample = expected_start + len(block.pcm)
+            if end_sample > effective_max_audio_samples:
+                raise PipelineError(
+                    "audio_too_long",
+                    "Decoded audio exceeds the configured duration limit",
+                )
+            if (
+                diarization_max_audio_samples is not None
+                and end_sample > diarization_max_audio_samples
+            ):
+                raise PipelineError(
+                    "diarization_too_long",
+                    "Decoded audio exceeds the diarization duration limit",
+                )
+            return end_sample
 
         iterator = iter(blocks)
         try:
@@ -1432,41 +1634,44 @@ class Processor:
             return 0
 
         while True:
+            next_processed_end_sample = validated_end(
+                current,
+                processed_end_sample,
+            )
+
             try:
                 following = next(iterator)
             except StopIteration:
                 following = None
             is_final = following is None
-
-            if current.start_sample != processed_end_sample:
-                raise PipelineError(
-                    "invalid_audio",
-                    "Decoded audio blocks are not contiguous",
-                )
+            if following is not None:
+                validated_end(following, next_processed_end_sample)
             if not is_final and len(current.pcm) < BLOCK_SAMPLES:
                 raise PipelineError(
                     "invalid_audio",
                     "Decoded audio has a non-final short block",
                 )
-            next_processed_end_sample = processed_end_sample + len(current.pcm)
-            if next_processed_end_sample > effective_max_audio_samples:
-                raise PipelineError(
-                    "audio_too_long",
-                    "Decoded audio exceeds the configured duration limit",
-                )
-            check_cancellation()
-            emitted, _completed_true_islands = segmenter.process(
+
+            _check_processing_cancellation(cancellation)
+            emitted, completed_true_islands = segmenter.process(
                 current,
                 is_final=is_final,
             )
-            durable_fence()
+            _durable_progress_fence(
+                cancellation,
+                progress_sink,
+                processed_end_sample,
+            )
             if type(emitted) is not tuple:
                 raise PipelineError(
                     "invalid_model_output",
                     "Speech segmenter returned an invalid result",
                 )
-            for segment in emitted:
-                enqueue(segment)
+            consume(
+                emitted,
+                completed_true_islands,
+                processed_end_sample,
+            )
 
             processed_end_sample = next_processed_end_sample
             progress_sink.update(
@@ -1474,11 +1679,132 @@ class Processor:
                 total_samples=None,
             )
             if is_final:
-                break
+                return processed_end_sample
             current = following
 
-        flush()
-        return processed_end_sample
+    def _process_offline_diarization(
+        self,
+        speech_islands: tuple[SpeechSpan, ...],
+        source_segments: tuple[BufferedSpeechSegment, ...],
+        cancellation: Cancellation,
+        progress_sink: ProgressSink,
+        segment_sink: SegmentSink,
+        *,
+        speaker_adapter: SpeakerEmbeddingAdapter,
+        speaker_clustering_policy: AnonymousSpeakerClusteringPolicy,
+        language: str,
+        total_samples: int,
+    ) -> None:
+        if not speech_islands:
+            if source_segments:
+                raise PipelineError(
+                    "invalid_model_output",
+                    "Speech segmenter returned inconsistent speech",
+                )
+            return
+
+        def durable_fence() -> None:
+            _durable_progress_fence(
+                cancellation,
+                progress_sink,
+                total_samples,
+            )
+
+        windows = _embed_global_speaker_windows(
+            speech_islands,
+            source_segments,
+            total_samples=total_samples,
+            speaker_adapter=speaker_adapter,
+            post_batch_fence=durable_fence,
+        )
+        embeddings = np.empty(
+            (len(windows), SPEAKER_EMBEDDING_DIMENSION),
+            dtype=np.float32,
+            order="C",
+        )
+        for index, window in enumerate(windows):
+            embeddings[index] = window.embedding
+        _check_processing_cancellation(cancellation)
+        clustering_result = cluster_anonymous_speakers(
+            embeddings,
+            policy=speaker_clustering_policy,
+        )
+        _check_processing_cancellation(cancellation)
+        projected = _project_speaker_regions(
+            speech_islands,
+            windows,
+            clustering_result,
+            total_samples=total_samples,
+        )
+
+        writer = _AsrBatchWriter(
+            self._adapter,
+            language=language,
+            cancellation=cancellation,
+            segment_sink=segment_sink,
+        )
+        source_cursor = 0
+        for span, cluster_ordinal in projected:
+            while (
+                source_cursor < len(source_segments)
+                and source_segments[source_cursor].span.end_sample
+                <= span.start_sample
+            ):
+                source_cursor += 1
+            scan_index = source_cursor
+            covered_until = span.start_sample
+            parts: list[np.ndarray] = []
+            while (
+                scan_index < len(source_segments)
+                and source_segments[scan_index].span.start_sample
+                < span.end_sample
+            ):
+                source = source_segments[scan_index]
+                overlap_start = max(
+                    span.start_sample,
+                    source.span.start_sample,
+                )
+                overlap_end = min(
+                    span.end_sample,
+                    source.span.end_sample,
+                )
+                if overlap_start != covered_until:
+                    raise PipelineError(
+                        "invalid_model_output",
+                        "Projected speaker region has incomplete PCM",
+                    )
+                parts.append(
+                    source.pcm[
+                        overlap_start - source.span.start_sample : overlap_end
+                        - source.span.start_sample
+                    ]
+                )
+                covered_until = overlap_end
+                if covered_until == span.end_sample:
+                    break
+                scan_index += 1
+            if covered_until != span.end_sample:
+                raise PipelineError(
+                    "invalid_model_output",
+                    "Projected speaker region has incomplete PCM",
+                )
+            if len(parts) == 1:
+                pcm = parts[0].copy()
+            else:
+                pcm = np.concatenate(parts)
+            segment = BufferedSpeechSegment(
+                span=span,
+                pcm_start_sample=span.start_sample,
+                pcm=pcm,
+            )
+            writer.enqueue(
+                segment,
+                anonymous_speaker=(
+                    clustering_result.clusters[cluster_ordinal].label
+                ),
+                post_batch_fence=durable_fence,
+            )
+        writer.flush(post_batch_fence=durable_fence)
 
     def _process_direct(
         self,

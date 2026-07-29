@@ -1722,6 +1722,10 @@ def test_claimed_job_attempt_progress_loser_discards_only_owned_artifact(
             "audio_too_long",
         ),
         (
+            PipelineError("diarization_too_long", "private diarization detail"),
+            "diarization_too_long",
+        ),
+        (
             AudioError("invalid_audio", "private audio detail"),
             "invalid_audio",
         ),

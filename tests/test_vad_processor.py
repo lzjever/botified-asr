@@ -10,6 +10,7 @@ import pytest
 from botified_asr import pipeline, speakers
 from botified_asr.audio import BLOCK_SAMPLES, Cancellation, DecodedBlock, MediaProbe
 from botified_asr.contracts import (
+    DIARIZATION_MAX_AUDIO_SAMPLES,
     DIRECT_MAX_SAMPLES,
     MAX_AUDIO_SAMPLES,
     CanonicalOptions,
@@ -44,6 +45,37 @@ class FakeDecoder:
         self.closed += 1
         if self.events is not None:
             self.events.append("decoder_close")
+
+
+class SharedZeroBoundaryDecoder(FakeDecoder):
+    def __init__(
+        self,
+        *,
+        full_blocks: int,
+        tail_samples: int = 0,
+        guard_after_tail: bool = False,
+    ) -> None:
+        super().__init__(())
+        self.full_blocks = full_blocks
+        self.tail_samples = tail_samples
+        self.guard_after_tail = guard_after_tail
+        self.yielded = 0
+        self.guard_requests = 0
+
+    def __iter__(self):
+        shared = np.zeros(BLOCK_SAMPLES, dtype=np.int16)
+        for index in range(self.full_blocks):
+            self.yielded += 1
+            yield DecodedBlock(index * BLOCK_SAMPLES, shared)
+        if self.tail_samples:
+            self.yielded += 1
+            yield DecodedBlock(
+                self.full_blocks * BLOCK_SAMPLES,
+                shared[: self.tail_samples],
+            )
+        if self.guard_after_tail:
+            self.guard_requests += 1
+            raise AssertionError("decoder iterated beyond the overflow block")
 
 
 class FakeFrontend:
@@ -144,10 +176,12 @@ class ScriptedSegmenter:
         adapter: object,
         outputs: tuple[object, ...],
         *,
+        completed_outputs: tuple[tuple[pipeline.SpeechSpan, ...], ...] | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.adapter = adapter
         self.outputs = outputs
+        self.completed_outputs = completed_outputs
         self.events = events
         self.calls: list[tuple[DecodedBlock, bool]] = []
 
@@ -161,13 +195,52 @@ class ScriptedSegmenter:
         self.calls.append((block, is_final))
         if self.events is not None:
             self.events.append("fsmn")
-        return output, ()
+        completed = (
+            ()
+            if self.completed_outputs is None
+            else self.completed_outputs[len(self.calls) - 1]
+        )
+        return output, completed
+
+
+class FinalSampleSegmenter:
+    def __init__(
+        self,
+        adapter: object,
+        *,
+        emit_final_speech: bool,
+        emit_first_speech: bool,
+    ) -> None:
+        self.adapter = adapter
+        self.emit_final_speech = emit_final_speech
+        self.emit_first_speech = emit_first_speech
+        self.calls: list[tuple[DecodedBlock, bool]] = []
+
+    def process(
+        self,
+        block: DecodedBlock,
+        *,
+        is_final: bool,
+    ) -> tuple[
+        tuple[pipeline.BufferedSpeechSegment, ...],
+        tuple[pipeline.SpeechSpan, ...],
+    ]:
+        self.calls.append((block, is_final))
+        if self.emit_first_speech and len(self.calls) == 1:
+            start = block.start_sample
+        elif is_final and self.emit_final_speech:
+            start = block.start_sample + len(block.pcm) - 1
+        else:
+            return (), ()
+        span = pipeline.SpeechSpan(start, start + 1)
+        return (_speech_segment(start, np.ones(1, dtype=np.int16)),), (span,)
 
 
 def _install_segmenter(
     monkeypatch: pytest.MonkeyPatch,
     outputs: tuple[object, ...],
     *,
+    completed_outputs: tuple[tuple[pipeline.SpeechSpan, ...], ...] | None = None,
     events: list[str] | None = None,
 ) -> list[ScriptedSegmenter]:
     instances: list[ScriptedSegmenter] = []
@@ -176,7 +249,29 @@ def _install_segmenter(
         instance = ScriptedSegmenter(
             adapter,
             outputs,
+            completed_outputs=completed_outputs,
             events=events,
+        )
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(pipeline, "StreamingSpeechSegmenter", factory)
+    return instances
+
+
+def _install_final_sample_segmenter(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    emit_final_speech: bool,
+    emit_first_speech: bool = False,
+) -> list[FinalSampleSegmenter]:
+    instances: list[FinalSampleSegmenter] = []
+
+    def factory(adapter: object) -> FinalSampleSegmenter:
+        instance = FinalSampleSegmenter(
+            adapter,
+            emit_final_speech=emit_final_speech,
+            emit_first_speech=emit_first_speech,
         )
         instances.append(instance)
         return instance
@@ -221,15 +316,23 @@ def _unit(*components: float) -> np.ndarray:
 
 
 class RecordingExactSpeakerAdapter:
-    def __init__(self, *, invalid_output: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        invalid_output: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
         self.calls: list[tuple[np.ndarray, ...]] = []
         self.invalid_output = invalid_output
+        self.events = events
 
     def embed_exact_windows(
         self,
         pcms: tuple[np.ndarray, ...],
     ) -> tuple[np.ndarray, ...]:
         self.calls.append(tuple(pcm.copy() for pcm in pcms))
+        if self.events is not None:
+            self.events.append("cam")
         if self.invalid_output:
             return ()
         return tuple(_unit(1.0, float(index + 1)) for index, _pcm in enumerate(pcms))
@@ -246,6 +349,14 @@ def _speech_segment(start: int, values: np.ndarray) -> pipeline.BufferedSpeechSe
         span=pipeline.SpeechSpan(start, start + len(values)),
         pcm_start_sample=start,
         pcm=np.ascontiguousarray(values, dtype=np.int16),
+    )
+
+
+def _clustering_policy() -> speakers.AnonymousSpeakerClusteringPolicy:
+    return speakers.AnonymousSpeakerClusteringPolicy(
+        pruning_p=0.5,
+        low_frequency_beta=1.0,
+        normalized_gap_gamma=0.1,
     )
 
 
@@ -326,6 +437,7 @@ def test_global_speaker_windows_follow_absolute_grid_and_preserve_silence() -> N
         segments,
         total_samples=72_001,
         speaker_adapter=adapter,
+        post_batch_fence=lambda: None,
     )
 
     assert [(window.start_sample, window.end_sample) for window in windows] == [
@@ -353,6 +465,7 @@ def test_global_speaker_windows_follow_absolute_grid_and_preserve_silence() -> N
 def test_global_speaker_windows_batch_at_existing_exact_window_bound() -> None:
     adapter = RecordingExactSpeakerAdapter()
     total_samples = 39 * speakers.SPEAKER_WINDOW_SHIFT_SAMPLES + 1
+    fences: list[None] = []
 
     windows = pipeline._embed_global_speaker_windows(
         (pipeline.SpeechSpan(0, total_samples),),
@@ -364,10 +477,12 @@ def test_global_speaker_windows_batch_at_existing_exact_window_bound() -> None:
         ),
         total_samples=total_samples,
         speaker_adapter=adapter,
+        post_batch_fence=lambda: fences.append(None),
     )
 
     assert len(windows) == 40
     assert [len(call) for call in adapter.calls] == [39, 1]
+    assert fences == [None, None]
     assert windows[-1].start_sample == 468_000
     assert windows[-1].end_sample == 492_000
 
@@ -380,6 +495,7 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
             (),
             total_samples=72_001,
             speaker_adapter=empty_adapter,
+            post_batch_fence=lambda: None,
         )
         == ()
     )
@@ -391,6 +507,7 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
             (_speech_segment(0, np.ones(1, dtype=np.int16)),),
             total_samples=1,
             speaker_adapter=empty_adapter,
+            post_batch_fence=lambda: None,
         )
     assert extra_segment.value.code == "invalid_model_output"
 
@@ -403,6 +520,7 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
             ),
             total_samples=3,
             speaker_adapter=empty_adapter,
+            post_batch_fence=lambda: None,
         )
     assert source_gap.value.code == "invalid_model_output"
 
@@ -413,6 +531,7 @@ def test_global_speaker_windows_empty_and_invalid_adapter_output() -> None:
             (_speech_segment(0, np.ones(1, dtype=np.int16)),),
             total_samples=1,
             speaker_adapter=invalid_adapter,
+            post_batch_fence=lambda: None,
         )
 
     assert caught.value.code == "invalid_model_output"
@@ -431,6 +550,7 @@ def test_global_speaker_windows_mask_chunk_spill_outside_true_island() -> None:
         ),
         total_samples=480_000,
         speaker_adapter=adapter,
+        post_batch_fence=lambda: None,
     )
 
     assert [(window.start_sample, window.end_sample) for window in windows] == [
@@ -833,11 +953,8 @@ def test_auto_post_fsmn_progress_fence_precedes_result_interpretation(
                 *_blocks(1),
                 DecodedBlock(BLOCK_SAMPLES, np.ones(1, dtype=np.int16)),
             ),
-            (
-                (0, None),
-                (BLOCK_SAMPLES, None),
-            ),
-            1,
+            (),
+            0,
         ),
     ),
     ids=("first_block_exceeds", "first_sample_after_cap"),
@@ -1070,7 +1187,8 @@ def test_auto_skips_empty_results_positionally_with_dense_record_indices(
 
 def test_processor_constructor_rejects_removed_online_speaker_dependencies() -> None:
     parameters = signature(pipeline.Processor).parameters
-    assert "speaker_adapter" not in parameters
+    assert "speaker_adapter" in parameters
+    assert "speaker_clustering_policy" in parameters
     assert "speaker_policy" not in parameters
     assert "known_speaker_policy" not in parameters
 
@@ -1106,6 +1224,344 @@ def test_diarize_readiness_fails_before_probe() -> None:
     assert sink.records == []
     assert sink.finalized == 0
     assert sink.aborted == 1
+
+
+def test_known_diarize_remains_not_ready_with_anonymous_dependencies() -> None:
+    decoder = FakeDecoder(_blocks(1))
+    frontend = FakeFrontend(decoder)
+    sink = RecordingSink()
+
+    with pytest.raises(pipeline.PipelineNotReady):
+        _process(
+            pipeline.Processor(
+                frontend,
+                FakeAsrAdapter(),
+                vad_adapter=object(),
+                speaker_adapter=RecordingExactSpeakerAdapter(),
+                speaker_clustering_policy=_clustering_policy(),
+            ),
+            sink,
+            selected_speaker_snapshot=_selected_snapshot(),
+            canonical_options=_options(
+                model="sensevoice-diarize",
+                known_speaker_ids=("00000001",),
+            ),
+        )
+
+    assert frontend.probe_calls == 0
+    assert frontend.decode_calls == 0
+    assert decoder.closed == 0
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+
+
+def test_diarize_runs_offline_after_decoder_close_with_bounded_cam_and_asr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    total_samples = 480_001
+    split = 480_000
+    island_start = 3_200
+    source_segments = (
+        pipeline.BufferedSpeechSegment(
+            span=pipeline.SpeechSpan(island_start, split),
+            pcm_start_sample=0,
+            pcm=np.concatenate(
+                [
+                    np.zeros(island_start, dtype=np.int16),
+                    np.ones(split - island_start, dtype=np.int16),
+                ]
+            ),
+        ),
+        _speech_segment(
+            split,
+            np.full(total_samples - split, 2, dtype=np.int16),
+        ),
+    )
+    island = pipeline.SpeechSpan(island_start, total_samples)
+    events: list[str] = []
+    decoded_blocks = tuple(
+        DecodedBlock(
+            start,
+            np.zeros(
+                min(BLOCK_SAMPLES, total_samples - start),
+                dtype=np.int16,
+            ),
+        )
+        for start in range(0, total_samples, BLOCK_SAMPLES)
+    )
+    _install_segmenter(
+        monkeypatch,
+        ((),) * (len(decoded_blocks) - 2)
+        + ((source_segments[0],), (source_segments[1],)),
+        completed_outputs=((),) * (len(decoded_blocks) - 1) + ((island,),),
+        events=events,
+    )
+    decoder = FakeDecoder(decoded_blocks, events=events)
+    speaker_adapter = RecordingExactSpeakerAdapter(events=events)
+    clustered_shapes: list[tuple[int, ...]] = []
+
+    def cluster(
+        embeddings: np.ndarray,
+        *,
+        policy: speakers.AnonymousSpeakerClusteringPolicy,
+    ) -> speakers.AnonymousSpeakerClusteringResult:
+        assert policy == _clustering_policy()
+        assert embeddings.dtype == np.float32
+        assert embeddings.flags.c_contiguous
+        clustered_shapes.append(embeddings.shape)
+        events.append("cluster")
+        return speakers.AnonymousSpeakerClusteringResult(
+            (0,) * len(embeddings),
+            (speakers.AnonymousSpeakerCluster("A", (1.0,)),),
+        )
+
+    monkeypatch.setattr(
+        pipeline,
+        "cluster_anonymous_speakers",
+        cluster,
+        raising=False,
+    )
+    project_speaker_regions = pipeline._project_speaker_regions
+
+    def project(
+        speech_islands: tuple[pipeline.SpeechSpan, ...],
+        windows: tuple[speakers.SpeakerEmbeddingWindow, ...],
+        clustering_result: speakers.AnonymousSpeakerClusteringResult,
+        *,
+        total_samples: int,
+    ) -> tuple[tuple[pipeline.SpeechSpan, int], ...]:
+        events.append("project")
+        return project_speaker_regions(
+            speech_islands,
+            windows,
+            clustering_result,
+            total_samples=total_samples,
+        )
+
+    monkeypatch.setattr(pipeline, "_project_speaker_regions", project)
+    asr = FakeAsrAdapter(events=events)
+    progress = RecordingProgress(events=events)
+    sink = RecordingSink(events)
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(decoder),
+            asr,
+            vad_adapter=object(),
+            speaker_adapter=speaker_adapter,
+            speaker_clustering_policy=_clustering_policy(),
+        ),
+        sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        canonical_options=_options(model="sensevoice-diarize"),
+        progress=progress,
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert decoder.closed == 1
+    assert [len(call) for call in speaker_adapter.calls] == [39, 2]
+    assert clustered_shapes == [
+        (41, speakers.SPEAKER_EMBEDDING_DIMENSION),
+    ]
+    assert len(asr.calls) == 1
+    np.testing.assert_array_equal(
+        asr.calls[0][0][0],
+        np.concatenate(
+            [
+                np.ones(split - island_start, dtype=np.int16),
+                np.full(total_samples - split, 2, dtype=np.int16),
+            ]
+        ),
+    )
+    assert sink.records == [
+        pipeline.SegmentRecord(
+            index=0,
+            start_sample=island_start,
+            end_sample=total_samples,
+            text="text-0",
+            language="en",
+            annotations=pipeline.RichAnnotations(),
+            anonymous_speaker="A",
+        )
+    ]
+    assert events.index("decoder_close") < events.index("cam")
+    cam_positions = [index for index, event in enumerate(events) if event == "cam"]
+    assert len(cam_positions) == 2
+    assert all(
+        events[index + 1] == f"progress:{total_samples}:None"
+        for index in cam_positions
+    )
+    assert max(
+        index for index, event in enumerate(events) if event == "fsmn"
+    ) < events.index("decoder_close")
+    assert (
+        cam_positions[-1]
+        < events.index("cluster")
+        < events.index("project")
+        < events.index("asr")
+    )
+    asr_position = events.index("asr")
+    assert events[asr_position + 1] == f"progress:{total_samples}:None"
+    assert events[asr_position + 2] == "append"
+
+
+def test_empty_diarize_skips_offline_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_segmenter(monkeypatch, ((),))
+    decoder = FakeDecoder(_blocks(1))
+    speaker_adapter = RecordingExactSpeakerAdapter()
+    asr = FakeAsrAdapter()
+    monkeypatch.setattr(
+        pipeline,
+        "cluster_anonymous_speakers",
+        lambda *_args, **_kwargs: pytest.fail("empty speech must not cluster"),
+        raising=False,
+    )
+    sink = RecordingSink()
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(decoder),
+            asr,
+            vad_adapter=object(),
+            speaker_adapter=speaker_adapter,
+            speaker_clustering_policy=_clustering_policy(),
+        ),
+        sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        canonical_options=_options(model="sensevoice-diarize"),
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert decoder.closed == 1
+    assert speaker_adapter.calls == []
+    assert asr.calls == []
+    assert sink.records == []
+    assert sink.finalized == 1
+    assert sink.aborted == 0
+
+
+def test_diarize_actual_cap_is_inclusive_and_enters_offline_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_blocks = DIARIZATION_MAX_AUDIO_SAMPLES // BLOCK_SAMPLES
+    decoder = SharedZeroBoundaryDecoder(full_blocks=full_blocks)
+    instances = _install_final_sample_segmenter(
+        monkeypatch,
+        emit_final_speech=True,
+    )
+    speaker_adapter = RecordingExactSpeakerAdapter()
+    asr = FakeAsrAdapter()
+    sink = RecordingSink()
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(decoder),
+            asr,
+            vad_adapter=object(),
+            speaker_adapter=speaker_adapter,
+            speaker_clustering_policy=_clustering_policy(),
+        ),
+        sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+        canonical_options=_options(model="sensevoice-diarize"),
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert len(instances) == 1
+    assert len(instances[0].calls) == full_blocks
+    assert instances[0].calls[-1][1] is True
+    assert decoder.yielded == full_blocks
+    assert decoder.closed == 1
+    assert speaker_adapter.calls
+    assert asr.calls
+    assert sink.records[0].end_sample == DIARIZATION_MAX_AUDIO_SAMPLES
+
+
+def test_diarize_stops_at_first_sample_past_actual_cap_without_lookahead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_blocks = DIARIZATION_MAX_AUDIO_SAMPLES // BLOCK_SAMPLES
+    decoder = SharedZeroBoundaryDecoder(
+        full_blocks=full_blocks,
+        tail_samples=1,
+        guard_after_tail=True,
+    )
+    instances = _install_final_sample_segmenter(
+        monkeypatch,
+        emit_final_speech=True,
+        emit_first_speech=True,
+    )
+    speaker_adapter = RecordingExactSpeakerAdapter()
+    asr = FakeAsrAdapter()
+    progress = RecordingProgress()
+    sink = RecordingSink()
+
+    with pytest.raises(pipeline.PipelineError) as caught:
+        _process(
+            pipeline.Processor(
+                FakeFrontend(decoder),
+                asr,
+                vad_adapter=object(),
+                speaker_adapter=speaker_adapter,
+                speaker_clustering_policy=_clustering_policy(),
+            ),
+            sink,
+            selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+            canonical_options=_options(model="sensevoice-diarize"),
+            progress=progress,
+        )
+
+    assert caught.value.code == "diarization_too_long"
+    assert len(instances) == 1
+    assert len(instances[0].calls) == full_blocks - 1
+    assert (
+        instances[0].calls[-1][0].start_sample
+        == (full_blocks - 2) * BLOCK_SAMPLES
+    )
+    assert decoder.yielded == full_blocks + 1
+    assert decoder.guard_requests == 0
+    assert decoder.closed == 1
+    assert speaker_adapter.calls == []
+    assert asr.calls == []
+    assert sink.records == []
+    assert sink.finalized == 0
+    assert sink.aborted == 1
+    assert progress.updates
+    assert all(total is None for _processed, total in progress.updates)
+
+
+def test_ordinary_vad_does_not_apply_diarization_actual_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_blocks = DIARIZATION_MAX_AUDIO_SAMPLES // BLOCK_SAMPLES
+    decoder = SharedZeroBoundaryDecoder(
+        full_blocks=full_blocks,
+        tail_samples=1,
+    )
+    instances = _install_final_sample_segmenter(
+        monkeypatch,
+        emit_final_speech=False,
+    )
+    sink = RecordingSink()
+
+    result = _process(
+        pipeline.Processor(
+            FakeFrontend(decoder),
+            FakeAsrAdapter(),
+            vad_adapter=object(),
+        ),
+        sink,
+        selected_speaker_snapshot=EMPTY_SELECTED_SNAPSHOT,
+    )
+
+    _assert_empty_processor_result(result, sink.ref)
+    assert len(instances[0].calls) == full_blocks + 1
+    assert instances[0].calls[-1][1] is True
+    assert decoder.closed == 1
+    assert sink.finalized == 1
+    assert sink.aborted == 0
 
 
 @pytest.mark.parametrize(
