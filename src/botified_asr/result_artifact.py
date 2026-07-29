@@ -33,7 +33,7 @@ from botified_asr.speaker_profiles import (
     validate_speaker_profile_id,
 )
 from botified_asr.speakers import (
-    ANONYMOUS_SPEAKER_LABELS,
+    anonymous_speaker_label,
     is_anonymous_speaker_label,
 )
 
@@ -596,10 +596,8 @@ def _validated_speaker_lookup(
         for resolution in resolutions
     ):
         raise CanonicalArtifactError("result artifact speaker mapping is invalid")
-    if (
-        len(resolutions) > len(ANONYMOUS_SPEAKER_LABELS)
-        or tuple(resolution.anonymous_speaker for resolution in resolutions)
-        != ANONYMOUS_SPEAKER_LABELS[: len(resolutions)]
+    if tuple(resolution.anonymous_speaker for resolution in resolutions) != tuple(
+        anonymous_speaker_label(ordinal) for ordinal in range(len(resolutions))
     ):
         raise CanonicalArtifactError("result artifact speaker mapping is invalid")
 

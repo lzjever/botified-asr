@@ -341,7 +341,7 @@ def test_corruption_cap_lf_and_writer_multibyte_cap_are_fail_closed(
         _jsonl(_mapping(anonymous_speaker=True)),
         _jsonl(_mapping(anonymous_speaker=1)),
         _jsonl(_mapping(anonymous_speaker="Unknown A")),
-        _jsonl(_mapping(anonymous_speaker="AG")),
+        _jsonl(_mapping(anonymous_speaker="A0")),
         _jsonl(_mapping(index=1)),
         _jsonl(_mapping(start_sample=-1)),
         _jsonl(_mapping(end_sample=0)),
@@ -371,7 +371,10 @@ def test_read_side_rejects_strict_types_indices_bounds_and_overlap(
     assert caught.value.code == "invalid_result_artifact"
 
 
-@pytest.mark.parametrize("anonymous_speaker", [None, "A", "Z", "AA", "AF"])
+@pytest.mark.parametrize(
+    "anonymous_speaker",
+    [None, "A", "Z", "AA", "AF", "AG", "AN"],
+)
 def test_canonical_speaker_field_round_trips_exactly(
     anonymous_speaker: str | None,
     tmp_path: Path,
@@ -792,6 +795,42 @@ def test_prepare_rejects_missing_visible_resolution_after_single_scan(
     assert caught.value.code == "invalid_result_artifact"
     assert len(opener.streams) == 1
     assert len(opener.streams[0].readline_sizes) >= 2
+
+
+def test_prepare_accepts_ordered_known_mapping_beyond_thirty_two_labels(
+    tmp_path: Path,
+) -> None:
+    from botified_asr.result_artifact import (
+        CanonicalJsonlReader,
+        ResultProjector,
+    )
+    from botified_asr.speakers import anonymous_speaker_label
+
+    mapping = SpeakerLabelMapping(
+        tuple(
+            SpeakerLabelResolution(anonymous_speaker_label(index), None)
+            for index in range(40)
+        )
+    )
+    opener = FreshOpener(b"")
+
+    projection = ResultProjector().prepare(
+        CanonicalJsonlReader(
+            tmp_path / "empty.jsonl",
+            opener=opener,
+        ),
+        _options(
+            "diarized_json",
+            known_speaker_ids=(KNOWN_SPEAKER_ID,),
+        ),
+        total_samples=0,
+        speaker_mapping=mapping,
+    )
+
+    assert projection.content_type == "application/json"
+    assert b"".join(projection.body_factory()) == (
+        b'{"task":"transcribe","duration":0,"text":"","segments":[]}'
+    )
 
 
 def test_diarized_projection_has_exact_wire_and_reuses_top_level_rich(

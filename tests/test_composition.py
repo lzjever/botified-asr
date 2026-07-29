@@ -1107,7 +1107,6 @@ def test_real_wav_processor_storage_and_three_projections(
     processor = Processor(
         FfmpegAudioFrontend(),
         NormalizingAsrAdapter(model),
-        known_speaker_policy=None,
     )
     try:
         for response_format in ("json", "text", "verbose_json"):

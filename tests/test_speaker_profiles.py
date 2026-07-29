@@ -286,6 +286,8 @@ def test_profile_reserves_only_ascii_labels_and_exact_unknown_label_syntax() -> 
         "Z",
         "AA",
         "AF",
+        "AG",
+        "AN",
         "ALICE",
         "Unknown A",
         "unknown a",

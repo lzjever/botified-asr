@@ -50,7 +50,6 @@ class ServerConfig:
 class RuntimeConfig:
     device: str = "auto"
     model_cache_dir: Path = Path("~/.cache/botified-asr/models")
-    max_speakers: int = 32
     inference_lanes: int = 1
 
     def __post_init__(self) -> None:
@@ -65,8 +64,6 @@ class RuntimeConfig:
                 "runtime.model_cache_dir",
             ),
         )
-        if not _is_int(self.max_speakers) or not 1 <= self.max_speakers <= 32:
-            raise ConfigError("runtime.max_speakers must be an integer from 1 to 32")
         if (
             not _is_int(self.inference_lanes)
             or not 1 <= self.inference_lanes <= MAX_INFERENCE_LANES

@@ -35,7 +35,11 @@ from botified_asr.composition import (
     TranscriptionProcessor,
     prepare_sync_transcription,
 )
-from botified_asr.contracts import DIRECT_MAX_SAMPLES, CanonicalOptions
+from botified_asr.contracts import (
+    DIARIZATION_MAX_DURATION_SECONDS,
+    DIRECT_MAX_SAMPLES,
+    CanonicalOptions,
+)
 from botified_asr.errors import InferenceSaturated
 from botified_asr.jobs import (
     JobDeletionOutcome,
@@ -1182,6 +1186,17 @@ def _validate_transcription_preflight(
     *,
     prefer_async: bool,
 ) -> None:
+    if (
+        options.model == "sensevoice-diarize"
+        and probe.duration_seconds > DIARIZATION_MAX_DURATION_SECONDS
+    ):
+        raise ApiError(
+            413,
+            "diarization_too_long",
+            f"Diarization audio must not exceed "
+            f"{DIARIZATION_MAX_DURATION_SECONDS} seconds",
+            param="file",
+        )
     if probe.duration_seconds > storage.limits.max_audio_duration_secs:
         raise ApiError(
             413,

@@ -30,7 +30,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 1. 一个可独立部署、兼容 OpenAI Transcriptions API 明确子集的 ASR 服务。
 2. 基于 SenseVoiceSmall 的多语言转写、情感和音频事件识别。
 3. 可逐请求选择的 VAD 和说话人 pipeline。
-4. 支持最大 1 GiB、最长 12 小时的会议音频；这是首版发布验证过的硬上限，部署配置只能收紧。
+4. 普通 ASR 支持最大 1 GiB、最长 12 小时音频；diarization 固定为最长 30 分钟，并在完整文件接收、解码和 VAD 完成后离线批处理，不提供在线、实时或增量 speaker 输出。
 5. 已知人物的声音样本注册、更新、删除和命名转写。
 6. 普通同步请求和同一端点上的可靠异步长任务。
 7. 一键在线安装脚本，并在 `lzjever/botified-releases` 公开。
@@ -114,7 +114,7 @@ FunASR + SenseVoice + FSMN-VAD + CAM++
 
 实现应依赖上游公开模型能力，但由本仓库拥有 HTTP、持久化、长文件和响应契约。
 
-首版明确不使用 FunASR `ClusterBackend`：它需要全量 embedding 和相似矩阵，不满足 12 小时有界内存目标。不得把它作为短音频或“质量更高时”的隐藏第二路径。
+首版明确不使用 FunASR `ClusterBackend`：diarization 固定为 30 分钟以内，由本服务以现有 NumPy 实现 §8.5 唯一的有界 spectral clustering 路径，不引入第二个模型、聚类框架或运行时依赖。不得把 `ClusterBackend` 作为短音频或“质量更高时”的隐藏第二路径。
 
 ### 4.3 版本固定
 
@@ -211,9 +211,9 @@ Gateway 不需要理解 FunASR 扩展字段。
 
 操作员预先为 Percy 等人物注册若干声音样本。转写会议时显式选择允许匹配的人物；匹配成功的 cluster 使用姓名，其他 cluster 使用 `Unknown A`、`Unknown B`。
 
-### 5.5 500 MiB 长会议
+### 5.5 500 MiB 长音频
 
-客户端以异步模式上传文件，收到短 job ID；服务在重启后仍能继续或明确失败，客户端轮询结果且无需保持数小时 HTTP 连接。
+客户端以普通 ASR 异步模式上传文件，收到短 job ID；服务在重启后仍能继续或明确失败，客户端轮询结果且无需保持数小时 HTTP 连接。该路径不绕过 diarization 的 30 分钟硬上限。
 
 ### 5.6 Agent 自助使用
 
@@ -277,12 +277,13 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 | `response_format` | 条件 | `sensevoice` 可省略；`sensevoice-diarize` 必须显式提交 `diarized_json` |
 | `chunking_strategy` | 条件 | `sensevoice` 可省略；`sensevoice-diarize` 必须显式提交 `auto` |
 | `include[]` | 否 | `funasr.emotion`、`funasr.audio_events` |
-| `known_speaker_ids[]` | 否 | 本次允许匹配的已注册人物 |
+| `known_speaker_ids[]` | 否 | 本次允许匹配的已注册人物，最多 32 个；该上限只约束命名候选，不限制会议实际参与人数或匿名 cluster 数 |
 
 数组字段在 canonical request options 中使用稳定规则：
 
 - `include[]` 先逐项验证；合法重复值去重后按 `funasr.emotion`、`funasr.audio_events` 的固定枚举顺序保存。
 - `known_speaker_ids[]` 出现重复 ID 时返回 `400 invalid_known_speaker_ids`；全部 ID 验证存在且兼容后按 ID 排序，再用于 profile snapshot 和 request fingerprint。
+- `known_speaker_ids[]` 超过 32 项时返回 `400 invalid_known_speaker_ids`；这不是 diarization speaker count 上限。
 
 首版明确拒绝：
 
@@ -305,7 +306,7 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 #### `sensevoice`
 
 - 无 `chunking_strategy`：直接转写，仅允许音频不超过 30 秒。
-- `chunking_strategy=auto`：执行 streaming FSMN-VAD 后分段转写。
+- `chunking_strategy=auto`：执行有界增量 FSMN-VAD 后分段转写。
 - `json` 默认只返回 `{text}`。
 - `verbose_json` 返回语言、真实时长和真实 segments。
 
@@ -313,9 +314,11 @@ multipart parser 只接受一个 `file` part 和下表字段白名单；总 part
 
 - 客户端必须显式提交 `chunking_strategy=auto`；缺省或其他值均返回 `400`，服务不得自动补齐。
 - 客户端必须显式提交 `response_format=diarized_json`；缺省或其他值均返回 `400`，服务不得自动补齐。
-- 在 VAD segment 上提取 CAM++ embedding。
-- 使用同一套 speaker clustering 处理短音频和长会议。
-- 已知人物只在匿名 cluster 完成后命名。
+- 固定只接受实际音频不超过 30 分钟的完整文件，不提供流式响应、在线 diarization、实时 speaker label 或处理中间 speaker 结果。
+- FSMN-VAD 先得到全文件绝对时间 speech islands；在 islands 内按现有 CAM++ policy 使用 1.5 秒 window、0.75 秒 shift 的全局时间锚点提取 embedding。
+- 完整文件处理结束后，使用本地 NumPy spectral clustering 和经真实数据校准的低频 normalized-gap 规则发现未知 speaker 数；将 window label 投影回时间轴并合并相邻同标签区间。若同 speaker run 超过 30 秒，再沿已有 VAD 安全切点和 30 秒模型边界切成同标签 final segments，之后才执行 ASR/rich 处理。
+- 已知人物只在匿名 clustering 完成后命名；最多 32 个 `known_speaker_ids[]` 只是 profile matching 候选边界，不限制实际 speaker 数。
+- 首版重叠语音只输出一个主 speaker，不承诺分离或同时标注多个说话人；这是明确质量限制，不增加 overlap 专用模型。
 
 ### 6.4 标点
 
@@ -466,7 +469,7 @@ Content-Type: text/plain; charset=utf-8
 | 401 | 鉴权失败 |
 | 404 | job 或 speaker 不存在 |
 | 409 | speaker name 冲突或资源状态冲突 |
-| 413 | 超过部署最大上传或实际音频时长 |
+| 413 | 超过部署最大上传、普通 ASR 实际音频时长或固定 diarization 30 分钟上限 |
 | 422 | 可接受但需要异步/VAD 的请求模式 |
 | 429 | storage、job 或推理 admission 饱和 |
 | 500 | 未分类内部错误 |
@@ -519,16 +522,17 @@ limits:
 
 - 部署者可以收紧这些边界，安装器使用以上发布上限。
 - `max_upload_bytes` 不得高于 1 GiB，`max_audio_duration_secs` 不得高于 12 小时；服务启动时拒绝超过首版验证上限的配置。
+- `sensevoice-diarize` 另有不可配置的 30 分钟发布硬上限，即 28,800,000 个 mono 16 kHz PCM sample；该上限不收紧普通 `sensevoice` 的 12 小时边界。
 - `max_upload_bytes` 只计算 transcription 请求中唯一 `file` part 的 payload 实际字节数；`file` payload 小于或等于上限时可接受。multipart overhead 另按 §6.2 的独立 1 MiB 上限计算。
 - 每个请求先确定适用的 file limit `B`：带 `Prefer: respond-async` 或 `sync_max_upload_bytes == max_upload_bytes` 时为 `max_upload_bytes`，其余情况为 `sync_max_upload_bytes`。
 - 应用在把 raw body byte 交给 multipart parser 分类前先累计 `R`，并施加联合安全上限 `R <= B + 1 MiB`；累计收到第 `B + 1 MiB + 1` 个 raw body byte 时固定返回 `400 invalid_multipart`。该错误优先于尚未分类的 file 或 overhead 单项错误。
 - 不能只依据 Content-Length；应用层按实际流入的 raw body、`file` payload 和 multipart overhead 分别累计计数，Content-Length 是否存在或其声明值不得改变下述公开错误优先级。
-- 上传完成后由 `ffprobe` 获取有限、非负的 duration，仅用于本次请求的 admission、VAD 要求和 sync/async 前置判断；该临时值不写入 job row，也不作为公开 progress total。
+- 上传完成后由 `ffprobe` 获取有限、非负的 duration，仅用于本次请求的 admission、VAD 要求和 sync/async 前置判断；该临时值不写入 job row，也不作为公开 progress total。对 `sensevoice-diarize`，probe 能确认 duration 超过 1,800 秒时在发布 job 或调用模型前返回 `413 diarization_too_long`。
 - 没有 `chunking_strategy=auto` 的请求超过 `direct_max_audio_duration_secs` 时，无论 sync/async 都返回 `422 long_audio_requires_vad`。
 - 联合安全上限未先触发时，带 `Prefer: respond-async` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`。
 - 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes < max_upload_bytes` 的请求累计收到第 `sync_max_upload_bytes + 1` 个 `file` payload 字节便立即停止接收，稳定返回 `422 async_required` 并幂等清理 upload lease、reservation 和 staging 文件；不得继续接收以推测最终是否超过硬上限。
 - 联合安全上限未先触发时，未带 `Prefer: respond-async` 且 `sync_max_upload_bytes == max_upload_bytes` 的请求累计收到第 `max_upload_bytes + 1` 个 `file` payload 字节便立即返回 `413`，不得返回 `422`。
-- 完成上传后，所有 POST 都先执行 `ffprobe` 可检查性、probe duration admission、VAD 要求和 sync/async 边界的前置判断；`ffprobe` 只负责 preflight。异步请求通过 preflight 后发布 queued job，不预解码，也不 spool 全量 PCM；实际 decode 错误和 actual PCM 时长越界由 job 执行阶段记录为稳定 terminal failure。实际 decode 的错误优先级按所选路径闭合：direct path 读到超过适用 `effective_direct_max_audio_samples` 的第一个 sample 时立即返回 `422 long_audio_requires_vad`；VAD path 只在超过适用 `effective_max_audio_samples` 或 12 小时发布硬上限时返回 `413 audio_too_long`。同步请求在 request 内遵循同一 actual path 顺序，不宣称 actual PCM 总时长硬上限总是先于 VAD 要求。流式接收期间继续按上述累计 byte 规则处理 byte 上限。
+- 完成上传后，所有 POST 都先执行 `ffprobe` 可检查性、probe duration admission、VAD 要求和 sync/async 边界的前置判断；`ffprobe` 只负责 preflight。异步请求通过 preflight 后发布 queued job，不预解码，也不 spool 全量 PCM；实际 decode 错误和 actual PCM 时长越界由 job 执行阶段记录为稳定 terminal failure。实际 decode 的错误优先级按所选路径闭合：direct path 读到超过适用 `effective_direct_max_audio_samples` 的第一个 sample 时立即返回 `422 long_audio_requires_vad`；`sensevoice-diarize` 读到第 28,800,001 个实际 sample 时立即 fail closed 为 `413 diarization_too_long`；其他 VAD path 只在超过适用 `effective_max_audio_samples` 或 12 小时发布硬上限时返回 `413 audio_too_long`。同步请求在 request 内遵循同一 actual path 顺序，不宣称 actual PCM 总时长硬上限总是先于 VAD 要求。流式接收期间继续按上述累计 byte 规则处理 byte 上限。
 
 ### 7.2 异步提交
 
@@ -577,6 +581,7 @@ queued/running -> cancelled
 - cancel 在当前有界 segment/batch 结束后生效。
 - `effective_max_audio_samples` 在 job 提交时固定为当时适用的部署 `max_audio_duration_secs * 16000`，且不得超过 12 小时发布硬上限对应的 samples；它在 job 生命周期内不可变，重启后的配置变化不得改变旧 job 的限制。
 - `effective_direct_max_audio_samples` 在 job 提交时固定为当时适用的部署 `direct_max_audio_duration_secs * 16000`，并受 `effective_max_audio_samples` 和 480,000 samples（30 秒）发布上限约束；它在 job 生命周期内不可变。同步请求不持久化 job 字段，但必须把本次请求开始时的当前 effective direct cap 传给同一个 processor，direct decoder 不得使用代码内固定的 480,000 threshold。
+- diarization 的 28,800,000-sample 上限是 processor 的固定发布边界，不增加 speaker count 配置、可调 diarization duration 或 job 内第二份 duration 配置；crash recovery 从输入开头重新执行同一检查。
 - `total_samples` 只表示 ffmpeg 实际输出的连续 mono 16 kHz PCM sample count，不由 `ffprobe` duration 换算。任一 attempt 首次成功到达 decoder EOF 前，`total_samples` 为 `NULL`；首次固定后在整个 job 生命周期内不可变。requeue 保留已经固定的 `total_samples`，只把 `processed_samples` 归零；新 attempt 到达 EOF 时必须得到完全相同的 actual count。succeeded 必须满足 `total_samples IS NOT NULL` 且 `processed_samples == total_samples`；failed/cancelled 可以没有 `total_samples`。
 
 ### 7.5 查询
@@ -618,7 +623,7 @@ succeeded 始终返回 job envelope：
 
 - `json`、`verbose_json` 和 `diarized_json` 的 canonical response 放在 `result`。
 - `text/plain` 只用于同步请求；异步 `response_format=text` 使用 `result.text`。
-- failed 返回 `{"id":"...","status":"failed","error":{...},"finished_at":"<RFC3339 UTC>"}`，不返回原始异常。runtime worker 只允许持久化 `invalid_audio`、`audio_too_long`、`long_audio_requires_vad`、`too_many_speakers`、`invalid_model_output`、`pipeline_not_ready` 或 `internal_error`；未知异常统一映射为 `internal_error`，不得保存原始异常文本或 traceback。`worker_crashed` 仅由恢复器写入，runtime failure commit 不接受该值。
+- failed 返回 `{"id":"...","status":"failed","error":{...},"finished_at":"<RFC3339 UTC>"}`，不返回原始异常。runtime worker 只允许持久化 `invalid_audio`、`audio_too_long`、`diarization_too_long`、`long_audio_requires_vad`、`invalid_model_output`、`pipeline_not_ready` 或 `internal_error`；未知异常统一映射为 `internal_error`，不得保存原始异常文本或 traceback。`worker_crashed` 仅由恢复器写入，runtime failure commit 不接受该值。
 - cancelled 返回 `{"id":"...","status":"cancelled","finished_at":"<RFC3339 UTC>"}`。
 - 所有时间使用 RFC 3339 UTC；queued/running 不返回不存在的 finished 字段，terminal 不返回 progress。
 
@@ -684,42 +689,49 @@ SQLite 还保存 upload/job storage reservation、`cancel_requested`、attempt t
 - unit 结束时若有 sync waiter，调度器先放行一个 sync waiter再继续 async job；不依赖普通 semaphore 的未定义公平性。
 - admission 饱和时同步请求等待一个短有界时间，之后返回 `429`，不能无界堆积。
 
-## 8. 大文件流式音频处理
+## 8. 有界音频处理
 
 ### 8.1 单一处理路径
 
-启用 VAD 的短音频和所有长音频使用同一条路径：
+普通 VAD 转写和离线 diarization 共用解码、FSMN-VAD、模型 adapter 与结果投影，只在何时执行 ASR 上分支：
 
 ```text
 bounded upload
   -> ffprobe
   -> ffmpeg streaming decode: mono PCM16 16 kHz
-  -> streaming FSMN-VAD
-  -> bounded speech-island buffer
-  -> optional bounded diarization into non-overlapping subsegments predicted as single-speaker
-  -> one-time ASR/rich model processing per final segment
-  -> incremental result writer
-  -> optional speaker naming
+  -> bounded incremental FSMN-VAD -> absolute-time speech islands
+  -> ordinary ASR: one-time ASR/rich processing per VAD segment -> result writer
+  -> diarization: retain at most 30 minutes of int16 speech PCM
+       -> after decoder EOF: CAM++ embeddings on 1.5s/0.75s global-time windows inside speech islands
+       -> local NumPy spectral clustering + calibrated low-frequency normalized-gap K selection
+       -> project window labels and merge adjacent equal labels
+       -> split any >30s same-speaker run at existing VAD-safe/30s model boundaries
+       -> one-time ASR/rich processing per final segment
+       -> optional known-speaker naming
   -> final response projection
 ```
+
+diarization 必须完整接收并处理文件后才能生成匿名 speaker label；HTTP sync/async、job progress 和内部 VAD progress 都不得对外暴露临时 speaker label、部分 cluster 或可被误解为实时 diarization 的中间结果。
 
 不得：
 
 - 解码完整会议到单个 WAV；
-- 将完整 PCM 放进内存；
+- 将完整媒体 PCM 或任何全量 float PCM 放进内存；
 - 为每个 VAD segment 从文件头重复解码；
-- 将所有 segment 音频保留到 job 结束；
+- 在普通 ASR 路径将所有 segment 音频保留到 job 结束；
 - 用固定 10 分钟切片直接截断句子；
 - 因客户端断开而泄漏 ffmpeg 或临时文件。
 - 把 file path 交给组合式 `AutoModel(model+vad+spk).generate` 或 `inference_with_vad`；
 - 直接使用保存全历史的 `DynamicVAD.process/confirmed_segments`。
+- 为 diarization 引入新模型、SciPy、scikit-learn、外部聚类服务或另一套 runtime。
 
 三个 adapter 的边界固定为：
 
 - ffmpeg 只把 bounded PCM block 交给 FSMN-VAD `generate` 的 request-local cache，消费边界后立即丢弃已确认历史；
-- 只有不超过 30 秒的 segment ndarray 可交给 SenseVoice 和 CAM++；
+- SenseVoice 只接收不超过 30 秒的 final segment；CAM++ 只接收现有 policy 定义的 1.5 秒 window；
 - adapter 不接受原始上传路径，不允许上游入口再次加载完整媒体；
-- 12 小时测试采集 request-local VAD cache 的 tensor bytes；首个 10 分钟 warmup 后到结束增长不得超过 1 MiB，且 cache 中不得出现 confirmed-segment 历史列表。
+- 普通 12 小时 ASR 测试采集 request-local VAD cache 的 tensor bytes；首个 10 分钟 warmup 后到结束增长不得超过 1 MiB，且 cache 中不得出现 confirmed-segment 历史列表。
+- diarization 可在 30 分钟硬上限内保留 speech islands 的 `np.int16` PCM、约 2,400 个 CAM++ embedding 和 spectral workspace；模型 adapter 只为当前 window 临时转换 float32，调用结束立即释放，不保留全量 float PCM。
 
 公开入口只调用一个 mode-neutral processor：
 
@@ -736,7 +748,7 @@ process(
 ) -> result_artifact
 ```
 
-processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只向注入的 `SegmentSink` 追加 sample-based canonical records，并接收 sink 完成后返回的 opaque artifact ref。API composition 在调用 processor 前从 storage 获取带 reservation 的 byte writer，再将其包装为 canonical JSONL `SegmentSink`；pipeline 不依赖 storage。sync 使用 request-owned artifact/progress sink，并传入本次请求的 current effective overall/direct sample caps；async 使用 durable attempt artifact/SQLite sink，并传入 job row 中 immutable 的 `effective_max_audio_samples` 和 `effective_direct_max_audio_samples`。direct/VAD 只是 processor 内的 segmentation policy，crash recovery 从头调用同一函数。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
+processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只向注入的 `SegmentSink` 追加 sample-based canonical records，并接收 sink 完成后返回的 opaque artifact ref。API composition 在调用 processor 前从 storage 获取带 reservation 的 byte writer，再将其包装为 canonical JSONL `SegmentSink`；pipeline 不依赖 storage。sync 使用 request-owned artifact/progress sink，并传入本次请求的 current effective overall/direct sample caps；async 使用 durable attempt artifact/SQLite sink，并传入 job row 中 immutable 的 `effective_max_audio_samples` 和 `effective_direct_max_audio_samples`。direct/VAD/diarization 只是 processor 内的处理策略；diarization attempt 崩溃后丢弃其 PCM、embedding、workspace 和 partial result，从文件开头重跑，不做 segment、window 或 cluster checkpoint。只用一个 spy/structure test 证明两个入口调用该 processor，不复制两套行为测试。
 
 ### 8.2 Decoder
 
@@ -748,10 +760,11 @@ processor 不知道 HTTP、job ID、SQLite 状态或 artifact 路径策略，只
 - pipe read 可跨 read 保留至多 1 byte carry；EOF 仍剩 1 byte 是 malformed decoder output，必须失败，不能丢弃或补零。
 - 每个有界 FSMN、SenseVoice 或 CAM++ unit 成功返回后，processor 必须在解释其结果、append canonical record 或进入下一个 unit 前，以当前已持久化音频边界提交一次 `processed_samples` 等值重复且 `total_samples=NULL` 的 durable progress fence。decoder 成功读到 EOF、确认无残留半个 sample 且子进程成功退出只是固定 actual count 的必要条件；所有 audio-derived unit 和 speaker mapping 都成功后，processor 才以 `progress_sink.update(processed_samples=actual_count, total_samples=actual_count)` 提交唯一 terminal progress，且该调用必须是最后一次 progress、位于 segment sink finalize 之前。此前 failed/cancelled 可以保持 `total_samples=NULL`。processor 不知道 job、attempt token 或 SQLite，也不执行 CAS 或 artifact cleanup；同步 request-local progress sink 在本次请求内校验这些 fence 并固定 actual count，异步 durable progress sink 将其实现为 attempt/cancel fenced CAS。
 - terminal progress 前的异步 progress update 必须要求 job 为 `visible/running`、attempt token 等于当前 token 且尚未取消，并只允许 `processed_samples` 单调不减；`total_samples IS NULL` 时还必须满足 `processed_samples <= effective_max_audio_samples`，已有 non-null `total_samples` 时必须满足 `processed_samples <= total_samples`。terminal fenced CAS 还必须要求 `total_samples` 为 `NULL` 或已经等于 actual count、`processed_samples <= actual count` 且 `actual count <= effective_max_audio_samples`；成功时原子设置 `processed_samples = total_samples = actual count`。已有 non-null `total_samples` 与新 attempt actual count 不同必须 fail closed；任何 fence/CAS loser 都由 async composition/storage 停止当前 attempt 并幂等清理其 partial artifact，不得 finalize 或提交结果。
-- processor 边界始终使用 `np.int16`；模型 adapter 只在当前有界 segment 内执行 `pcm.astype(np.float32) / 32768.0`，校验一维、finite 和长度后调用模型，不在 processor 额外保留一份 float32 全量副本。
+- processor 边界始终使用 `np.int16`；模型 adapter 只在当前有界 SenseVoice segment 或 CAM++ window 内执行 `pcm.astype(np.float32) / 32768.0`，校验一维、finite 和长度后调用模型，不在 processor 额外保留一份 float32 全量副本。
 - direct path 同样按输出 PCM sample 计数，并使用调用方提供的 `effective_direct_max_audio_samples`，不得在 decoder 内写死 480,000。1–effective direct cap samples 只产生一个 half-open segment `[0,n)`；读到第 effective direct cap + 1 个 sample 时立即终止 decoder 并返回 `422 long_audio_requires_vad`，不得调用模型、追加/完成成功 segment sink 或留下 partial artifact/reservation，也禁止把 cap 内前缀作为成功响应。异步执行使用 job 持久化的 immutable cap，同步执行使用本次请求的 current effective cap；首版发布 cap 上限仍为 480,000 samples（30 秒）。
 - direct path 解码为 0 samples 时按 §6.5 返回成功空结果，模型调用数为 0。
-- VAD path 按实际 PCM sample 数执行调用方提供的 `effective_max_audio_samples`；超过该值或 12 小时发布硬上限即停止并返回 `413 audio_too_long`，`ffprobe` 只做前置拒绝。异步执行使用 job 持久化的 immutable cap，同步执行使用本次请求的 current effective cap。
+- 普通 VAD path 按实际 PCM sample 数执行调用方提供的 `effective_max_audio_samples`；超过该值或 12 小时发布硬上限即停止并返回 `413 audio_too_long`，`ffprobe` 只做前置拒绝。异步执行使用 job 持久化的 immutable cap，同步执行使用本次请求的 current effective cap。
+- diarization path 同时执行固定的 28,800,000-sample 上限：前 28,800,000 个实际 sample 可继续处理，读到第 28,800,001 个 sample 时立即停止 decoder、清理本 attempt 的 speech PCM/embedding/workspace/partial artifact，并返回 `413 diarization_too_long`；不得对 30 分钟前缀聚类或返回部分 speaker/ASR 结果。
 - stderr 有界捕获，错误不回传原始命令或宿主路径。
 - 子进程跟随 request/job cancellation。
 - 每个 PCM block 大小固定并有背压。
@@ -766,16 +779,17 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 
 ### 8.3 VAD buffer
 
-- streaming VAD 输出绝对毫秒边界和 speech island；island 只界定连续语音，不声明 speaker 唯一。
+- 增量 FSMN-VAD 输出绝对 sample 边界和 speech island；island 只界定连续语音，不声明 speaker 唯一。
 - ring/spool 只保留当前未闭合 speech island 和少量前置 padding。
 - 单个 speech island 达到 30 秒时强制安全切分。
-- 请求 diarization 时先把 island 切成有序、预测为单一说话人的非重叠 final subsegments；未请求时 island 就是 final segment；ASR、情感和事件对每个 final segment 各处理一次，禁止整岛转写后对子段重复转写。
+- 普通 ASR 中 island 就是 final segment，完成后即可执行一次 ASR/rich 处理并释放 PCM。
+- diarization 中保留各 island 的 bounded `np.int16` speech PCM 和绝对 sample 映射，直到完整文件 EOF、actual duration 校验和 clustering 完成；此阶段不执行 ASR，也不产生 speaker segment。
 - 空白音频返回空字符串和空 segments，不生成模型幻觉文本。
 
-### 8.4 Incremental result
+### 8.4 Result artifact
 
-- 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相；canonical line 保存整数 `start_sample`/`end_sample`，公开响应只在 projection 时统一换算为秒。
-- 内存只保留当前 batch 和有界 speaker state。
+- 普通 ASR 每个完成 batch 的 segment、文本和标签追加到唯一 JSONL 中间真相；diarization 只在全文件 clustering、label projection、相邻标签合并和超长同 speaker run 安全切分完成后，按 final segment 执行 ASR 并追加。canonical line 保存整数 `start_sample`/`end_sample`，公开响应只在 projection 时统一换算为秒。
+- 普通 ASR 内存只保留当前 batch；diarization 额外保留固定 30 分钟上限内的 int16 speech PCM、embedding 和 spectral workspace。
 - 最终 `text` 由 canonical segment 顺序拼接。
 - 所有输出格式共用一个 canonical text join helper。每个 segment text 只移除首尾 Unicode whitespace，不执行 NFC/NFKC 或其他正文 normalization；trim 后为空的 segment 跳过。连接相邻非空文本时，若左侧末字符 Unicode category 为 `Ps`/`Pi`、右侧首字符 category 为 `Pe`/`Pf`/`Po`，或任一边界字符属于 Han、Hiragana、Katakana，则不插入字符；其他情况恰好插入一个 U+0020。Hangul 按普通 letter 处理，因此默认插入 U+0020，segment 内已有空格不改写。
 - join golden 至少固定：`你` + `好` = `你好`，`hello` + `world` = `hello world`，`Hello.` + `Next` = `Hello. Next`，`hello` + `,` = `hello,`，`中` + `English` = `中English`，`English` + `中` = `English中`，`(` + `hello` = `(hello`，`hello` + `)` = `hello)`，`안녕` + `하세요` = `안녕 하세요`；outer whitespace 被 trim、empty 被跳过，emoji 作为普通非 CJK 边界默认以 U+0020 分隔。
@@ -784,16 +798,25 @@ flac mp3 mp4 mpeg mpga m4a ogg wav webm
 - succeeded GET 跳过私有 manifest line，写 job envelope prefix，将 canonical body 流式嵌入 `result` 后写 suffix；不得为返回 12 小时结果重新构造完整 dict/string。
 - partial、JSONL、`.complete`、输入和 enrollment staging 各自记录实际 reservation；只有 artifact unlink 且父目录 `fsync` 后才释放对应 bytes。
 
-### 8.5 Speaker state
+### 8.5 Offline diarization
 
-production speaker/diarization 在独立 held-out 的真实中文和英文数据、不同设备/麦克风上分别达到既定质量指标前必须 fail closed；校准数据本身不得作为过线依据，也不把未经验证的聚类或切分算法固化为首版设计。
+production speaker/diarization 在独立 held-out 的真实中文和英文数据、不同设备/麦克风上分别达到既定质量指标前必须 fail closed；用于选择 row-wise pruning `p`、低频范围 `β` 和 normalized-gap 门槛 `γ` 的校准数据本身不得作为过线依据。当前 `EN4`/`ZH5` 实验只用于选择下面的唯一候选，不是 production 质量证据，也不为此增加报告或平行流程文档。
 
-候选实现只接受以下边界：
+唯一实现固定为：
 
-- 对 bounded speech island 继续切分，输出按时间排序、预测为单一说话人的非重叠最终 subsegment。
-- 短音频和最长 12 小时音频的公开 speaker label 语义与响应契约一致；内部可采用适合输入长度的有界实现。
-- request-local 状态有界，speaker 最多 32 个；超出时稳定失败，不把人物随机合并。
-- 不保存完整 PCM、全历史 embedding 或全局无界相似度矩阵，不为此增加外部 broker 或 segment checkpoint。
+1. FSMN-VAD 完成全文件 speech islands；输入实际长度最多 28,800,000 samples。
+2. 在 speech islands 内按现有 CAM++ embedding policy 的 1.5 秒 window、0.75 秒 shift 提取 normalized embedding。window anchor 使用完整音频的绝对时间网格，不在每个 island 重新从零编号；不足窗口按现有 padding policy，纯静音 anchor 跳过。
+3. 令按 absolute anchor canonical 顺序排列的 normalized embeddings 为 `X`、anchor 数为 `N`。直接计算 `A = X @ X.T`，不得 clip 负 cosine。对 `A` 每一行按 affinity 值升序 stable 排序；相同值按 canonical absolute anchor 顺序决定先后。令 `remove_count = max(0, min(int((1 - p) * N), N - 6))`，清零该行最低的 `remove_count` 项，因此每行至少保留 `min(6, N)` 项。之后计算 `M = 0.5 * (A + A.T)` 并将 diagonal 清零。
+4. 令 `degree = sum(abs(M), axis=1)`；以 `L = -M` 初始化并将 `L` 的 diagonal 设为 `degree`，然后以 `numpy.linalg.eigh` 得到升序完整有界谱 `w`。只要求模型输出和谱为 finite，不宣称未 clip 负边所得谱具有额外 PSD 性质；`[-1e-12, 0)` 内的负 eigenvalue 作为固定浮点误差 clamp 为 `0`，小于 `-1e-12` 或 non-finite 则返回 `invalid_model_output`。
+5. `N=0` 返回空结果，`N=1` 或 `N=2` 直接取 `K=1`。`N>=3` 时，对数据域内的 `K=k` 候选 `2 <= k <= N-1`，按 zero-based `w` 计算 `gap = w[k] - w[k - 1]` 和 `g = gap / max(abs(w[k]), 1e-12)`；只有 `w[k] <= β * median(degree)` 且 `g >= γ` 的候选合格。取 `g` 最大的 `k`，并列时取最小 `k`；无合格候选时取 `K=1`，all-zero affinity/spectrum 因此自然得到 `K=1`。这里没有固定 speaker/K 上限，最高 `N-1` 只是当前数据可定义的自然上界。
+6. `K>1` 时对 canonical absolute anchor 顺序的输入执行 NumPy-only deterministic 10 次 k-means++/Lloyd，10 次使用固定 PRNG seed stream；distance 计算、等距 assignment、empty cluster 处理、每轮 tie 和 best-inertia tie 都必须稳定，best inertia 并列时保留较早的 restart。最终 cluster 按各 cluster 最早 absolute anchor 排序并依次标为 `A`、`B`、……；`K=1` 不运行 k-means。该路径不调用 FunASR `ClusterBackend`，也不增加 SciPy、scikit-learn 或其他依赖。
+7. `p`、`β`、`γ` 必须用真实中文和英文数据校准，并随只读 processor clustering policy 发布；它们不进入客户端参数或 YAML，也不进入 `embedding_policy_fingerprint`。任一值或上述 clustering 语义变化都必须递增 `processor_compatibility_version`，从而改变 `processor_fingerprint`，但不得要求已有 speaker 重新 enrollment。独立 held-out 未过线时 production speaker/diarization 继续 fail closed。
+8. 将 window cluster label 投影回绝对时间 speech regions，以相邻 window 的边界中点确定单一主 speaker，并合并相邻同标签区间。若合并后的同 speaker run 超过 SenseVoice 30 秒输入上限，优先沿该 run 内已有 VAD 安全切点继续切分，不足时按 30 秒模型边界切分；切分片段保留同一 speaker label，且每个 final segment 必须不超过 30 秒，不得把长 run 直接交给 SenseVoice。
+9. 对 final segments 各执行一次 ASR/rich 处理，再计算 cluster centroid 并与最多 32 个已选 profile 匹配命名，最后投影 `diarized_json`。
+
+30 分钟和 0.75 秒 shift 将 anchor 数自然限制在约 2,400。实现只需保留 bounded `np.int16` speech PCM、embedding 数组和该规模的 NumPy spectral workspace；不得保留完整 float PCM。这里不设置会议实际参与人数或匿名 cluster 数硬上限，也不增加 speaker count 配置或对应错误码；`known_speaker_ids[]` 的 32 项上限只限制命名候选。
+
+首版对重叠语音只选择一个主 speaker，因此重叠区域可能被归给其中一人，不能表达同时说话。这是公开质量限制；不为此增加 overlap detection/separation 模型。diarization 没有在线、实时或增量 speaker 输出，崩溃后从完整输入开头重跑。
 
 ## 9. 已知人物注册
 
@@ -872,7 +895,7 @@ DELETE /v1/speakers/{speaker_id}
 
 - 客户端必须显式提交 `known_speaker_ids[]`。
 - 不提交时不扫描全库。
-- 单请求最多 32 个已知人物。
+- 单请求最多 32 个已知人物命名候选；该 snapshot/匹配边界不限制会议实际参与人数或 anonymous cluster 数。
 - 重复 ID 按 §6.2 返回 `400`；全部 ID 验证存在且与当前 embedding policy 兼容后按 ID 排序。
 - sync 请求在进入 processor 前、async 请求在 job 创建事务中 snapshot profile ID、name 和 embedding，避免运行中更新造成同一会议前后不一致。
 - async publish 在同一个 job 创建事务中按 ID 升序读取 profiles，并编码为 strict canonical UTF-8 JSON。version 1 wire 的唯一 shape 是 `{"speakers":[{"embedding":"...","id":"...","name":"..."}],"version":1}`；top-level exact keys 为 `speakers,version`，speaker entry exact keys 为 `embedding,id,name`，`version` 必须是 exact integer `1`，不得接受 boolean、其他 number 或 string。speaker array 最多 32 项，严格按 ID 升序且拒绝 duplicate ID；`name` 必须等于 speaker profile 的 canonical name。
@@ -893,7 +916,7 @@ anonymous clustering
 
 - threshold 和 top-two margin 是服务级固定模型策略，不由每个客户端随意调整。
 - 阈值必须通过真实设备、普通话/英语和不同麦克风样本校准。
-- `embedding_policy_fingerprint` 只表示向量提取与聚合的兼容性，不包含 enrollment threshold、anonymous-cluster threshold、match threshold 或 top-two margin；变更这些决策阈值需要重新运行 identity 测试，但不得因此要求已有 speaker 重新 enrollment。
+- `embedding_policy_fingerprint` 只表示向量提取与聚合的兼容性，不包含 enrollment threshold、clustering `p/β/γ`、match threshold 或 top-two margin；变更这些决策阈值需要重新运行对应的 held-out 测试，但不得因此要求已有 speaker 重新 enrollment。影响 clustering 输出的变化由 `processor_compatibility_version` 进入 `processor_fingerprint`。
 - 相似度达到阈值但与第二名区分不足时保持 Unknown。
 - 多个 anonymous cluster 可以匹配同一已知人物，以容忍长会议 cluster fragmentation。
 - 匹配只使用声音；name 和 description 不进入模型。
@@ -955,7 +978,6 @@ server:
 runtime:
   device: "auto"
   model_cache_dir: "~/.cache/botified-asr/models"
-  max_speakers: 32
   inference_lanes: 1
 
 storage:
@@ -983,8 +1005,9 @@ limits:
 - `storage.data_dir` 和 `runtime.model_cache_dir` 展开 `~` 后必须已经是 absolute path，再以 `resolve(strict=False)` 规范为 canonical path；两个 canonical root 相等、任一位于另一目录树内时均 fail closed。
 - model cache 只归 model artifact resolver 管理，不进入 `Storage` ledger、job data reservation、retention 或 orphan cleanup。
 - 未知字段 fail fast。
-- `limits` 下所有值均为正整数；`runtime.max_speakers` 是 `1..32` 的整数；`runtime.inference_lanes` 是默认值为 `1` 的 `1..2` 整数，`2` 是首版功能支持上限，不是任意目标硬件的容量承诺。
+- `limits` 下所有值均为正整数；`runtime.inference_lanes` 是默认值为 `1` 的 `1..2` 整数，`2` 是首版功能支持上限，不是任意目标硬件的容量承诺。
 - duration 必须满足 `direct_max_audio_duration_secs <= sync_max_audio_duration_secs <= max_audio_duration_secs <= 43200`。
+- diarization 的 1,800 秒边界是固定产品限制，不进入 YAML，也不随 `max_audio_duration_secs` 放宽；部署者若要整体收紧，可收紧现有 `max_audio_duration_secs`。
 - upload bytes 必须满足 `sync_max_upload_bytes <= max_upload_bytes <= 1073741824`。
 - storage 必须满足 `max_job_storage_bytes >= ceil(max_upload_bytes / 8388608) * 8388608`，即将 `max_upload_bytes` 向上取整到 8 MiB reservation 量子的整数倍。
 - 上一条只保证没有其他 reservation 且 filesystem free-space floor 满足时，单个最大 transcription 输入可获得 staging reservation；不保证并发上传或后续 intermediate、attempt、complete、terminal artifact 的空间，后者仍在每次写盘前执行 §11.3 的 SQLite 原子 reservation 和 free-space admission。
@@ -1369,7 +1392,7 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
   -map 0:a:0 -ac 1 -ar 16000 -c:a pcm_s16le -t 16384 long.wav
 ```
 
-脚本断言输出可完整解码、duration 为 `16384 ± 0.1` 秒且文件大小在 500–501 MiB；生成文件不提交 Git。另用同一 source 生成恰好 12 小时、低于 1 GiB 的固定 codec 压缩媒体，并断言实际 PCM sample count 为 12 小时。
+脚本断言输出可完整解码、duration 为 `16384 ± 0.1` 秒且文件大小在 500–501 MiB；生成文件不提交 Git。另用同一 source 生成恰好 12 小时、低于 1 GiB 的固定 codec 压缩媒体，并断言实际 PCM sample count 为 12 小时；这些长文件只测试普通 ASR，不请求 diarization。
 
 模型 cache 预热后使用以下固定资源上限：
 
@@ -1382,10 +1405,20 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 以下五个场景分别覆盖对应边界：
 
 1. **500 MiB**：一个 job 完成 upload、decode 和 transcription，验证 byte/storage reservation、RSS/GPU/disk 上限，不注入状态机 fault。
-2. **12 小时**：一个压缩媒体 job 只验证实际 PCM duration cap、VAD cache plateau、有界资源和最终结果；不重复承担 crash 测试。
+2. **12 小时普通 ASR**：一个压缩媒体 job 只验证实际 PCM duration cap、VAD cache plateau、有界资源和最终结果；不请求 diarization，也不重复承担 crash 测试。
 3. **Crash/CAS**：1–5 分钟 fixture 使用 fake/fast adapter 精确覆盖 `.complete` rename 前后、cancel-vs-success、receiving/deleting、shutdown marker 生命周期；另用跨越至少五个 inference unit 的中型真实模型任务做一次进程 `SIGKILL` 和从头恢复。
 4. **取消**：中型任务运行后 DELETE；五分钟内进入 cancelled，ffmpeg、partial、attempt artifact 和 reservation 清零，随后第二次 DELETE 删除 job。
 5. **公平性**：足够跨越至少五个 inference unit 的中型 job；先用 20 次预热短请求建立 idle p95，再在 long job running 时提交固定 10 秒同步请求，要求在 long job terminal 前完成且延迟不超过 idle p95 三倍加 5 秒。
+
+diarization 另保留一个边界测试组：
+
+- `ffprobe` 可确认 duration 大于 1,800 秒时，在 job publish/模型调用前返回 `413 diarization_too_long`；普通 `sensevoice` 对同一输入仍按 12 小时边界处理。
+- probe 未确认越界时，实际 decode 恰好 28,800,000 samples 可进入离线批处理；读到第 28,800,001 个 sample 时 fail closed 为 `diarization_too_long`，且没有 partial speaker/ASR 结果。
+- 30 分钟 fixture 验证 embedding anchor 约 2,400、speech PCM 为 `np.int16`、没有全量 float PCM，embedding/spectral workspace 在预期上界内。
+- fake CAM++ embedding 固定一个未知人数样本，覆盖未 clip negative cosine、stable row-wise pruning 及 canonical-anchor tie、symmetrization/zero diagonal、absolute degree、`numpy.linalg.eigh`、低频 normalized-gap 筛选、并列取最小 `K`、deterministic 10-restart k-means、绝对时间投影和相邻同标签合并；另覆盖 `N=0/1/2`、all-zero 和无合格候选均回退 `K=1`，以 §8.5 唯一算法的固定输出为准，也不对实际 speaker 数施加 32 上限。
+- 构造合并后超过 30 秒的同 speaker run，验证优先复用已有 VAD 安全切点、必要时按 30 秒模型边界继续切分，所有 final segments 均保留同一 speaker label 且长度不超过 30 秒。
+- overlap fixture 固定首版单一主 speaker 输出，并验证完整文件 clustering 完成前不会产生 speaker segment。
+- diarization attempt 在 embedding、clustering 和 final ASR 三个位置分别 crash 后均从输入开头重跑，不恢复 segment/window/cluster checkpoint。
 
 ### 16.4 Skill 测试
 
@@ -1402,7 +1435,8 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 - 使用未参与阈值拟合和 enrollment 的 held-out 中英文 fixture；至少两位已知人物、三位未知人物、两类录音设备。
 - 每位已知人物使用 2–5 个 enrollment 样本，另有至少 10 个 held-out utterance；未知人物合计至少 30 个 utterance。
 - 已知人物正确命名率至少 90%，未知 utterance 的 false-known assignment 必须为 0；低 margin 保持 `Unknown`。
-- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 VAD -> window embedding -> clustering -> centroid matching -> response projection。
+- 至少一个“两位 known + 一位 Unknown”的中英文混合会议通过完整 FSMN-VAD -> 1.5s/0.75s global-time window embedding -> NumPy un-clipped affinity/stable pruning/symmetrization/absolute-degree Laplacian/low-frequency normalized-gap/deterministic k-means -> label projection/merge/30s-safe split -> ASR -> centroid matching -> response projection。
+- 以超过 32 个匿名 cluster 的 synthetic embedding 验证没有会议参与人数硬限制；另独立验证 `known_speaker_ids[]` 第 33 项只因命名候选边界被拒绝。
 - synthetic vector 只单测 threshold/margin 数学边界；真实 fixture 在 model policy/revision 变化时运行，不在每次普通 CI 重复。
 
 ## 17. 性能指标
@@ -1411,7 +1445,8 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 
 - cold start / warm start；
 - 10 秒短音频 p50/p95；
-- 1 小时会议 RTF；
+- 1 小时普通 ASR RTF；
+- 30 分钟离线 diarization RTF；
 - 500 MiB 测试总耗时；
 - manifest 声明 device 的 peak host/device memory；
 - diarization 开关前后成本；
@@ -1465,7 +1500,9 @@ ffmpeg -stream_loop -1 -i two-speaker-60s.flac \
 |---|---|
 | 500 MiB 解码后内存膨胀 | streaming ffmpeg + bounded VAD segment |
 | 长 job 阻塞语音留言 | bounded batch 后释放 admission |
-| speaker 聚类随会议长度退化 | 有界 centroid/history，长会议基准 |
+| offline spectral workspace 随窗口数增长 | diarization 固定 30 分钟，1.5s/0.75s 全局锚点约 2,400，只保留 int16 speech PCM、embedding 和 bounded NumPy workspace |
+| 用户误以为支持实时 speaker 输出 | 只在完整文件 clustering、投影和 ASR 后返回 diarized result，API 不暴露临时 label 或 partial cluster |
+| 重叠语音归属错误 | 首版明确只输出单一主 speaker，并以真实中英文 overlap fixture 记录质量边界 |
 | 已知人物误匹配 | threshold + top-two margin，默认 Unknown |
 | 不同麦克风影响声纹 | 多样本平均，真实环境校准 |
 | 上游 mutable pipeline 状态 | 独立模型对象和本服务 orchestration，不逐请求改 AutoModel 配置 |

@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from dataclasses import asdict, dataclass
-from numbers import Real
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
 from botified_asr import audio
-from botified_asr.errors import PipelineError
 
 SPEAKER_SAMPLE_RATE = audio.SAMPLE_RATE
 SPEAKER_EMBEDDING_DIMENSION = 192
@@ -22,15 +19,7 @@ SPEAKER_DOWNMIX_POLICY_VERSION = "ffmpeg-first-audio-stream-ac1-v1"
 SPEAKER_PADDING_POLICY_VERSION = "right-zero-pad-v1"
 SPEAKER_NORMALIZATION_POLICY_VERSION = "int16-div-32768-l2-v1"
 SPEAKER_ENROLLMENT_AGGREGATION_POLICY_VERSION = "sample-centroid-equal-average-v1"
-ANONYMOUS_SPEAKER_LABELS = tuple(chr(ord("A") + ordinal) for ordinal in range(26)) + (
-    "AA",
-    "AB",
-    "AC",
-    "AD",
-    "AE",
-    "AF",
-)
-_ANONYMOUS_SPEAKER_LABEL_SET = frozenset(ANONYMOUS_SPEAKER_LABELS)
+_ANONYMOUS_SPEAKER_LABEL = re.compile(r"\A[A-Z]+\Z", flags=re.ASCII)
 _MODEL_ID_PART = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _MODEL_REVISION = re.compile(r"\A[0-9a-f]{40}\Z")
 _POLICY_VERSION_TOKEN = re.compile(r"\A[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*\Z")
@@ -129,214 +118,24 @@ class SpeakerEmbeddingAdapter(Protocol):
     ) -> tuple[SpeakerEmbeddingWindow, ...]: ...
 
 
-@dataclass(frozen=True)
-class AnonymousSpeakerPolicy:
-    threshold: float
-    max_speakers: int
-
-    def __post_init__(self) -> None:
-        if isinstance(self.threshold, bool) or not isinstance(self.threshold, Real):
-            raise TypeError("anonymous speaker threshold must be a real number")
-        try:
-            threshold = float(self.threshold)
-        except (OverflowError, ValueError) as error:
-            raise ValueError("anonymous speaker threshold must be finite") from error
-        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
-            raise ValueError("anonymous speaker threshold must be between -1 and 1")
-        if type(self.max_speakers) is not int:
-            raise TypeError("maximum anonymous speakers must be an integer")
-        if not 1 <= self.max_speakers <= 32:
-            raise ValueError("maximum anonymous speakers must be between 1 and 32")
-        object.__setattr__(
-            self,
-            "threshold",
-            0.0 if threshold == 0.0 else threshold,
-        )
-
-
-@dataclass(frozen=True)
-class _ValidatedWindow:
-    duration_samples: int
-    embedding: np.ndarray
-
-
 @dataclass(frozen=True, slots=True)
 class AnonymousSpeakerCluster:
     label: str
     centroid: tuple[float, ...]
 
 
-class AnonymousSpeakerState:
-    def __init__(self, policy: AnonymousSpeakerPolicy) -> None:
-        if not isinstance(policy, AnonymousSpeakerPolicy):
-            raise TypeError("anonymous speaker policy is invalid")
-        self._policy = policy
-        self._centroid_sums: list[np.ndarray] = []
-        self._finalized = False
-
-    @property
-    def speaker_count(self) -> int:
-        return len(self._centroid_sums)
-
-    def assign_segment(
-        self,
-        windows: tuple[SpeakerEmbeddingWindow, ...],
-    ) -> str:
-        if self._finalized:
-            raise RuntimeError("anonymous speaker state is finalized")
-        validated = _validate_windows(windows)
-        staged_sums = [centroid_sum.copy() for centroid_sum in self._centroid_sums]
-        votes = [0] * len(staged_sums)
-
-        for window in validated:
-            ordinal = _assign_window(
-                window.embedding,
-                staged_sums,
-                policy=self._policy,
-            )
-            if ordinal == len(votes):
-                votes.append(0)
-            votes[ordinal] += window.duration_samples
-
-        winning_ordinal = max(
-            range(len(votes)),
-            key=lambda ordinal: (votes[ordinal], -ordinal),
-        )
-        label = _speaker_label(winning_ordinal)
-        self._centroid_sums = staged_sums
-        return label
-
-    def finalize_clusters(self) -> tuple[AnonymousSpeakerCluster, ...]:
-        if self._finalized:
-            raise RuntimeError("anonymous speaker state is finalized")
-        clusters = tuple(
-            AnonymousSpeakerCluster(
-                label=_speaker_label(ordinal),
-                centroid=tuple(
-                    float(component)
-                    for component in _normalized_centroid(centroid_sum)
-                ),
-            )
-            for ordinal, centroid_sum in enumerate(self._centroid_sums)
-        )
-        self._finalized = True
-        return clusters
-
-
-def _validate_windows(
-    windows: object,
-) -> tuple[_ValidatedWindow, ...]:
-    if type(windows) is not tuple or not windows:
-        _raise_invalid_output()
-
-    validated: list[_ValidatedWindow] = []
-    previous_start: int | None = None
-    previous_end: int | None = None
-    for window in windows:
-        if not isinstance(window, SpeakerEmbeddingWindow):
-            _raise_invalid_output()
-        start_sample = window.start_sample
-        end_sample = window.end_sample
-        if (
-            type(start_sample) is not int
-            or type(end_sample) is not int
-            or start_sample < 0
-            or end_sample <= start_sample
-            or end_sample - start_sample > SPEAKER_WINDOW_MAX_SAMPLES
-            or previous_start is not None
-            and start_sample <= previous_start
-            or previous_end is not None
-            and end_sample <= previous_end
-        ):
-            _raise_invalid_output()
-        embedding = window.embedding
-        if (
-            not isinstance(embedding, np.ndarray)
-            or embedding.dtype != np.float32
-            or embedding.shape != (SPEAKER_EMBEDDING_DIMENSION,)
-            or not embedding.flags.c_contiguous
-            or not np.isfinite(embedding).all()
-        ):
-            _raise_invalid_output()
-        normalized = embedding.astype(np.float64, copy=True)
-        norm = float(np.linalg.norm(normalized))
-        if (
-            not math.isfinite(norm)
-            or norm <= 0.0
-            or not math.isclose(
-                norm,
-                1.0,
-                rel_tol=0.0,
-                abs_tol=SPEAKER_EMBEDDING_NORM_TOLERANCE,
-            )
-        ):
-            _raise_invalid_output()
-        normalized /= norm
-        if not np.isfinite(normalized).all():
-            _raise_invalid_output()
-        validated.append(
-            _ValidatedWindow(
-                duration_samples=end_sample - start_sample,
-                embedding=normalized,
-            )
-        )
-        previous_start = start_sample
-        previous_end = end_sample
-    return tuple(validated)
-
-
-def _assign_window(
-    embedding: np.ndarray,
-    centroid_sums: list[np.ndarray],
-    *,
-    policy: AnonymousSpeakerPolicy,
-) -> int:
-    nearest_ordinal: int | None = None
-    nearest_similarity = -math.inf
-    for ordinal, centroid_sum in enumerate(centroid_sums):
-        centroid = _normalized_centroid(centroid_sum)
-        similarity = float(np.dot(centroid, embedding))
-        if not math.isfinite(similarity):
-            _raise_invalid_output()
-        if similarity > nearest_similarity:
-            nearest_ordinal = ordinal
-            nearest_similarity = similarity
-
-    if nearest_ordinal is None or nearest_similarity < policy.threshold:
-        if len(centroid_sums) >= policy.max_speakers:
-            raise PipelineError(
-                "too_many_speakers",
-                "Audio contains too many anonymous speakers",
-            )
-        centroid_sums.append(embedding.copy())
-        return len(centroid_sums) - 1
-
-    combined = centroid_sums[nearest_ordinal] + embedding
-    _normalized_centroid(combined)
-    centroid_sums[nearest_ordinal] = combined
-    return nearest_ordinal
-
-
-def _normalized_centroid(centroid_sum: np.ndarray) -> np.ndarray:
-    norm = float(np.linalg.norm(centroid_sum))
-    if not math.isfinite(norm) or norm <= 0.0:
-        _raise_invalid_output()
-    centroid = centroid_sum / norm
-    if not np.isfinite(centroid).all():
-        _raise_invalid_output()
-    return centroid
-
-
-def _speaker_label(ordinal: int) -> str:
-    return ANONYMOUS_SPEAKER_LABELS[ordinal]
+def anonymous_speaker_label(ordinal: int) -> str:
+    if type(ordinal) is not int:
+        raise TypeError("anonymous speaker ordinal must be an integer")
+    if ordinal < 0:
+        raise ValueError("anonymous speaker ordinal must not be negative")
+    value = ordinal + 1
+    characters: list[str] = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        characters.append(chr(ord("A") + remainder))
+    return "".join(reversed(characters))
 
 
 def is_anonymous_speaker_label(value: object) -> bool:
-    return type(value) is str and value in _ANONYMOUS_SPEAKER_LABEL_SET
-
-
-def _raise_invalid_output() -> None:
-    raise PipelineError(
-        "invalid_model_output",
-        "Speaker model returned an invalid result",
-    )
+    return type(value) is str and _ANONYMOUS_SPEAKER_LABEL.fullmatch(value) is not None

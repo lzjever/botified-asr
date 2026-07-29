@@ -17,6 +17,21 @@ def write_config(tmp_path: Path, text: str) -> Path:
     return path
 
 
+def test_runtime_max_speakers_is_not_a_supported_config_field(
+    tmp_path: Path,
+) -> None:
+    default = load_config(write_config(tmp_path, "{}\n"))
+
+    assert not hasattr(default.runtime, "max_speakers")
+    with pytest.raises(ConfigError, match=r"runtime\.max_speakers"):
+        load_config(
+            write_config(
+                tmp_path,
+                "runtime:\n  max_speakers: 32\n",
+            )
+        )
+
+
 def test_unknown_yaml_key_fails_fast(tmp_path: Path) -> None:
     path = write_config(tmp_path, "server:\n  listen: '127.0.0.1:8090'\n  typo: true\n")
 

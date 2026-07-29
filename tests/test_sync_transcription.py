@@ -281,6 +281,80 @@ def _known_files() -> dict[str, tuple]:
     }
 
 
+def _diarized_files() -> dict[str, tuple]:
+    return {
+        "file": ("audio.wav", b"stored-input", "audio/wav"),
+        "model": (None, "sensevoice-diarize"),
+        "response_format": (None, "diarized_json"),
+        "chunking_strategy": (None, "auto"),
+    }
+
+
+def test_sync_diarization_probe_over_release_limit_is_413_and_cleans(
+    storage: Storage,
+) -> None:
+    prober = RecordingProber(1800.0001)
+    processor = SpyProcessor()
+
+    with TestClient(_app(storage, processor, audio_prober=prober)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=_diarized_files(),
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == {
+        "message": "Diarization audio must not exceed 1800 seconds",
+        "type": "invalid_request_error",
+        "param": "file",
+        "code": "diarization_too_long",
+    }
+    assert len(prober.calls) == 1
+    assert processor.calls == 0
+    _assert_no_resources(storage)
+
+
+def test_sync_diarization_at_release_limit_reaches_processor_readiness(
+    storage: Storage,
+) -> None:
+    prober = RecordingProber(1800)
+    processor = SpyProcessor("not_ready")
+
+    with TestClient(_app(storage, processor, audio_prober=prober)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=_diarized_files(),
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "pipeline_not_ready"
+    assert processor.calls == 1
+    assert processor.media_probes == [prober.probe]
+    _assert_no_resources(storage)
+
+
+def test_sync_ordinary_asr_does_not_use_the_diarization_probe_limit(
+    storage: Storage,
+) -> None:
+    prober = RecordingProber(1800.0001)
+    processor = SpyProcessor()
+    files = _files()
+    files["chunking_strategy"] = (None, "auto")
+
+    with TestClient(_app(storage, processor, audio_prober=prober)) as client:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer test-secret"},
+            files=files,
+        )
+
+    assert response.status_code == 200
+    assert processor.calls == 1
+    _assert_no_resources(storage)
+
+
 @pytest.mark.parametrize(
     ("duration", "chunking", "status", "code", "param"),
     [

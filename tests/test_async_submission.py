@@ -179,6 +179,76 @@ def assert_probe_only(
     assert processor.calls == 0
 
 
+def _long_duration_storage(path: Path) -> Storage:
+    return Storage(
+        path,
+        LimitsConfig(
+            max_upload_bytes=1024,
+            sync_max_upload_bytes=512,
+            max_job_storage_bytes=2 * RESERVATION_QUANTUM,
+            min_filesystem_free_bytes=1,
+        ),
+        current_processor_fingerprint=PROCESSOR_FINGERPRINT,
+        free_bytes=lambda _: 1 << 40,
+    )
+
+
+def test_async_diarization_probe_over_release_limit_aborts_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _long_duration_storage(tmp_path / "diarization-over-limit")
+    prober = RecordingProber(duration=1800.0001)
+    client, processor = app_client(storage, prober)
+    monkeypatch.setattr(
+        storage,
+        "publish_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("over-limit diarization must not publish a job")
+        ),
+    )
+    try:
+        with client:
+            response = post_async(
+                client,
+                model="sensevoice-diarize",
+                extra_fields=(
+                    ("response_format", "diarized_json"),
+                    ("chunking_strategy", "auto"),
+                ),
+            )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "diarization_too_long"
+        assert_probe_only(prober, processor)
+        assert_cleaned(storage)
+    finally:
+        storage.close()
+
+
+def test_async_ordinary_asr_does_not_use_the_diarization_probe_limit(
+    tmp_path: Path,
+) -> None:
+    storage = _long_duration_storage(tmp_path / "ordinary-long-audio")
+    prober = RecordingProber(duration=1800.0001)
+    client, processor = app_client(storage, prober)
+    try:
+        with client:
+            response = post_async(
+                client,
+                extra_fields=(("chunking_strategy", "auto"),),
+            )
+
+        assert response.status_code == 202
+        assert_probe_only(prober, processor)
+        queued = storage.get_visible_job(response.json()["id"])
+        assert queued is not None
+        storage.delete_or_cancel_job(queued.id, CREATED_AT)
+        storage.cleanup_cancelled_job_input(queued.id)
+    finally:
+        storage.close()
+
+
 def test_async_post_returns_exact_202_and_retains_queued_input(
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,

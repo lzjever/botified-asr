@@ -245,7 +245,6 @@ def run_processor(
     return Processor(
         frontend,
         adapter,
-        known_speaker_policy=None,
     ).process(
         Path("/internal/input.ready"),
         canonical_options or options(),
@@ -303,7 +302,6 @@ def test_processor_reuses_the_request_local_media_probe() -> None:
     result = Processor(
         frontend,
         FakeAdapter(),
-        known_speaker_policy=None,
     ).process(
         Path("/internal/input.ready"),
         options(),
@@ -362,7 +360,6 @@ def test_processor_rejects_invalid_effective_caps_before_probe(
         Processor(
             frontend,
             FakeAdapter(),
-            known_speaker_policy=None,
         ).process(
             Path("/internal/input.ready"),
             options(),
@@ -663,7 +660,6 @@ def test_unimplemented_branches_are_typed_not_ready_and_never_run_direct() -> No
             Processor(
                 frontend,
                 adapter,
-                known_speaker_policy=None,
             ).process(
                 Path("/internal/input.ready"),
                 canonical_options,
@@ -765,7 +761,7 @@ def test_jsonl_validation_and_writer_fault_cleanup_are_fail_closed() -> None:
                 )
             )
     assert len(writer.payloads) == payload_count
-    for invalid_speaker in (True, 1, "Unknown A", "AG"):
+    for invalid_speaker in (True, 1, "Unknown A", "A0"):
         with pytest.raises((TypeError, ValueError)):
             sink.append(
                 SegmentRecord(
@@ -943,7 +939,6 @@ def test_runtime_generated_wav_runs_through_public_processor(
     result = Processor(
         FfmpegAudioFrontend(),
         NormalizingAsrAdapter(model),
-        known_speaker_policy=None,
     ).process(
         path,
         options(),

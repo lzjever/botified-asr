@@ -77,7 +77,6 @@ def main() -> None:
                     frontend,
                     bundle.asr,
                     vad_adapter=bundle.vad,
-                    known_speaker_policy=None,
                 )
                 for bundle in model_pool.bundles
             )

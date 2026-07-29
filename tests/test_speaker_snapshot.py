@@ -504,7 +504,7 @@ _THIRTY_THREE_IDS = tuple(f"{index:08d}" for index in range(1, 34))
         "ids_out_of_order",
         "duplicate_ids",
         "expected_ids_mismatch",
-        "too_many_speakers",
+        "too_many_selected_speakers",
         "wire_over_64_kib",
     ),
 )

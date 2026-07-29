@@ -308,7 +308,6 @@ def expected_success_events(
             (scenario.frontend, scenario.asrs[0]),
             {
                 "vad_adapter": scenario.vads[0],
-                "known_speaker_policy": None,
             },
         ),
         (
@@ -316,7 +315,6 @@ def expected_success_events(
             (scenario.frontend, scenario.asrs[1]),
             {
                 "vad_adapter": scenario.vads[1],
-                "known_speaker_policy": None,
             },
         ),
         (

@@ -67,7 +67,6 @@ RUNTIME_JOB_FAILURE_CODES = frozenset(
         "invalid_audio",
         "audio_too_long",
         "long_audio_requires_vad",
-        "too_many_speakers",
         "invalid_model_output",
         "pipeline_not_ready",
         "internal_error",
