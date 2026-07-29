@@ -11,6 +11,9 @@ from typing import Any
 
 import pytest
 
+from botified_asr.speaker_enrollment import SpeakerEnrollmentPolicy
+from botified_asr.speakers import AnonymousSpeakerClusteringPolicy
+
 
 main_module = importlib.import_module("botified_asr.main")
 
@@ -54,11 +57,17 @@ def install_fakes(
         processor_fingerprint=PROCESSOR_FINGERPRINT,
     )
     processors = (object(), object())
+    enrollment_processors = (object(), object())
+    enrollment_processor_calls: list[
+        tuple[tuple[Any, ...], dict[str, Any]]
+    ] = []
     sync_processor = object()
     async_processor = object()
+    speaker_enrollment_processor = object()
     processor_pool = SimpleNamespace(
         sync_processor=sync_processor,
         async_processor=async_processor,
+        speaker_enrollment_processor=speaker_enrollment_processor,
     )
     class FakeExecutor:
         ready = False
@@ -169,6 +178,21 @@ def install_fakes(
         return result
 
     monkeypatch.setattr(main_module, "Processor", build_processor)
+    next_enrollment_processor = 0
+
+    def build_enrollment_processor(*args: Any, **kwargs: Any) -> object:
+        nonlocal next_enrollment_processor
+        enrollment_processor_calls.append((args, kwargs))
+        result = enrollment_processors[next_enrollment_processor]
+        next_enrollment_processor += 1
+        return result
+
+    monkeypatch.setattr(
+        main_module,
+        "SpeakerEnrollmentProcessor",
+        build_enrollment_processor,
+        raising=False,
+    )
     monkeypatch.setattr(
         main_module,
         "TranscriptionProcessorPool",
@@ -268,9 +292,12 @@ def install_fakes(
         bundles=bundles,
         model_pool=model_pool,
         processors=processors,
+        enrollment_processors=enrollment_processors,
+        enrollment_processor_calls=enrollment_processor_calls,
         processor_pool=processor_pool,
         sync_processor=sync_processor,
         async_processor=async_processor,
+        speaker_enrollment_processor=speaker_enrollment_processor,
         executor=executor,
         executor_clocks=executor_clocks,
         readiness=readiness,
@@ -308,6 +335,12 @@ def expected_success_events(
             (scenario.frontend, scenario.asrs[0]),
             {
                 "vad_adapter": scenario.vads[0],
+                "speaker_adapter": scenario.speakers[0],
+                "speaker_clustering_policy": AnonymousSpeakerClusteringPolicy(
+                    pruning_p=1.0,
+                    low_frequency_beta=2.0,
+                    normalized_gap_gamma=0.5,
+                ),
             },
         ),
         (
@@ -315,11 +348,17 @@ def expected_success_events(
             (scenario.frontend, scenario.asrs[1]),
             {
                 "vad_adapter": scenario.vads[1],
+                "speaker_adapter": scenario.speakers[1],
+                "speaker_clustering_policy": AnonymousSpeakerClusteringPolicy(
+                    pruning_p=1.0,
+                    low_frequency_beta=2.0,
+                    normalized_gap_gamma=0.5,
+                ),
             },
         ),
         (
             "TranscriptionProcessorPool",
-            (scenario.processors,),
+            (scenario.processors, scenario.enrollment_processors),
             {},
         ),
         ("secrets.token_urlsafe", (), {}),
@@ -349,6 +388,9 @@ def expected_success_events(
                 "audio_prober": scenario.frontend.probe,
                 "processor_fingerprint": PROCESSOR_FINGERPRINT,
                 "speaker_embedding_policy": (scenario.speaker_embedding_policy),
+                "speaker_enrollment_processor": (
+                    scenario.speaker_enrollment_processor
+                ),
                 "job_executor": scenario.executor,
                 "close_storage_on_shutdown": False,
             },
@@ -382,6 +424,30 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
     main_module.main()
 
     assert scenario.events == expected_success_events(scenario)
+    assert scenario.enrollment_processor_calls == [
+        (
+            (
+                scenario.frontend,
+                scenario.vads[index],
+                scenario.speakers[index],
+                scenario.speaker_embedding_policy,
+                SpeakerEnrollmentPolicy(consistency_threshold=0.31),
+            ),
+            {},
+        )
+        for index in range(2)
+    ]
+    processor_policies = [
+        kwargs["speaker_clustering_policy"]
+        for name, _args, kwargs in scenario.events
+        if name == "Processor"
+    ]
+    enrollment_policies = [
+        args[-1]
+        for args, _kwargs in scenario.enrollment_processor_calls
+    ]
+    assert processor_policies[0] is processor_policies[1]
+    assert enrollment_policies[0] is enrollment_policies[1]
     assert len(scenario.executor_clocks) == 1
     assert callable(scenario.executor_clocks[0])
     assert scenario.executor_clocks[0]() == PROCESS_NOW

@@ -89,7 +89,7 @@ def _build_processor_fingerprint(
             "fsmn_vad": model_snapshot_manifest_digest(vad_snapshot),
             "sensevoice": model_snapshot_manifest_digest(sensevoice_snapshot),
         },
-        "processor_compatibility_version": 1,
+        "processor_compatibility_version": 2,
         "result_envelope_version": RESULT_ENVELOPE_VERSION,
         "speaker_snapshot_wire_version": SPEAKER_SNAPSHOT_WIRE_VERSION,
         "version": 1,

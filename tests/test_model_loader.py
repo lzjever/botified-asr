@@ -24,7 +24,7 @@ DEVICE = "cpu"
 ASR_NOSPEECH = "<|nospeech|><|EMO_UNKNOWN|><|Event_UNK|><|withitn|>"
 LOAD_ERROR_MESSAGE = "FunASR model bundle could not be loaded"
 PROCESSOR_FINGERPRINT = (
-    "15912cff0389a1a0e38828063e4de2018e4787c53ee60a25ca74f7bedfbdd633"
+    "2a2960bbc174eec64bd8c6da9613de1fdc9ff4cd01ddbddc96c25e5f5cca845c"
 )
 CAMPLUS_SPEC = getattr(model_artifacts, "CAMPLUS_SPEC", object())
 

@@ -19,6 +19,11 @@ from botified_asr.model_artifacts import ModelArtifactResolver
 from botified_asr.model_loader import load_funasr_model_pool
 from botified_asr.pipeline import Processor
 from botified_asr.runtime import JobExecutor
+from botified_asr.speaker_enrollment import (
+    SpeakerEnrollmentPolicy,
+    SpeakerEnrollmentProcessor,
+)
+from botified_asr.speakers import AnonymousSpeakerClusteringPolicy
 from botified_asr.storage import Storage
 
 
@@ -71,15 +76,35 @@ def main() -> None:
             current_processor_fingerprint=model_pool.processor_fingerprint,
         )
         frontend = FfmpegAudioFrontend()
+        speaker_clustering_policy = AnonymousSpeakerClusteringPolicy(
+            pruning_p=1.0,
+            low_frequency_beta=2.0,
+            normalized_gap_gamma=0.5,
+        )
+        speaker_enrollment_policy = SpeakerEnrollmentPolicy(
+            consistency_threshold=0.31,
+        )
         processor_pool = TranscriptionProcessorPool(
             tuple(
                 Processor(
                     frontend,
                     bundle.asr,
                     vad_adapter=bundle.vad,
+                    speaker_adapter=bundle.speaker,
+                    speaker_clustering_policy=speaker_clustering_policy,
                 )
                 for bundle in model_pool.bundles
-            )
+            ),
+            tuple(
+                SpeakerEnrollmentProcessor(
+                    frontend,
+                    bundle.vad,
+                    bundle.speaker,
+                    model_pool.speaker_embedding_policy,
+                    speaker_enrollment_policy,
+                )
+                for bundle in model_pool.bundles
+            ),
         )
         generation = secrets.token_urlsafe()
         job_executor = JobExecutor(
@@ -102,6 +127,9 @@ def main() -> None:
             audio_prober=frontend.probe,
             processor_fingerprint=model_pool.processor_fingerprint,
             speaker_embedding_policy=model_pool.speaker_embedding_policy,
+            speaker_enrollment_processor=(
+                processor_pool.speaker_enrollment_processor
+            ),
             job_executor=job_executor,
             close_storage_on_shutdown=False,
         )
