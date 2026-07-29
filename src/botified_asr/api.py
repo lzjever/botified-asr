@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
+import time
 from asyncio import Event, Task, create_task, wait_for
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -18,9 +20,11 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from botified_asr.audio import SAMPLE_RATE, AudioError, Cancellation, MediaProbe
 from botified_asr.canonical_options import (
@@ -102,6 +106,68 @@ SPEAKER_ID_GENERATION_ATTEMPTS = 16
 _LOWERCASE_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _RETENTION_SWEEP_BATCH_SIZE = 32
 _RETENTION_SWEEP_INTERVAL_SECONDS = 60.0
+_HTTP_LOGGER = logging.getLogger("botified_asr.http")
+_ERROR_CODE_SCOPE_KEY = "botified_asr.error_code"
+
+
+def _log_http_completion(extra: dict[str, object]) -> None:
+    try:
+        _HTTP_LOGGER.info("http_request_completed", extra=extra)
+    except Exception:
+        pass
+
+
+class _HttpCompletionLogMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started_ns = time.monotonic_ns()
+        request_id = generate_public_id()
+        status = 500
+
+        async def capture_status(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture_status)
+        except Exception:
+            scope.setdefault(_ERROR_CODE_SCOPE_KEY, "internal_error")
+            raise
+        finally:
+            route = scope.get("route")
+            _log_http_completion(
+                {
+                    "event": "http_request_completed",
+                    "request_id": request_id,
+                    "method": scope["method"],
+                    "route": getattr(route, "path", "<unmatched>"),
+                    "status": status,
+                    "elapsed_ms": round(
+                        (time.monotonic_ns() - started_ns) / 1_000_000,
+                        3,
+                    ),
+                    "error_code": scope.get(_ERROR_CODE_SCOPE_KEY),
+                }
+            )
+
+
+class _TemplateRoute(Route):
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        scope["route"] = self
+        await super().handle(scope, receive, send)
 
 
 class ApiError(Exception):
@@ -651,38 +717,38 @@ def create_app(
     app = Starlette(
         debug=False,
         routes=[
-            Route("/health/live", live, methods=["GET"]),
-            Route("/health/ready", ready, methods=["GET"]),
-            Route("/v1/models", list_models, methods=["GET"]),
-            Route("/v1/models/{model_id}", get_model, methods=["GET"]),
-            Route("/v1/speakers", list_speakers, methods=["GET"]),
-            Route("/v1/speakers", create_speaker, methods=["POST"]),
-            Route(
+            _TemplateRoute("/health/live", live, methods=["GET"]),
+            _TemplateRoute("/health/ready", ready, methods=["GET"]),
+            _TemplateRoute("/v1/models", list_models, methods=["GET"]),
+            _TemplateRoute("/v1/models/{model_id}", get_model, methods=["GET"]),
+            _TemplateRoute("/v1/speakers", list_speakers, methods=["GET"]),
+            _TemplateRoute("/v1/speakers", create_speaker, methods=["POST"]),
+            _TemplateRoute(
                 "/v1/speakers/{speaker_id}",
                 get_speaker,
                 methods=["GET"],
             ),
-            Route(
+            _TemplateRoute(
                 "/v1/speakers/{speaker_id}",
                 update_speaker,
                 methods=["PUT"],
             ),
-            Route(
+            _TemplateRoute(
                 "/v1/speakers/{speaker_id}",
                 delete_speaker,
                 methods=["DELETE"],
             ),
-            Route(
+            _TemplateRoute(
                 "/v1/audio/transcriptions",
                 transcriptions,
                 methods=["POST"],
             ),
-            Route(
+            _TemplateRoute(
                 "/v1/audio/transcriptions/{job_id}",
                 get_transcription_job,
                 methods=["GET"],
             ),
-            Route(
+            _TemplateRoute(
                 "/v1/audio/transcriptions/{job_id}",
                 delete_transcription_job,
                 methods=["DELETE"],
@@ -694,6 +760,7 @@ def create_app(
             Exception: _internal_error_response,
         },
         lifespan=lifespan,
+        middleware=[Middleware(_HttpCompletionLogMiddleware)],
     )
     return app
 
@@ -1758,7 +1825,8 @@ def _storage_admission_error(exc: StorageAdmissionError) -> ApiError:
     )
 
 
-def _api_error_response(_: Request, exc: ApiError) -> JSONResponse:
+def _api_error_response(request: Request, exc: ApiError) -> JSONResponse:
+    request.scope[_ERROR_CODE_SCOPE_KEY] = exc.code
     return JSONResponse(
         {
             "error": {
@@ -1772,10 +1840,10 @@ def _api_error_response(_: Request, exc: ApiError) -> JSONResponse:
     )
 
 
-def _http_error_response(_: Request, exc: HTTPException) -> JSONResponse:
+def _http_error_response(request: Request, exc: HTTPException) -> JSONResponse:
     code = "not_found" if exc.status_code == 404 else "http_error"
     return _api_error_response(
-        _,
+        request,
         ApiError(
             exc.status_code,
             code,
@@ -1784,9 +1852,9 @@ def _http_error_response(_: Request, exc: HTTPException) -> JSONResponse:
     )
 
 
-def _internal_error_response(_: Request, __: Exception) -> JSONResponse:
+def _internal_error_response(request: Request, _: Exception) -> JSONResponse:
     return _api_error_response(
-        _,
+        request,
         ApiError(
             500,
             "internal_error",

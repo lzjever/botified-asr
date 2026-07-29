@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import json
+import logging
 import signal
 import sys
 from datetime import datetime, timezone
@@ -32,9 +34,11 @@ def install_fakes(
     *,
     listen: str = "127.0.0.1:19001",
     failure_site: str | None = None,
+    logging_failure_event: str | None = None,
     track_executor: bool = False,
 ) -> SimpleNamespace:
     events: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    service_log_events: list[str] = []
     failure = RuntimeError("startup failed")
     limits = object()
     fetcher = object()
@@ -277,8 +281,23 @@ def install_fakes(
         fake("_ShutdownAwareServer", server),
         raising=False,
     )
+
+    class FakeServiceLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            event = str(extra["event"])
+            service_log_events.append(event)
+            if logging_failure_event == event:
+                raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(
+        main_module,
+        "_configure_logging",
+        lambda: FakeServiceLogger(),
+        raising=False,
+    )
     return SimpleNamespace(
         events=events,
+        service_log_events=service_log_events,
         failure=failure,
         config=config,
         limits=limits,
@@ -406,6 +425,8 @@ def expected_success_events(
                 "port": 19001,
                 "workers": 1,
                 "timeout_graceful_shutdown": 30,
+                "log_config": None,
+                "access_log": False,
             },
         ),
         (
@@ -463,6 +484,150 @@ def test_main_composes_loaded_models_before_serving_and_closes_storage(
     assert scenario.readiness.ready is False
     assert scenario.executor.stop_calls == 1
     assert scenario.storage.close_calls == 1
+    assert scenario.service_log_events == [
+        "service_started",
+        "service_stopped",
+    ]
+
+
+def test_json_log_formatter_emits_only_whitelisted_utc_fields() -> None:
+    record = logging.LogRecord(
+        "botified_asr.http",
+        logging.INFO,
+        __file__,
+        1,
+        "must not be copied",
+        (),
+        None,
+    )
+    record.created = 1_785_188_800.125
+    record.event = "http_request_completed"
+    record.request_id = "7K3M9Q2W"
+    record.method = "POST"
+    record.route = "/v1/audio/transcriptions"
+    record.status = 401
+    record.elapsed_ms = 1.25
+    record.error_code = "invalid_api_key"
+    record.authorization = "Bearer private"
+    record.transcript = "private transcript"
+
+    payload = json.loads(main_module._JsonLogFormatter().format(record))
+
+    assert payload == {
+        "ts": "2026-07-27T21:46:40.125Z",
+        "level": "INFO",
+        "event": "http_request_completed",
+        "request_id": "7K3M9Q2W",
+        "method": "POST",
+        "route": "/v1/audio/transcriptions",
+        "status": 401,
+        "elapsed_ms": 1.25,
+        "error_code": "invalid_api_key",
+    }
+
+    third_party_record = logging.LogRecord(
+        "uvicorn.error",
+        logging.WARNING,
+        __file__,
+        1,
+        "private unstructured message",
+        (),
+        None,
+    )
+    third_party_record.event = "http_request_completed"
+    third_party_record.request_id = object()
+    third_party_record.elapsed_ms = float("nan")
+    third_party_payload = json.loads(
+        main_module._JsonLogFormatter().format(third_party_record)
+    )
+    assert set(third_party_payload) == {"ts", "level", "event"}
+    assert third_party_payload == {
+        "ts": third_party_payload["ts"],
+        "level": "WARNING",
+        "event": "log_message",
+    }
+    assert "private unstructured message" not in json.dumps(third_party_payload)
+
+    invalid_project_record = logging.LogRecord(
+        "botified_asr.http",
+        logging.INFO,
+        __file__,
+        1,
+        "private project message",
+        (),
+        None,
+    )
+    invalid_project_record.event = "http_request_completed"
+    invalid_project_record.request_id = object()
+    invalid_project_record.method = "GET"
+    invalid_project_record.route = "/health/live"
+    invalid_project_record.status = 200
+    invalid_project_record.elapsed_ms = float("nan")
+    invalid_project_record.error_code = None
+    invalid_payload = json.loads(
+        main_module._JsonLogFormatter().format(invalid_project_record)
+    )
+    assert set(invalid_payload) == {"ts", "level", "event"}
+    assert invalid_payload["event"] == "log_message"
+
+
+def test_logging_configuration_preserves_root_and_emits_own_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root_logger = logging.getLogger()
+    application_logger = logging.getLogger("botified_asr")
+    root_handlers = list(root_logger.handlers)
+    application_handlers = list(application_logger.handlers)
+    root_level = root_logger.level
+    application_level = application_logger.level
+    application_propagate = application_logger.propagate
+    sentinel = logging.NullHandler()
+    root_logger.addHandler(sentinel)
+    try:
+        service_logger = main_module._configure_logging()
+        service_logger.info(
+            "service_started",
+            extra={"event": "service_started"},
+        )
+
+        payload = json.loads(capsys.readouterr().err)
+        assert sentinel in root_logger.handlers
+        assert application_logger.propagate is False
+        assert payload["event"] == "service_started"
+    finally:
+        root_logger.handlers[:] = root_handlers
+        root_logger.setLevel(root_level)
+        application_logger.handlers[:] = application_handlers
+        application_logger.setLevel(application_level)
+        application_logger.propagate = application_propagate
+
+
+@pytest.mark.parametrize(
+    ("logging_failure_event", "cleanup_failure"),
+    (
+        ("service_started", False),
+        ("service_stopped", True),
+    ),
+)
+def test_service_logging_failure_does_not_change_service_or_cleanup_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    logging_failure_event: str,
+    cleanup_failure: bool,
+) -> None:
+    scenario = install_fakes(
+        monkeypatch,
+        failure_site="executor.stop" if cleanup_failure else None,
+        logging_failure_event=logging_failure_event,
+    )
+
+    if cleanup_failure:
+        with pytest.raises(RuntimeError) as caught:
+            main_module.main()
+        assert caught.value is scenario.failure
+    else:
+        main_module.main()
+
+    assert any(name == "server.run" for name, _, _ in scenario.events)
 
 
 def test_main_version_uses_installed_metadata_without_starting_service(

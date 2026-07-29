@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import math
 import os
 import secrets
+import sys
 from datetime import datetime, timezone
 from importlib.metadata import version as distribution_version
 from pathlib import Path
@@ -26,6 +30,79 @@ from botified_asr.speaker_enrollment import (
 from botified_asr.speaker_matching import KnownSpeakerMatchPolicy
 from botified_asr.speakers import AnonymousSpeakerClusteringPolicy
 from botified_asr.storage import Storage
+
+
+class _JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.fromtimestamp(record.created, timezone.utc)
+        payload: dict[str, object] = {
+            "ts": timestamp.isoformat(timespec="milliseconds").replace(
+                "+00:00",
+                "Z",
+            ),
+            "level": record.levelname,
+            "event": "log_message",
+        }
+        event = getattr(record, "event", None)
+        if record.name == "botified_asr.service" and event in {
+            "service_started",
+            "service_stopped",
+        }:
+            payload["event"] = event
+        elif record.name == "botified_asr.http" and event == (
+            "http_request_completed"
+        ):
+            request_id = getattr(record, "request_id", None)
+            method = getattr(record, "method", None)
+            route = getattr(record, "route", None)
+            status = getattr(record, "status", None)
+            elapsed_ms = getattr(record, "elapsed_ms", None)
+            error_code = getattr(record, "error_code", None)
+            if (
+                type(request_id) is str
+                and type(method) is str
+                and type(route) is str
+                and type(status) is int
+                and type(elapsed_ms) is float
+                and math.isfinite(elapsed_ms)
+                and elapsed_ms >= 0
+                and (error_code is None or type(error_code) is str)
+            ):
+                payload.update(
+                    {
+                        "event": event,
+                        "request_id": request_id,
+                        "method": method,
+                        "route": route,
+                        "status": status,
+                        "elapsed_ms": elapsed_ms,
+                        "error_code": error_code,
+                    }
+                )
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+def _configure_logging() -> logging.Logger:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_JsonLogFormatter())
+    application_logger = logging.getLogger("botified_asr")
+    application_logger.handlers.clear()
+    application_logger.addHandler(handler)
+    application_logger.setLevel(logging.INFO)
+    application_logger.propagate = False
+    return logging.getLogger("botified_asr.service")
+
+
+def _log_service_event(logger: logging.Logger, event: str) -> None:
+    try:
+        logger.info(event, extra={"event": event})
+    except Exception:
+        pass
 
 
 class _ShutdownAwareServer(uvicorn.Server):
@@ -54,12 +131,14 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, default=_default_config_path())
     args = parser.parse_args()
+    service_logger = _configure_logging()
     config = load_config(args.config)
     host, port_text = config.server.listen.rsplit(":", 1)
     port = int(port_text)
     api_key = load_api_key()
     storage: Storage | None = None
     job_executor: JobExecutor | None = None
+    service_started = False
     try:
         fetcher = HuggingFaceSnapshotFetcher()
         resolver = ModelArtifactResolver(
@@ -145,15 +224,23 @@ def main() -> None:
             port=port,
             workers=1,
             timeout_graceful_shutdown=30,
+            log_config=None,
+            access_log=False,
         )
+        _log_service_event(service_logger, "service_started")
+        service_started = True
         _ShutdownAwareServer(uvicorn_config, job_executor).run()
     finally:
         try:
             if job_executor is not None:
                 job_executor.stop()
         finally:
-            if storage is not None:
-                storage.close()
+            try:
+                if storage is not None:
+                    storage.close()
+            finally:
+                if service_started:
+                    _log_service_event(service_logger, "service_stopped")
 
 
 def _default_config_path() -> Path:

@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Iterable
 
 import anyio
@@ -134,6 +135,177 @@ def app_client(
         close_storage_on_shutdown=False,
     )
     return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.mark.parametrize(
+    (
+        "path",
+        "expected_status",
+        "expected_route",
+        "expected_error_code",
+        "explode",
+    ),
+    (
+        (
+            "/health/live?token=private-token",
+            200,
+            "/health/live",
+            None,
+            False,
+        ),
+        (
+            "/v1/models/private-model?token=private-token",
+            401,
+            "/v1/models/{model_id}",
+            "invalid_api_key",
+            False,
+        ),
+        (
+            "/health/ready?token=private-token",
+            500,
+            "/health/ready",
+            "internal_error",
+            True,
+        ),
+    ),
+)
+def test_http_completion_log_uses_route_template_and_stable_error_code(
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected_status: int,
+    expected_route: str,
+    expected_error_code: str | None,
+    explode: bool,
+) -> None:
+    records: list[dict[str, object]] = []
+
+    class RecordingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            records.append(extra)
+
+    monkeypatch.setattr(api_module, "_HTTP_LOGGER", RecordingLogger())
+    monkeypatch.setattr(api_module, "generate_public_id", lambda: "7K3M9Q2W")
+    if explode:
+        monkeypatch.setattr(
+            storage,
+            "probe_readiness",
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("private database failure")
+            ),
+        )
+
+    with app_client(storage) as client:
+        response = client.get(path, headers=AUTH if explode else {})
+
+    assert response.status_code == expected_status
+    assert records == [
+        {
+            "event": "http_request_completed",
+            "request_id": "7K3M9Q2W",
+            "method": "GET",
+            "route": expected_route,
+            "status": expected_status,
+            "elapsed_ms": records[0]["elapsed_ms"],
+            "error_code": expected_error_code,
+        }
+    ]
+    assert isinstance(records[0]["elapsed_ms"], float)
+    assert records[0]["elapsed_ms"] >= 0
+    serialized = json.dumps(records)
+    assert "private-model" not in serialized
+    assert "private-token" not in serialized
+    assert "private database failure" not in serialized
+
+
+def test_http_completion_log_preserves_started_stream_status_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[dict[str, object]] = []
+    failure = RuntimeError("private streaming failure")
+
+    class RecordingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            records.append(extra)
+
+    async def broken_stream(scope, _receive, send) -> None:
+        scope["route"] = SimpleNamespace(path="/stream")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise failure
+
+    async def invoke() -> None:
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message) -> None:
+            pass
+
+        await api_module._HttpCompletionLogMiddleware(broken_stream)(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/stream",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+    monkeypatch.setattr(api_module, "_HTTP_LOGGER", RecordingLogger())
+    monkeypatch.setattr(api_module, "generate_public_id", lambda: "7K3M9Q2W")
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(invoke())
+
+    assert caught.value is failure
+    assert records[0]["status"] == 200
+    assert records[0]["error_code"] == "internal_error"
+
+
+@pytest.mark.parametrize("explode", (False, True))
+def test_http_logging_failure_does_not_change_request_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    explode: bool,
+) -> None:
+    request_failure = RuntimeError("request failed")
+
+    class FailingLogger:
+        def info(self, _message: str, *, extra: dict[str, object]) -> None:
+            raise RuntimeError("logging failed")
+
+    async def endpoint(scope, _receive, send) -> None:
+        scope["route"] = SimpleNamespace(path="/representative")
+        if explode:
+            raise request_failure
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def invoke() -> None:
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message) -> None:
+            pass
+
+        await api_module._HttpCompletionLogMiddleware(endpoint)(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/representative",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+    monkeypatch.setattr(api_module, "_HTTP_LOGGER", FailingLogger())
+
+    if explode:
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(invoke())
+        assert caught.value is request_failure
+    else:
+        asyncio.run(invoke())
 
 
 def test_live_is_the_only_unauthenticated_route(storage: Storage) -> None:
