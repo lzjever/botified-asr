@@ -74,7 +74,7 @@ curl --fail-with-body \
 ### Advanced container configuration
 
 The image already contains its complete default configuration. To change
-inference lanes, capacity, or the public URL, start with
+inference lanes or capacity, start with
 [config/container.yaml](config/container.yaml) from the exact Git tag matching
 the image version. Copy and edit the whole file, keeping `/data/state` and
 `/data/models` as non-overlapping siblings, then run:
@@ -104,7 +104,6 @@ mkdir -p ~/.config/botified-asr
 cat > ~/.config/botified-asr/config.yaml <<'YAML'
 server:
   listen: "127.0.0.1:17770"
-  public_base_url: "http://127.0.0.1:17770"
 YAML
 export BOTIFIED_ASR_API_KEY='replace-with-a-long-random-token'
 uv run botified-asr --config ~/.config/botified-asr/config.yaml

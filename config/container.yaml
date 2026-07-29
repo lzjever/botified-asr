@@ -1,6 +1,5 @@
 server:
   listen: "0.0.0.0:17770"
-  public_base_url: "http://127.0.0.1:17770"
 
 runtime:
   device: "cpu"

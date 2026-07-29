@@ -17,6 +17,25 @@ def write_config(tmp_path: Path, text: str) -> Path:
     return path
 
 
+def test_default_server_endpoint_uses_canonical_asr_port(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, "{}\n"))
+
+    assert config.server.listen == "127.0.0.1:17770"
+
+
+def test_server_public_base_url_is_not_a_supported_config_field(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigError, match=r"server\.public_base_url"):
+        load_config(
+            write_config(
+                tmp_path,
+                "server:\n"
+                "  public_base_url: 'http://127.0.0.1:17770'\n",
+            )
+        )
+
+
 def test_runtime_max_speakers_is_not_a_supported_config_field(
     tmp_path: Path,
 ) -> None:
@@ -33,7 +52,7 @@ def test_runtime_max_speakers_is_not_a_supported_config_field(
 
 
 def test_unknown_yaml_key_fails_fast(tmp_path: Path) -> None:
-    path = write_config(tmp_path, "server:\n  listen: '127.0.0.1:8090'\n  typo: true\n")
+    path = write_config(tmp_path, "server:\n  listen: '127.0.0.1:17770'\n  typo: true\n")
 
     with pytest.raises(ConfigError, match=r"server\.typo"):
         load_config(path)

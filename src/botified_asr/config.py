@@ -42,8 +42,7 @@ def _canonical_directory(value: object, field_name: str) -> Path:
 
 @dataclass(frozen=True)
 class ServerConfig:
-    listen: str = "127.0.0.1:8090"
-    public_base_url: str = "http://127.0.0.1:8090"
+    listen: str = "127.0.0.1:17770"
 
 
 @dataclass(frozen=True)
