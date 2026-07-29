@@ -1213,13 +1213,13 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 6. 完成既有安装状态 preflight，并确认属于 fresh install 或下述 same-release repair 后，才按选定的 manifest digest 拉取对应 OCI image。
 7. fresh install 创建固定的 engine-managed named volumes `botified-asr-data` 和 `botified-asr-model-cache`，分别挂载到容器内 exact path `/var/lib/botified-asr` 和 `/var/cache/botified-asr/models`；`config.yaml`、`service.env` 和 `client.env` 仍位于当前用户的配置目录。fresh volumes 必须以最终容器用户 `10001:10001` 验证可写后才继续；fresh install 选定的 Docker 或 Podman 此后不得切换。
 8. 未提供 API Key 时生成安全随机 token，分别写入 mode `0600` 的 `service.env` 和 §10.3 `client.env`；不得回显。
-9. 安装唯一可执行 launcher `~/.local/bin/botified-asr-service`；存在 user systemd 时安装单个 systemd user unit，unit 只调用该 launcher，没有 user systemd 时由同一 launcher 作为启动 wrapper 并明确提示。
+9. 安装唯一可执行 launcher `~/.local/bin/botified-asr-service` 和唯一卸载入口 `~/.local/bin/botified-asr-uninstall`；存在 user systemd 时安装单个 systemd user unit，unit 只调用该 launcher，没有 user systemd 时由同一 launcher 作为启动 wrapper 并明确提示。
 10. 启动服务、等待 ready，并用安装器内置的最小 HTTP smoke 执行一个随发布固定的短音频转写。
-11. 输出 base URL、credential 路径、service status、repair 和 uninstall 命令。
+11. 输出 base URL、credential 路径、service status、same-release repair 命令和 `botified-asr-uninstall [--purge]`。
 12. 只允许 fresh install，或在既有安装的 `release_version` 与 platform image digest 都完全相同时执行 repair；installed `botified-asr-service` launcher 是已安装 engine、version 和 digest 的唯一事实来源，preflight 严格解析它，不读取或创建平行的 installed-state、status 或 manifest 文件。repair 不覆盖或重建 `config.yaml`、API Key、credential 文件或两个 named volumes。
 13. 发现版本或 digest 不同、engine 变化、既有任一 managed 资源但 launcher 缺失、launcher 不符合固定模板、孤儿资源或其他无法明确识别的 managed 状态时，必须在停止旧服务、拉取 image、打开 SQLite 或写配置前 fail closed，并保持旧服务不动。
-14. fresh attempt 只在内存中记录本次新建且 preflight 已确认此前不存在的 exact config/credential 文件、launcher、user unit/wrapper、受控容器和两个 named volumes。任何正常失败都先输出不含 secret 的受控日志，再逆序停止并删除该内存集合中的本次资源，使安装回到 fresh；不得删除任何 preexisting 资源。SIGKILL 后或再次运行时无法证明资源属于本次 attempt 的状态按第 13 项 fail closed，不擅自清理。
-15. uninstall 默认移除 service/unit、launcher/wrapper 和受控容器，但保留配置、credential 和两个 named volumes；只有显式 `--purge` 且二次确认后才额外删除 exact volumes `botified-asr-data` 和 `botified-asr-model-cache`，不得按前缀、label 或目录递归扩大删除范围。
+14. fresh attempt 只在内存中记录本次新建且 preflight 已确认此前不存在的 exact config/credential 文件、launcher、uninstaller、user unit、受控容器和两个 named volumes。任何正常失败都先输出不含 secret 的受控日志，再逆序停止并删除该内存集合中的本次资源，使安装回到 fresh；不得删除任何 preexisting 资源。SIGKILL 后或再次运行时无法证明资源属于本次 attempt 的状态按第 13 项 fail closed，不擅自清理。
+15. uninstall 默认只停止服务，删除 systemd user unit（若存在）和受控容器；fallback 下只停止并删除由 launcher 启动的受控容器。默认保留 launcher、唯一 uninstaller、`config.yaml`、`service.env`、`client.env` 以及 exact volumes `botified-asr-data` 和 `botified-asr-model-cache`，因此同一 release 仍可依据 launcher 唯一身份执行 repair，并明确输出 repair 和 `--purge` 命令。只有显式 `--purge` 且输入一次精确的完整 target 确认文本后，才额外删除 launcher、uninstaller、exact files `config.yaml`、`service.env`、`client.env`、仍存在的 exact user unit 和上述两个 exact volumes，使状态恢复为 fresh；不得按前缀、label 或目录递归扩大删除范围。
 
 发布/安装细则：
 
@@ -1233,7 +1233,7 @@ CUDA image 的 PyTorch/CUDA runtime、最低 NVIDIA driver 和受支持 compute 
 - manifest 为每个受支持平台给出 image digest、模型 ID/revision 和 runtime 要求，并记录包括固定短 smoke 音频在内的 artifact checksum。
 - Skill tarball 解包前拒绝绝对路径、`..` traversal、device node 以及逃逸目标目录的 symlink/hardlink。
 - 本仓库的 installer 测试向 `install-asr.sh` 和 `install-asr-skill.sh` 注入损坏 manifest/tarball，并断言拉 image、写 user unit/wrapper 或改动既有服务前已失败；复用现有测试体系，不另建 installer framework。
-- 唯一卸载入口为已安装的 `botified-asr-uninstall [--purge]`。
+- 唯一卸载入口为已安装的 `~/.local/bin/botified-asr-uninstall [--purge]`。
 
 不做：
 
