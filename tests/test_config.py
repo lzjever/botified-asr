@@ -23,6 +23,52 @@ def test_default_server_endpoint_uses_canonical_asr_port(tmp_path: Path) -> None
     assert config.server.listen == "127.0.0.1:17770"
 
 
+@pytest.mark.parametrize(
+    "yaml_value",
+    (
+        "17770",
+        "'localhost'",
+        "':17770'",
+        "'localhost:'",
+        "'localhost:+17770'",
+        "'localhost:１７７７０'",
+        "'localhost:0'",
+        "'localhost:65536'",
+    ),
+)
+def test_server_listen_rejects_invalid_endpoints(
+    tmp_path: Path,
+    yaml_value: str,
+) -> None:
+    path = write_config(
+        tmp_path,
+        f"server:\n  listen: {yaml_value}\n",
+    )
+
+    with pytest.raises(ConfigError, match=r"server\.listen"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "listen",
+    (
+        "0.0.0.0:1",
+        "asr.internal:443",
+        "::1:65535",
+    ),
+)
+def test_server_listen_accepts_ipv4_hostname_and_ipv6(
+    tmp_path: Path,
+    listen: str,
+) -> None:
+    path = write_config(
+        tmp_path,
+        f"server:\n  listen: '{listen}'\n",
+    )
+
+    assert load_config(path).server.listen == listen
+
+
 def test_server_public_base_url_is_not_a_supported_config_field(
     tmp_path: Path,
 ) -> None:

@@ -44,6 +44,23 @@ def _canonical_directory(value: object, field_name: str) -> Path:
 class ServerConfig:
     listen: str = "127.0.0.1:17770"
 
+    def __post_init__(self) -> None:
+        message = (
+            "server.listen must be host:port with an ASCII decimal port "
+            "from 1 to 65535"
+        )
+        if not isinstance(self.listen, str) or ":" not in self.listen:
+            raise ConfigError(message)
+        host, port_text = self.listen.rsplit(":", 1)
+        if not host or re.fullmatch(r"[0-9]+", port_text) is None:
+            raise ConfigError(message)
+        try:
+            port = int(port_text)
+        except ValueError as error:
+            raise ConfigError(message) from error
+        if not 1 <= port <= 65535:
+            raise ConfigError(message)
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
